@@ -153,9 +153,9 @@ fn client_reconnects_and_resends_after_cursor() {
     let mut c = Client::new(&path, "src".into(), 100);
 
     c.send(&events[..10]).unwrap();
-    assert_eq!((c.pending(), c.cursor()), (0, Some(10)));
+    assert_eq!(c.flush(Duration::from_secs(5)).unwrap(), Some(10));
     c.send(&events[10..20]).unwrap();
-    assert_eq!(c.pending(), 10, "frame persisted but unacked stays buffered");
+    assert_eq!(c.flush(Duration::from_millis(20)).unwrap_err().to_string().split(';').next(), Some("10 events unacked after 20ms (0 dropped)"), "frame persisted but unacked stays buffered");
     c.send(&events[20..]).unwrap();
 
     assert_eq!(c.flush(Duration::from_secs(5)).unwrap(), Some(30));
@@ -186,4 +186,40 @@ fn client_rejects_foreign_source() {
     let mut c = Client::new(socket_path("foreign"), "other".into(), 3);
     assert!(c.send(&heartbeats(1)).is_err());
     assert_eq!(c.pending(), 0);
+}
+
+#[test]
+fn client_rejects_invalid_event_without_buffering_it() {
+    let path = socket_path("invalid");
+    let fc = fake_collector(&path, None);
+    let mut c = Client::new(&path, "src".into(), 100);
+    let mut events = heartbeats(2);
+    events[1].occurred_at_utc_ns = -5;
+    let err = c.send(&events).unwrap_err().to_string();
+    assert_eq!(err, format!("event {}: occurred_at_utc_ns -5 is outside 1970-01-01..2200-01-01", events[1].event_id));
+    assert_eq!(c.pending(), 0, "no event of a rejected batch is buffered");
+    c.send(&events[..1]).unwrap();
+    assert_eq!(c.flush(Duration::from_secs(5)).unwrap(), Some(1), "the source keeps flowing");
+    assert_eq!(*fc.store.lock().unwrap(), events[..1]);
+}
+
+#[test]
+fn send_does_not_wait_for_a_silent_collector() {
+    let path = socket_path("silent");
+    let listener = UnixListener::bind(&path).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let held = listener.accept().unwrap();
+        tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_secs(10));
+        drop(held);
+    });
+    let mut c = Client::new(&path, "src".into(), 100);
+    let events = heartbeats(3);
+    let t = std::time::Instant::now();
+    c.send(&events[..1]).unwrap();
+    c.send(&events[1..]).unwrap();
+    assert!(t.elapsed() < Duration::from_millis(200), "send took {:?}", t.elapsed());
+    assert_eq!(c.pending(), 3);
+    rx.recv_timeout(Duration::from_secs(1)).expect("the collector accepted the connection");
 }

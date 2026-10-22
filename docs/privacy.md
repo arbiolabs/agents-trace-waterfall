@@ -8,6 +8,7 @@ Agent traces often contain secrets and proprietary source code. trace-waterfall 
 - Span metadata: name, kind, status, start and end times, model, provider, tool name.
 - Usage: token counts and cost, with provenance (actual, estimate, or unknown).
 - Artifact records: file path, hash, and change summary.
+- Span `error` messages and span and session attributes, as the adapter sends them. Secret redaction applies, but nothing else is removed. An error message can quote source code or a command line.
 
 ## What is not collected by default
 
@@ -27,6 +28,8 @@ Adapters may send short `input_preview` and `output_preview` strings and full pa
 payloads = false          # default
 projects = ["my-project"] # opt in for these projects only
 ```
+
+Without opt-in, the collector removes `input_preview` and `output_preview` before it writes an event. `trace-tui import` applies the same policy.
 
 ## Safeguards on disk
 

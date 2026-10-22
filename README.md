@@ -45,7 +45,7 @@ Press `?` in the TUI for the keymap.
 
 ```toml
 db = "~/.local/share/trace-waterfall/traces.db"   # or TRACE_WATERFALL_DB
-socket = "/tmp/trace-waterfall.sock"              # or TRACE_WATERFALL_SOCKET
+# socket = "..."                                  # or TRACE_WATERFALL_SOCKET; default is per-user, see docs/protocol.md
 theme = "default"                                 # ascii, monochrome, ascii-monochrome
 
 [retention]

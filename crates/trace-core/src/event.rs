@@ -5,6 +5,10 @@ use std::cmp::Ordering;
 pub type Ns = i64;
 pub type Attributes = Map<String, serde_json::Value>;
 pub const SCHEMA_VERSION: u32 = 1;
+/// Source of the collector's own synthetic events, such as `session.ended {interrupted}`.
+pub const COLLECTOR_SOURCE: &str = "collector";
+/// Accepted timestamp range: 1970-01-01 (inclusive) to 2200-01-01 (exclusive), UTC.
+pub const VALID_TIME_NS: std::ops::Range<Ns> = 0..7_258_118_400_000_000_000;
 
 macro_rules! id {
     ($name:ident) => {
@@ -224,6 +228,30 @@ impl CanonicalEvent {
 
     pub fn dedup_key(&self) -> (SourceId, EventId) {
         (self.source_id.clone(), self.event_id.clone())
+    }
+
+    /// Envelope checks for events that cross a process boundary (SDK client, socket frames, canonical JSONL import).
+    pub fn validate(&self) -> Result<(), String> {
+        let id = &self.event_id;
+        if self.schema_version != SCHEMA_VERSION {
+            return Err(format!("event {id}: schema_version {} is not {SCHEMA_VERSION}", self.schema_version));
+        }
+        if self.source_id.0.is_empty() || id.0.is_empty() || self.session_id.0.is_empty() {
+            return Err("source_id, event_id and session_id must be non-empty".into());
+        }
+        if self.source_seq < 1 {
+            return Err(format!("event {id}: source_seq starts at 1"));
+        }
+        let session_level = matches!(self.body, EventBody::SessionStarted { .. } | EventBody::SessionEnded { .. } | EventBody::Heartbeat {});
+        if !session_level && self.span_id.is_none() {
+            return Err(format!("event {id}: {} needs a span_id", self.body.type_name()));
+        }
+        for (name, t) in [("occurred_at_utc_ns", self.occurred_at_utc_ns), ("observed_at_utc_ns", self.observed_at_utc_ns)] {
+            if !VALID_TIME_NS.contains(&t) {
+                return Err(format!("event {id}: {name} {t} is outside 1970-01-01..2200-01-01"));
+            }
+        }
+        Ok(())
     }
 }
 

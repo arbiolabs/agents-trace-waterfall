@@ -346,7 +346,7 @@ fn parse_utc(s: &str) -> Option<Ns> {
     let d: Vec<_> = date.split('-').map(num).collect::<Option<_>>()?;
     let (hms, frac) = time.split_once('.').unwrap_or((time, ""));
     let t: Vec<_> = hms.split(':').map(num).collect::<Option<_>>()?;
-    let (&[y, m, day], &[h, mi, sec]) = (&d[..], &t[..]) else {
+    let (&[y, m @ 1..=12, day @ 1..=31], &[h @ 0..=23, mi @ 0..=59, sec @ 0..=60]) = (&d[..], &t[..]) else {
         return None;
     };
     if frac.len() > 9 || !frac.bytes().all(|b| b.is_ascii_digit()) {
@@ -360,10 +360,13 @@ fn parse_utc(s: &str) -> Option<Ns> {
     // Days from civil date (Howard Hinnant's algorithm).
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
-    let yoe = y - era * 400;
+    let yoe = y.rem_euclid(400);
     let doy = (153 * ((m + 9) % 12) + 2) / 5 + day - 1;
-    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
-    Some((days * 86_400 + h * 3600 + mi * 60 + sec) * 1_000_000_000 + nanos)
+    let days = era.checked_mul(146_097)? + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    days.checked_mul(86_400)?
+        .checked_add(h * 3600 + mi * 60 + sec)?
+        .checked_mul(1_000_000_000)?
+        .checked_add(nanos)
 }
 
 #[cfg(test)]
@@ -387,5 +390,9 @@ mod tests {
         );
         assert_eq!(parse_utc("2026-10-22 15:27:19Z"), None);
         assert_eq!(parse_utc("2026-10-22T15:27:19"), None);
+        assert_eq!(parse_utc("2262-04-11T23:47:16Z"), Some(9_223_372_036_000_000_000));
+        assert_eq!(parse_utc("2263-01-01T00:00:00Z"), None);
+        assert_eq!(parse_utc("99999999999999-01-01T00:00:00Z"), None);
+        assert_eq!(parse_utc("2026-13-01T00:00:00Z"), None);
     }
 }

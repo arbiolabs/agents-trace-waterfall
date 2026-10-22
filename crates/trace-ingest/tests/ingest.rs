@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use trace_adapter_sdk::{Client, MAX_LINE_BYTES, read_jsonl};
 use trace_core::*;
-use trace_ingest::{CollectorConfig, import_file, run_collector_until};
+use trace_ingest::{Capture, CollectorConfig, import_file, run_collector_until};
 use trace_storage::{AppendOutcome, SessionFilter, Store};
 
 const YEAR: Duration = Duration::from_secs(365 * 86_400);
@@ -264,11 +264,12 @@ fn protocol_errors_close_the_connection() {
 }
 
 fn import_fixture(store: &mut Store) -> AppendOutcome {
-    let a = import_file(store, &fixture().join("sess-1.jsonl"), "claude-code").unwrap();
+    let a = import_file(store, &fixture().join("sess-1.jsonl"), "claude-code", &Capture::default()).unwrap();
     let b = import_file(
         store,
         &fixture().join("sess-1/subagents/agent-agent1.jsonl"),
         "claude-code",
+        &Capture::default(),
     )
     .unwrap();
     AppendOutcome {
@@ -488,7 +489,7 @@ fn real_transcript() {
         println!(
             "{}: {:?}",
             f.display(),
-            import_file(&mut store, f, "claude-code").unwrap()
+            import_file(&mut store, f, "claude-code", &Capture::default()).unwrap()
         );
     }
     for s in store.list_sessions(&SessionFilter::default()).unwrap() {
@@ -579,4 +580,45 @@ fn collector_strips_previews_unless_project_opted_in() {
     };
     assert_eq!(previews("a"), (Some("IN".into()), Some("OUT".into())));
     assert_eq!(previews("b"), (None, None));
+}
+
+#[test]
+fn collector_rejects_frame_with_out_of_range_timestamp() {
+    let env = env();
+    let c = start(config(&env, &[], YEAR));
+    let event = json!({"source_id": "s", "source_seq": 1, "event_id": "e1", "observed_at_utc_ns": -1,
+        "occurred_at_utc_ns": 1, "session_id": "sess", "event_type": "heartbeat", "body": {}});
+    let frame = format!("{}\n", json!({"type": "events", "events": [event]}));
+    assert_eq!(
+        raw(&env.sock, &[hello("s"), frame]),
+        vec![
+            json!({"type": "welcome", "protocol": 1, "cursor": null}),
+            json!({"type": "error", "message": "event e1: observed_at_utc_ns -1 is outside 1970-01-01..2200-01-01"})
+        ]
+    );
+    c.stop();
+    assert_eq!(journal_len(&Store::open(&env.db).unwrap()), 0);
+}
+
+#[test]
+fn import_applies_capture_policy() {
+    let env = env();
+    let file = env.dir.join("previews.jsonl");
+    let lines = [
+        json!({"source_id": "s", "source_seq": 1, "event_id": "e1", "observed_at_utc_ns": 1, "occurred_at_utc_ns": 1,
+            "session_id": "sess", "event_type": "session.started", "body": {"project_id": "p"}}),
+        json!({"source_id": "s", "source_seq": 2, "event_id": "e2", "observed_at_utc_ns": 2, "occurred_at_utc_ns": 2,
+            "session_id": "sess", "span_id": "x", "event_type": "span.started", "body": {"name": "x", "kind": "tool", "input_preview": "IN"}}),
+        json!({"source_id": "s", "source_seq": 3, "event_id": "e3", "observed_at_utc_ns": 3, "occurred_at_utc_ns": 3,
+            "session_id": "sess", "span_id": "x", "event_type": "span.ended", "body": {"status": "succeeded", "output_preview": "OUT"}}),
+    ];
+    std::fs::write(&file, lines.map(|l| format!("{l}\n")).concat()).unwrap();
+    let previews = |capture: Capture| {
+        let mut store = Store::open_in_memory().unwrap();
+        import_file(&mut store, &file, "canonical", &capture).unwrap();
+        let x = &store.load_session(&"sess".into()).unwrap().spans[&SpanId::from("x")];
+        (x.input_preview.clone(), x.output_preview.clone())
+    };
+    assert_eq!(previews(Capture::default()), (None, None));
+    assert_eq!(previews(Capture { projects: vec!["p".into()], ..Capture::default() }), (Some("IN".into()), Some("OUT".into())));
 }
