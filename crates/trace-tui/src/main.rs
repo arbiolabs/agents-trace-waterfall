@@ -7,8 +7,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 use trace_core::{SPEEDS, SessionId, SessionStatus};
 use trace_storage::{SessionFilter, Store};
-use trace_tui::app::{App, wall_ns};
+use trace_tui::app::App;
 use trace_tui::config::Config;
+use trace_view::wall_ns;
 
 const STALE_AFTER: Duration = Duration::from_secs(300);
 const DAY_NS: i64 = 86_400_000_000_000;

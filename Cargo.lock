@@ -1855,6 +1855,7 @@ dependencies = [
  "ratatui",
  "serde_json",
  "trace-core",
+ "trace-view",
 ]
 
 [[package]]
@@ -1883,6 +1884,17 @@ dependencies = [
  "trace-core",
  "trace-ingest",
  "trace-render",
+ "trace-storage",
+ "trace-view",
+]
+
+[[package]]
+name = "trace-view"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "trace-core",
  "trace-storage",
 ]
 

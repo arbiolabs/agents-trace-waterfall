@@ -1,19 +1,12 @@
-use anyhow::Context;
 use base64::Engine;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::widgets::TableState;
-use std::collections::HashSet;
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use trace_core::{
-    CanonicalEvent, Ns, Replay, ReplayClock, SessionId, SessionStatus, Span, SpanId, TraceState, wire_name,
-};
-use trace_render::{Row, RowKind, Theme, Viewport, WaterfallState, flatten};
+use std::path::Path;
+use std::time::{Duration, Instant};
+use trace_core::{SessionId, SessionStatus};
+use trace_render::Theme;
 use trace_storage::{SessionFilter, SessionSummary, Store};
-
-pub const EXPAND_ALL_LIMIT: usize = 5_000;
+use trace_view::{Mode, TraceDoc, export_span};
 const LIVE_TICK: Duration = Duration::from_millis(66);
 const SESSIONS_REFRESH: Duration = Duration::from_secs(1);
 const STATUS_FILTERS: [Option<SessionStatus>; 5] = [
@@ -36,22 +29,6 @@ pub enum Focus {
     Tree,
     Timeline,
     Inspector,
-}
-
-/// What drives the view clock. All three project the trace through `TraceState::apply`.
-pub enum Mode {
-    /// Wall clock. While paused, polled events wait in `buffered` and the display clock stays at `paused_at`.
-    Live {
-        following: bool,
-        paused_at: Option<Ns>,
-        buffered: Vec<CanonicalEvent>,
-    },
-    Replay {
-        replay: Replay,
-        clock: ReplayClock,
-    },
-    /// A finished session: the clock sits at its end.
-    Static,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,245 +63,22 @@ pub struct Inspector {
     pub scroll: u16,
 }
 
+/// A `TraceDoc` plus the terminal-only state around it: tree scroll, focus and the inspector.
 pub struct View {
-    pub state: TraceState,
-    pub mode: Mode,
-    pub last_journal_seq: i64,
-    pub collapsed: HashSet<SpanId>,
-    pub search: String,
-    pub rows: Vec<Row>,
-    pub wf: WaterfallState,
-    /// Selection identity; `wf.selected` is re-derived from it whenever rows change.
-    pub selected: Option<SpanId>,
-    /// None until the first render knows the timeline width.
-    pub viewport: Option<Viewport>,
-    pub timeline_width: u16,
+    pub doc: TraceDoc,
+    /// First visible row; `WaterfallWidget` scrolls it to keep the selection visible.
+    pub scroll: usize,
     pub focus: Focus,
     pub inspector: Option<Inspector>,
-    pub now: Ns,
 }
 
 impl View {
-    fn new(state: TraceState, mode: Mode, last_journal_seq: i64) -> Self {
-        let mut v = Self {
-            state,
-            mode,
-            last_journal_seq,
-            collapsed: HashSet::new(),
-            search: String::new(),
-            rows: Vec::new(),
-            wf: WaterfallState::default(),
-            selected: None,
-            viewport: None,
-            timeline_width: 0,
+    fn new(doc: TraceDoc) -> Self {
+        Self {
+            doc,
+            scroll: 0,
             focus: Focus::Tree,
             inspector: None,
-            now: 0,
-        };
-        v.refresh();
-        v
-    }
-
-    pub fn session_id(&self) -> &SessionId {
-        &self.state.session.session_id
-    }
-
-    pub fn selected_span(&self) -> Option<&Span> {
-        self.selected
-            .as_ref()
-            .and_then(|id| self.state.spans.get(id))
-    }
-
-    /// Rebuilds rows and the clock after any change to state, collapse set or search.
-    pub fn refresh(&mut self) {
-        let m = (!self.search.trim().is_empty()).then(|| matcher(&self.search));
-        self.rows = flatten(
-            &self.state,
-            &self.collapsed,
-            m.as_ref().map(|f| f as &dyn Fn(&Span) -> bool),
-        );
-        let found = self.selected.as_ref().and_then(|id| {
-            self.rows
-                .iter()
-                .position(|r| matches!(&r.kind, RowKind::Span(s) if s == id))
-        });
-        self.select(found.unwrap_or(self.wf.selected));
-        self.tick_clock();
-    }
-
-    /// The view clock. Live advances with the wall clock unless paused.
-    pub fn tick_clock(&mut self) {
-        self.now = match &self.mode {
-            Mode::Live { paused_at, .. } => paused_at.unwrap_or_else(wall_ns),
-            Mode::Replay { clock, .. } => clock.position,
-            Mode::Static => self
-                .state
-                .session
-                .ended_at_utc_ns
-                .or(self.state.last_occurred_at_utc_ns)
-                .unwrap_or(0),
-        };
-    }
-
-    fn select(&mut self, i: usize) {
-        self.wf.selected = i.min(self.rows.len().saturating_sub(1));
-        self.selected = match self.rows.get(self.wf.selected).map(|r| &r.kind) {
-            Some(RowKind::Span(id)) => Some(id.clone()),
-            _ => None,
-        };
-    }
-
-    /// Fits the viewport to the whole trace, or the whole recording in replay.
-    pub fn fit(&self, width: u16) -> Viewport {
-        let (start, end) = match &self.mode {
-            Mode::Replay { replay, .. } => (replay.start().unwrap_or(0), replay.end().unwrap_or(0)),
-            _ => (self.state.axis_start().unwrap_or(self.now), self.now),
-        };
-        Viewport::fit(start, end, width)
-    }
-
-    fn apply_all(&mut self, events: impl IntoIterator<Item = CanonicalEvent>) {
-        for e in events {
-            self.state.apply(&e);
-        }
-        if matches!(self.mode, Mode::Live { .. })
-            && self.state.session.status != SessionStatus::Live
-        {
-            self.mode = Mode::Static;
-        }
-        self.refresh();
-    }
-
-    fn move_by(&mut self, d: isize) {
-        self.select(self.wf.selected.saturating_add_signed(d));
-    }
-
-    fn left(&mut self) {
-        let Some(id) = self.selected.clone() else {
-            return;
-        };
-        let row = &self.rows[self.wf.selected];
-        if row.has_children && !row.collapsed {
-            self.collapsed.insert(id);
-            self.refresh();
-        } else if let Some(p) = self.state.spans[&id].parent_span_id.clone()
-            && let Some(i) = self
-                .rows
-                .iter()
-                .position(|r| r.kind == RowKind::Span(p.clone()))
-        {
-            self.select(i);
-        }
-    }
-
-    fn right(&mut self) {
-        let Some(id) = self.selected.clone() else {
-            return;
-        };
-        let row = &self.rows[self.wf.selected];
-        if row.collapsed {
-            self.collapsed.remove(&id);
-            self.refresh();
-        } else if row.has_children {
-            self.move_by(1);
-        }
-    }
-
-    /// Expands every descendant if any is collapsed, else collapses them all. Stops after EXPAND_ALL_LIMIT spans.
-    fn toggle_descendants(&mut self) -> Option<String> {
-        let id = self.selected.clone()?;
-        let mut subtree = vec![id];
-        let mut i = 0;
-        while i < subtree.len() && subtree.len() < EXPAND_ALL_LIMIT {
-            subtree.extend(self.state.children(&subtree[i]).iter().cloned());
-            i += 1;
-        }
-        subtree.truncate(EXPAND_ALL_LIMIT);
-        let parents: Vec<_> = subtree
-            .into_iter()
-            .filter(|s| !self.state.children(s).is_empty())
-            .collect();
-        if parents.iter().any(|p| self.collapsed.contains(p)) {
-            parents.iter().for_each(|p| {
-                self.collapsed.remove(p);
-            });
-        } else {
-            self.collapsed.extend(parents);
-        }
-        self.refresh();
-        (i >= EXPAND_ALL_LIMIT).then(|| format!("stopped at {EXPAND_ALL_LIMIT} spans"))
-    }
-
-    fn zoom(&mut self, factor: f64) {
-        let following = matches!(
-            self.mode,
-            Mode::Live {
-                following: true,
-                ..
-            }
-        );
-        let anchor = match self.selected_span() {
-            Some(s) if !following => s.started_at_utc_ns,
-            _ => self.now,
-        };
-        if let Some(vp) = &mut self.viewport {
-            vp.zoom(factor, anchor);
-        }
-    }
-
-    fn pan(&mut self, dir: f64) {
-        if let Mode::Live { following, .. } = &mut self.mode {
-            *following = false;
-        }
-        let cells = f64::from(self.timeline_width.max(4)) / 4.0 * dir;
-        if let Some(vp) = &mut self.viewport {
-            vp.pan(cells);
-        }
-    }
-
-    fn seek(&mut self, to: impl FnOnce(&Replay, &ReplayClock) -> Option<Ns>) {
-        let Mode::Replay { replay, clock } = &mut self.mode else {
-            return;
-        };
-        if let Some(t) = to(replay, clock) {
-            clock.position = t.clamp(replay.start().unwrap_or(t), replay.end().unwrap_or(t));
-            self.state = replay.state_at(clock.position);
-        }
-        self.refresh();
-    }
-
-    /// Footer status: lag and queue depth for live, position and speed for replay.
-    pub fn status(&self) -> String {
-        match &self.mode {
-            Mode::Live {
-                following,
-                paused_at,
-                buffered,
-            } => {
-                let lag = self.state.last_occurred_at_utc_ns.map_or("—".into(), |t| {
-                    trace_render::format_duration((wall_ns() - t).max(0))
-                });
-                let state = if paused_at.is_some() {
-                    "PAUSED"
-                } else {
-                    "LIVE"
-                };
-                let follow = if *following { " follow" } else { "" };
-                format!("{state}{follow} lag {lag} queued {}", buffered.len())
-            }
-            Mode::Replay { replay, clock } => {
-                let start = replay.start().unwrap_or(0);
-                format!(
-                    "REPLAY {} {}x {}/{} ev {}/{}",
-                    if clock.playing { "playing" } else { "paused" },
-                    clock.speed(),
-                    trace_render::format_duration(clock.position - start),
-                    trace_render::format_duration(replay.end().unwrap_or(0) - start),
-                    replay.index_at(clock.position),
-                    replay.events().len()
-                )
-            }
-            Mode::Static => "STATIC".into(),
         }
     }
 }
@@ -379,37 +133,14 @@ impl App {
     }
 
     pub fn open(&mut self, id: SessionId) -> anyhow::Result<()> {
-        let rows = self.store.events_since(0, Some(&id))?;
-        anyhow::ensure!(!rows.is_empty(), "session {id} has no events");
-        let last_journal_seq = rows.last().map_or(0, |r| r.0);
-        let mut state = TraceState::new(id);
-        for (_, e) in &rows {
-            state.apply(e);
-        }
-        let mode = if state.session.status == SessionStatus::Live {
-            Mode::Live {
-                following: true,
-                paused_at: None,
-                buffered: Vec::new(),
-            }
-        } else {
-            Mode::Static
-        };
-        self.view = Some(View::new(state, mode, last_journal_seq));
+        self.view = Some(View::new(TraceDoc::open(&self.store, id)?));
         self.screen = Screen::Waterfall;
         Ok(())
     }
 
     pub fn open_replay(&mut self, id: SessionId, speed: f64, at_end: bool) -> anyhow::Result<()> {
-        let replay = Replay::new(id.clone(), self.store.session_events(&id)?);
-        let (Some(start), Some(end)) = (replay.start(), replay.end()) else {
-            anyhow::bail!("session {id} has no events")
-        };
-        let mut clock = ReplayClock::new(if at_end { end } else { start });
-        clock.set_speed(speed);
-        clock.playing = !at_end;
-        let state = replay.state_at(clock.position);
-        self.view = Some(View::new(state, Mode::Replay { replay, clock }, 0));
+        let doc = TraceDoc::open_replay(&self.store, id, speed, at_end)?;
+        self.view = Some(View::new(doc));
         self.screen = Screen::Waterfall;
         self.last_tick = Instant::now();
         Ok(())
@@ -419,7 +150,7 @@ impl App {
     pub fn tick_interval(&self) -> Option<Duration> {
         match (self.screen, &self.view) {
             (Screen::Sessions, _) => Some(SESSIONS_REFRESH),
-            (Screen::Waterfall, Some(v)) => match &v.mode {
+            (Screen::Waterfall, Some(v)) => match &v.doc.mode {
                 Mode::Live { .. } => Some(LIVE_TICK),
                 Mode::Replay { clock, .. } if clock.playing => Some(LIVE_TICK),
                 _ => None,
@@ -441,42 +172,10 @@ impl App {
         if self.screen == Screen::Sessions && self.last_refresh.elapsed() >= SESSIONS_REFRESH {
             self.refresh_sessions()?;
         }
-        let Some(v) = &mut self.view else {
-            return Ok(());
-        };
-        match &mut v.mode {
-            Mode::Live {
-                paused_at,
-                buffered,
-                ..
-            } => {
-                let new = self
-                    .store
-                    .events_since(v.last_journal_seq, Some(&v.state.session.session_id))?;
-                let Some((seq, _)) = new.last() else {
-                    return Ok(());
-                };
-                v.last_journal_seq = *seq;
-                let new = new.into_iter().map(|(_, e)| e);
-                if paused_at.is_some() {
-                    buffered.extend(new);
-                } else {
-                    v.apply_all(new);
-                }
-            }
-            Mode::Replay { replay, clock } if clock.playing => {
-                let before = clock.position;
-                clock.tick(dt.as_nanos() as Ns, replay.end().unwrap_or(before));
-                if replay.index_at(before) != replay.index_at(clock.position) {
-                    v.state = replay.state_at(clock.position);
-                    v.refresh();
-                } else {
-                    v.tick_clock();
-                }
-            }
-            _ => {}
+        match &mut self.view {
+            Some(v) => v.doc.advance(&self.store, dt),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -547,8 +246,8 @@ impl App {
             }
             Screen::Waterfall => {
                 if let Some(v) = &mut self.view {
-                    v.search = text;
-                    v.refresh();
+                    v.doc.search = text;
+                    v.doc.refresh();
                 }
             }
             Screen::Help => {}
@@ -622,15 +321,15 @@ impl App {
             return;
         }
         match code {
-            KeyCode::Char('j') | KeyCode::Down => v.move_by(1),
-            KeyCode::Char('k') | KeyCode::Up => v.move_by(-1),
-            KeyCode::Char('g') | KeyCode::Home => v.select(0),
-            KeyCode::Char('G') | KeyCode::End => v.select(usize::MAX),
-            KeyCode::Char('h') | KeyCode::Left if v.focus == Focus::Timeline => v.pan(-1.0),
-            KeyCode::Char('l') | KeyCode::Right if v.focus == Focus::Timeline => v.pan(1.0),
-            KeyCode::Char('h') | KeyCode::Left => v.left(),
-            KeyCode::Char('l') | KeyCode::Right => v.right(),
-            KeyCode::Char('e') => self.message = v.toggle_descendants(),
+            KeyCode::Char('j') | KeyCode::Down => v.doc.move_by(1),
+            KeyCode::Char('k') | KeyCode::Up => v.doc.move_by(-1),
+            KeyCode::Char('g') | KeyCode::Home => v.doc.select(0),
+            KeyCode::Char('G') | KeyCode::End => v.doc.select(usize::MAX),
+            KeyCode::Char('h') | KeyCode::Left if v.focus == Focus::Timeline => v.doc.pan(-1.0),
+            KeyCode::Char('l') | KeyCode::Right if v.focus == Focus::Timeline => v.doc.pan(1.0),
+            KeyCode::Char('h') | KeyCode::Left => v.doc.left(),
+            KeyCode::Char('l') | KeyCode::Right => v.doc.right(),
+            KeyCode::Char('e') => self.message = v.doc.toggle_descendants(),
             KeyCode::Enter => {
                 v.inspector = Some(v.inspector.unwrap_or(Inspector {
                     tab: Tab::Overview,
@@ -650,9 +349,9 @@ impl App {
                     }
                 }
             }
-            KeyCode::Esc if !v.search.is_empty() => {
-                v.search.clear();
-                v.refresh();
+            KeyCode::Esc if !v.doc.search.is_empty() => {
+                v.doc.search.clear();
+                v.doc.refresh();
             }
             KeyCode::Esc => {
                 self.screen = Screen::Sessions;
@@ -665,46 +364,19 @@ impl App {
     /// Keys that work in every waterfall focus.
     fn common_key(&mut self, code: KeyCode) {
         let Some(v) = &mut self.view else { return };
+        let v = &mut v.doc;
         match (code, &mut v.mode) {
             (KeyCode::Char('/'), _) => self.prompt = Some(v.search.clone()),
             (KeyCode::Char('+' | '='), _) => v.zoom(0.5),
             (KeyCode::Char('-'), _) => v.zoom(2.0),
-            (KeyCode::Char('H'), Mode::Replay { .. }) => {
-                let step = (v.timeline_width.max(10) as f64
-                    * v.viewport.map_or(1e6, |vp| vp.ns_per_cell)
-                    / 10.0) as Ns;
-                v.seek(|_, c| Some(c.position - step));
-            }
-            (KeyCode::Char('L'), Mode::Replay { .. }) => {
-                let step = (v.timeline_width.max(10) as f64
-                    * v.viewport.map_or(1e6, |vp| vp.ns_per_cell)
-                    / 10.0) as Ns;
-                v.seek(|_, c| Some(c.position + step));
-            }
+            (KeyCode::Char('H'), Mode::Replay { .. }) => v.seek_by(-1),
+            (KeyCode::Char('L'), Mode::Replay { .. }) => v.seek_by(1),
             (KeyCode::Char('H'), _) => v.pan(-1.0),
             (KeyCode::Char('L'), _) => v.pan(1.0),
-            (
-                KeyCode::Char(' '),
-                Mode::Live {
-                    paused_at,
-                    buffered,
-                    ..
-                },
-            ) => {
-                if paused_at.take().is_some() {
-                    let queued = std::mem::take(buffered);
-                    v.apply_all(queued);
-                } else {
-                    *paused_at = Some(v.now);
-                }
-            }
-            (KeyCode::Char(' '), Mode::Replay { replay, clock }) => {
-                if !clock.playing && Some(clock.position) >= replay.end() {
-                    clock.position = replay.start().unwrap_or(0);
-                }
-                clock.playing = !clock.playing;
+            (KeyCode::Char(' '), Mode::Live { .. }) => v.toggle_pause(),
+            (KeyCode::Char(' '), Mode::Replay { .. }) => {
                 self.last_tick = Instant::now();
-                v.seek(|_, c| Some(c.position));
+                v.toggle_pause();
             }
             (KeyCode::Char('f'), Mode::Live { following, .. }) => *following = !*following,
             (KeyCode::Char('[' | ']' | '<' | '>' | ' ' | 'f'), Mode::Static) => {
@@ -755,65 +427,3 @@ impl App {
         }
     }
 }
-
-/// Writes `dir/span-<id>.json` readable only by the owner. The untrusted id is reduced to `[A-Za-z0-9._-]`.
-pub fn export_span(dir: &Path, s: &Span) -> anyhow::Result<PathBuf> {
-    let id: String = s
-        .span_id
-        .to_string()
-        .chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '-' => c,
-            _ => '_',
-        })
-        .collect();
-    let path = dir.join(format!("span-{id}.json"));
-    let json = serde_json::to_string_pretty(s)?;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .and_then(|mut f| {
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            f.write_all(json.as_bytes())
-        })
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
-}
-
-pub fn wall_ns() -> Ns {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as Ns)
-}
-
-/// Space-separated tokens, all of which must match. `kind:` `status:` `model:` `tool:` `name:` scope a token;
-/// a bare token matches any of them. Case-insensitive substring.
-pub fn matcher(query: &str) -> impl Fn(&Span) -> bool + use<> {
-    let terms: Vec<(Option<String>, String)> = query
-        .split_whitespace()
-        .map(|t| match t.split_once(':') {
-            Some((k @ ("kind" | "status" | "model" | "tool" | "name"), v)) => {
-                (Some(k.to_owned()), v.to_lowercase())
-            }
-            _ => (None, t.to_lowercase()),
-        })
-        .collect();
-    move |s: &Span| {
-        let fields = [
-            ("name", s.name.to_lowercase()),
-            ("kind", wire_name(&s.kind)),
-            ("status", wire_name(&s.status)),
-            ("model", s.model.as_deref().unwrap_or("").to_lowercase()),
-            ("tool", s.tool_name.as_deref().unwrap_or("").to_lowercase()),
-        ];
-        terms.iter().all(|(k, v)| {
-            fields
-                .iter()
-                .any(|(f, val)| k.as_deref().is_none_or(|k| k == *f) && val.contains(v.as_str()))
-        })
-    }
-}
-

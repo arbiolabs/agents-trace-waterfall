@@ -4,10 +4,11 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use std::path::PathBuf;
 use std::time::Duration;
 use trace_core::{CanonicalEvent, Replay, SessionId, SpanId};
-use trace_render::{RowKind, Theme};
+use trace_render::Theme;
 use trace_storage::{SessionFilter, Store};
-use trace_tui::app::{App, Mode, Tab};
+use trace_tui::app::{App, Tab};
 use trace_tui::ui::inspector_lines;
+use trace_view::{Mode, RowKind, TraceDoc};
 
 const SESSION: &str = "01KDVDNA000000000000000001";
 
@@ -74,18 +75,16 @@ fn key(app: &mut App, code: KeyCode) {
     app.handle_key(KeyEvent::from(code));
 }
 
+fn doc(app: &App) -> &TraceDoc {
+    &app.view.as_ref().unwrap().doc
+}
+
 fn selected(app: &App) -> String {
-    app.view
-        .as_ref()
-        .unwrap()
-        .selected_span()
-        .unwrap()
-        .name
-        .clone()
+    doc(app).selected_span().unwrap().name.clone()
 }
 
 fn row_names(app: &App) -> Vec<String> {
-    let v = app.view.as_ref().unwrap();
+    let v = doc(app);
     v.rows
         .iter()
         .map(|r| match &r.kind {
@@ -109,9 +108,7 @@ fn screen(app: &mut App, w: u16, h: u16) -> Vec<String> {
 }
 
 fn span_id_named(app: &App, name: &str) -> SpanId {
-    app.view
-        .as_ref()
-        .unwrap()
+    doc(app)
         .state
         .spans
         .values()
@@ -154,7 +151,7 @@ fn navigates_tree_with_jkhl_and_g() {
 fn collapsed_branch_stays_collapsed_when_live_events_arrive() {
     let db = TempDb::new("collapse");
     let (mut app, mut writer) = live(&db, 13);
-    assert!(matches!(app.view.as_ref().unwrap().mode, Mode::Live { .. }));
+    assert!(matches!(doc(&app).mode, Mode::Live { .. }));
     press(&mut app, "jh");
     assert_eq!(row_names(&app), ["agent", "turn 1", "turn 2"]);
     writer.append(&sample()[13..30]).unwrap();
@@ -180,7 +177,7 @@ fn selection_follows_span_id_when_a_child_arrives_above() {
     let (mut app, mut writer) = live(&db, 13);
     press(&mut app, "jjjj");
     assert_eq!(selected(&app), "turn 2");
-    assert_eq!(app.view.as_ref().unwrap().wf.selected, 4);
+    assert_eq!(doc(&app).selected_row, 4);
     let late: CanonicalEvent = serde_json::from_value(serde_json::json!({
         "source_id": "late-source", "source_seq": 1, "event_id": "late-1",
         "observed_at_utc_ns": 1767225601000000000i64, "occurred_at_utc_ns": 1767225601000000000i64,
@@ -192,7 +189,7 @@ fn selection_follows_span_id_when_a_child_arrives_above() {
     app.tick_by(Duration::ZERO).unwrap();
     assert_eq!(row_names(&app)[4], "late tool");
     assert_eq!(selected(&app), "turn 2");
-    assert_eq!(app.view.as_ref().unwrap().wf.selected, 5);
+    assert_eq!(doc(&app).selected_row, 5);
 }
 
 #[test]
@@ -202,7 +199,7 @@ fn pause_buffers_and_resume_applies_every_event() {
     press(&mut app, " ");
     writer.append(&sample()[20..]).unwrap();
     app.tick_by(Duration::ZERO).unwrap();
-    let v = app.view.as_ref().unwrap();
+    let v = doc(&app);
     assert_eq!(v.state.event_count, 20);
     assert!(
         v.status().starts_with("PAUSED follow lag "),
@@ -211,7 +208,7 @@ fn pause_buffers_and_resume_applies_every_event() {
     );
     assert!(v.status().ends_with("queued 50"), "{}", v.status());
     press(&mut app, " ");
-    let v = app.view.as_ref().unwrap();
+    let v = doc(&app);
     assert_eq!(
         v.state.event_count,
         writer
@@ -236,34 +233,31 @@ fn replay_at_t_matches_replay_state_at() {
     press(&mut app, " ]]]");
     let reference = Replay::new(id, sample());
     let start = reference.start().unwrap();
-    let Mode::Replay { clock, .. } = &app.view.as_ref().unwrap().mode else {
+    let Mode::Replay { clock, .. } = &doc(&app).mode else {
         panic!("not replay")
     };
     let t = clock.position;
     assert_eq!(t - start, 528_000_000);
     assert!(!clock.playing);
-    let v = app.view.as_ref().unwrap();
+    let v = doc(&app);
     assert_eq!(v.state, reference.state_at(t));
     assert_eq!(v.state.event_count, 6);
     assert_eq!(row_names(&app), ["agent", "turn 1", "llm call"]);
 
     press(&mut app, "[");
-    let Mode::Replay { clock, .. } = &app.view.as_ref().unwrap().mode else {
+    let Mode::Replay { clock, .. } = &doc(&app).mode else {
         panic!()
     };
     assert_eq!(clock.position - start, 394_000_000);
 
     press(&mut app, ">> ");
     app.tick_by(Duration::from_millis(100)).unwrap();
-    let Mode::Replay { clock, .. } = &app.view.as_ref().unwrap().mode else {
+    let Mode::Replay { clock, .. } = &doc(&app).mode else {
         panic!()
     };
     assert_eq!(clock.speed(), 5.0);
     assert_eq!(clock.position - start, 894_000_000);
-    assert_eq!(
-        app.view.as_ref().unwrap().state,
-        reference.state_at(clock.position)
-    );
+    assert_eq!(doc(&app).state, reference.state_at(clock.position));
 }
 
 #[test]
@@ -342,7 +336,7 @@ fn search_status_failed_keeps_failed_span_and_ancestors() {
     assert_eq!(row_names(&app), ["agent", "turn 3", "bash"]);
     press(&mut app, "G");
     assert_eq!(
-        app.view.as_ref().unwrap().selected_span().unwrap().status,
+        doc(&app).selected_span().unwrap().status,
         trace_core::SpanStatus::Failed
     );
     press(&mut app, "/");
@@ -375,7 +369,7 @@ fn inspector_says_not_captured_for_missing_output() {
     press(&mut app, "ll");
     let v = app.view.as_ref().unwrap();
     assert_eq!(v.inspector.unwrap().tab, Tab::Output);
-    let lines: Vec<String> = inspector_lines(v, Tab::Output)
+    let lines: Vec<String> = inspector_lines(&v.doc, Tab::Output)
         .iter()
         .map(ToString::to_string)
         .collect();
@@ -386,10 +380,10 @@ fn inspector_says_not_captured_for_missing_output() {
             .any(|l| l.contains("not captured"))
     );
     let failed = span_id_named(&app, "bash");
-    let v = app.view.as_mut().unwrap();
+    let v = &mut app.view.as_mut().unwrap().doc;
     v.selected = Some(failed);
     v.refresh();
-    let err: Vec<String> = inspector_lines(app.view.as_ref().unwrap(), Tab::Error)
+    let err: Vec<String> = inspector_lines(doc(&app), Tab::Error)
         .iter()
         .map(ToString::to_string)
         .collect();
@@ -400,12 +394,12 @@ fn inspector_says_not_captured_for_missing_output() {
 fn events_tab_saturates_extreme_offsets() {
     let mut app = opened(&sample());
     press(&mut app, "jj");
-    let v = app.view.as_mut().unwrap();
+    let v = &mut app.view.as_mut().unwrap().doc;
     let id = v.selected.clone().unwrap();
     let s = v.state.spans.get_mut(&id).unwrap();
     s.started_at_utc_ns = i64::MAX;
     s.events[0].timestamp_utc_ns = i64::MIN;
-    let lines: Vec<String> = inspector_lines(app.view.as_ref().unwrap(), Tab::Events)
+    let lines: Vec<String> = inspector_lines(doc(&app), Tab::Events)
         .iter()
         .map(ToString::to_string)
         .collect();
@@ -416,12 +410,12 @@ fn events_tab_saturates_extreme_offsets() {
 fn span_export_sanitizes_the_id_and_is_owner_only() {
     use std::os::unix::fs::PermissionsExt;
     let app = opened(&sample());
-    let mut span = app.view.as_ref().unwrap().selected_span().unwrap().clone();
+    let mut span = doc(&app).selected_span().unwrap().clone();
     span.span_id = SpanId::from("../x/y");
     let dir = std::env::temp_dir().join(format!("trace-tui-export-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let path = trace_tui::app::export_span(&dir, &span).unwrap();
+    let path = trace_view::export_span(&dir, &span).unwrap();
     assert_eq!(path, dir.join("span-.._x_y.json"));
     assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     let back: serde_json::Value =

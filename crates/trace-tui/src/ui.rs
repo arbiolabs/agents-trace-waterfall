@@ -1,4 +1,4 @@
-use crate::app::{App, Focus, Inspector, Mode, Screen, Tab, View};
+use crate::app::{App, Focus, Inspector, Screen, Tab, View};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -8,7 +8,8 @@ use ratatui::widgets::{
     Block, Borders, Cell, Clear, Paragraph, Row as TRow, StatefulWidget, Table, Wrap,
 };
 use trace_core::{CostProvenance, Ns, SLOWEST_DEFAULT_KINDS, SessionStatus, wire_name};
-use trace_render::{Glyphs, Theme, WaterfallWidget, format_cost, format_duration, format_tokens};
+use trace_render::{Glyphs, Theme, WaterfallState, WaterfallWidget};
+use trace_view::{Mode, TraceDoc, format_cost, format_duration, format_tokens};
 
 const WIDE: u16 = 120;
 
@@ -53,7 +54,7 @@ fn hints(app: &App) -> String {
         }
         (Screen::Waterfall, None) => String::new(),
         (Screen::Waterfall, Some(v)) => {
-            let keys = match (v.focus, &v.mode) {
+            let keys = match (v.focus, &v.doc.mode) {
                 (Focus::Inspector, _) => {
                     "h/l tab · j/k scroll · y copy · x export · Tab tree · Esc close"
                 }
@@ -68,7 +69,7 @@ fn hints(app: &App) -> String {
                     "j/k h/l · Enter inspect · +/- H/L · / search · e all · r replay · s sessions · ? help"
                 }
             };
-            format!("{} │ {keys}", v.status())
+            format!("{} │ {keys}", v.doc.status())
         }
     }
 }
@@ -196,9 +197,9 @@ fn sessions(app: &mut App, f: &mut Frame, area: Rect) {
 fn waterfall(app: &mut App, f: &mut Frame, area: Rect) {
     let theme = app.theme;
     let Some(v) = &mut app.view else { return };
-    v.tick_clock();
+    v.doc.tick_clock();
     let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
-    f.render_widget(Paragraph::new(summary(v)), head);
+    f.render_widget(Paragraph::new(summary(&v.doc)), head);
 
     let w = body.width;
     if w < COMPACT {
@@ -245,36 +246,29 @@ fn waterfall(app: &mut App, f: &mut Frame, area: Rect) {
 
 /// `tree_width` equal to `area.width` draws the tree alone and leaves the timeline state untouched.
 fn draw_waterfall(v: &mut View, theme: &Theme, buf: &mut Buffer, area: Rect, tree_width: u16) {
-    let tl_w = area.width.saturating_sub(tree_width.saturating_add(1));
-    if tl_w > 0 {
-        v.timeline_width = tl_w;
-        let mut vp = v.viewport.unwrap_or_else(|| v.fit(tl_w));
-        if let Mode::Live {
-            following: true, ..
-        } = v.mode
-        {
-            vp.start_ns = v
-                .now
-                .saturating_sub((f64::from(tl_w) * vp.ns_per_cell * 0.95) as Ns);
-        }
-        v.viewport = Some(vp);
-    }
-    let vp = v.viewport.unwrap_or_else(|| v.fit(1));
-    let origin = v.state.axis_start().unwrap_or(v.now);
+    let vp = v
+        .doc
+        .layout(area.width.saturating_sub(tree_width.saturating_add(1)));
+    let d = &v.doc;
+    let mut wf = WaterfallState {
+        offset: v.scroll,
+        selected: d.selected_row,
+    };
     let widget = WaterfallWidget {
-        state: &v.state,
-        rows: &v.rows,
-        now: v.now,
+        state: &d.state,
+        rows: &d.rows,
+        now: d.now,
         viewport: vp,
-        origin_ns: origin,
+        origin_ns: d.state.axis_start().unwrap_or(d.now),
         theme,
         tree_width,
         focused: v.focus != Focus::Inspector,
     };
-    widget.render(area, buf, &mut v.wf);
+    widget.render(area, buf, &mut wf);
+    v.scroll = wf.offset;
 }
 
-fn summary(v: &View) -> Line<'static> {
+fn summary(v: &TraceDoc) -> Line<'static> {
     let st = &v.state;
     let t = st.totals();
     let mut prov = Vec::new();
@@ -350,7 +344,7 @@ fn inspector(v: &View, f: &mut Frame, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border)
         .title(Line::from(title));
-    let lines = inspector_lines(v, ins.tab);
+    let lines = inspector_lines(&v.doc, ins.tab);
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -362,7 +356,7 @@ fn inspector(v: &View, f: &mut Frame, area: Rect) {
 
 const NOT_CAPTURED: &str = "not captured";
 
-pub fn inspector_lines(v: &View, tab: Tab) -> Vec<Line<'static>> {
+pub fn inspector_lines(v: &TraceDoc, tab: Tab) -> Vec<Line<'static>> {
     let Some(s) = v.selected_span() else {
         return vec![Line::from("No span selected.")];
     };
