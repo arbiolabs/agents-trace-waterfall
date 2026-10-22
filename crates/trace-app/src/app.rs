@@ -1015,7 +1015,8 @@ impl TraceApp {
                 let fit = doc.fit(fit_w as u16);
                 let focus = if matches!(doc.mode, Mode::Replay { .. }) { None } else { focus_window(doc, fit.ns_per_cell, fit_w) };
                 doc.viewport = Some(focus.as_ref().map_or(fit, |f| f.1));
-                if let Some((id, _)) = focus.filter(|_| doc.selected.is_none())
+                // Row 0 is the default selection; anything else came from `--select`.
+                if let Some((id, _)) = focus.filter(|_| doc.selected_row == 0)
                     && let Some(i) = doc.rows.iter().position(|r| r.kind == RowKind::Span(id.clone()))
                 {
                     doc.select(i);
@@ -1158,6 +1159,8 @@ impl TraceApp {
     /// dragging an edge zooms.
     fn render_overview(&self, pal: &Palette, g: Geo, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         const BUCKET: f32 = 2.;
+        const LANE: f32 = 3.;
+        const LANE_GAP: f32 = 2.;
         let doc = self.doc.as_ref().expect("overview needs a document");
         let session_end = doc.state.session.ended_at_utc_ns;
         let n = (g.tl_w / BUCKET).ceil().max(1.) as usize;
@@ -1168,30 +1171,29 @@ impl TraceApp {
             let tone = present::tone(s) as usize;
             counts[a..=b.max(a)].iter_mut().for_each(|c| c[tone] += 1);
         }
-        let peak = counts.iter().map(|c| c.iter().sum::<u32>()).max().unwrap_or(0).max(1) as f32;
+        // One thin lane per tone (wait in amber, LLM, tool, error), stronger where spans overlap.
+        let peak = counts.iter().flatten().copied().max().unwrap_or(0).max(1) as f32;
         let tones = [Tone::Agent, Tone::Llm, Tone::Tool, Tone::Error];
         let marks: Vec<(f32, f32, Hsla)> = counts
             .iter()
             .enumerate()
-            .filter_map(|(i, c)| {
-                let total = c.iter().sum::<u32>();
-                if total == 0 {
-                    return None;
-                }
-                let tone = if c[3] > 0 { 3 } else { (0..3).max_by_key(|&k| c[k]).unwrap_or(0) };
-                let h = 4. + (STRIP_H - 12. - 4.) * (1. + total as f32).ln() / (1. + peak).ln();
-                Some((i as f32 * BUCKET, h, pal.kind(tones[tone]).mark))
+            .flat_map(|(i, c)| (0..4).filter(|&k| c[k] > 0).map(move |k| (i, k, c[k])))
+            .map(|(i, k, n)| {
+                let density = (1. + n as f32).ln() / (1. + peak).ln();
+                {
+                let color = if k == 0 { pal.amber } else { pal.kind(tones[k]).mark };
+                (i as f32 * BUCKET, k as f32 * (LANE + LANE_GAP), color.opacity(0.45 + 0.55 * density))
+            }
             })
             .collect();
         let (a, b) = g.window();
-        let lx0 = g.ov_x(a).clamp(0., g.tl_w - 6.);
-        let lx1 = g.ov_x(b).clamp(lx0 + 6., g.tl_w);
+        let lx0 = g.ov_x(a).clamp(0., g.tl_w - 10.);
+        let lx1 = g.ov_x(b).clamp(lx0 + 10., g.tl_w);
         let this = cx.entity().downgrade();
         let strip = canvas(|_, _, _| {}, move |bounds, _, window, _| {
-            let mid = bounds.origin.y + bounds.size.height / 2.;
-            for (x, h, color) in &marks {
-                let o = point(bounds.origin.x + px(*x), mid - px(h / 2.));
-                window.paint_quad(fill(Bounds::new(o, size(px(BUCKET - 0.5), px(*h))), *color).corner_radii(px(0.75)));
+            let top = bounds.origin.y + (bounds.size.height - px(4. * LANE + 3. * LANE_GAP)) / 2.;
+            for (x, y, color) in &marks {
+                window.paint_quad(fill(Bounds::new(point(bounds.origin.x + px(*x), top + px(*y)), size(px(BUCKET), px(LANE))), *color));
             }
             let local = move |p: Point<Pixels>| (p.x - bounds.origin.x).to_f64() as f32;
             let down = this.clone();
@@ -1223,7 +1225,12 @@ impl TraceApp {
             });
         });
         let grip = || div().w(px(2.)).h(px(10.)).rounded_full().bg(pal.faint);
-        let span_label = format!("{} – {}", format_duration(a - g.origin), format_duration(b - g.origin));
+        let whole = a <= g.overview.0 && b >= g.overview.1;
+        let span_label = if whole {
+            "Whole trace".to_owned()
+        } else {
+            format!("{} – {}", format_duration((a - g.origin).max(0)), format_duration((b.min(g.overview.1) - g.origin).max(0)))
+        };
         div()
             .h(px(OVERVIEW_H))
             .flex_shrink_0()
@@ -1245,7 +1252,7 @@ impl TraceApp {
                     .text_size(px(12.))
                     .font_features(tnum())
                     .child(div().text_color(pal.text).font_weight(FontWeight::MEDIUM).child(span_label))
-                    .child(div().text_color(pal.muted).child(format!("of {}", format_duration(g.overview.1 - g.overview.0)))),
+                    .child(div().text_color(pal.muted).child(format!("{}{}", if whole { "" } else { "of " }, format_duration(g.overview.1 - g.overview.0)))),
             )
             .child(
                 div()
@@ -1266,8 +1273,8 @@ impl TraceApp {
                             .rounded(px(6.))
                             .bg(pal.card)
                             .border_1()
-                            .border_color(pal.line)
-                            .shadow(vec![soft_shadow(pal, 0.08, 1., 3.)])
+                            .border_color(pal.faint.opacity(if pal.dark { 1. } else { 0.7 }))
+                            .shadow(vec![soft_shadow(pal, 0.10, 1., 3.)])
                             .flex()
                             .items_center()
                             .justify_between()
