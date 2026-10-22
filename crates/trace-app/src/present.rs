@@ -1,7 +1,7 @@
 //! Pure presentation rules: what each span looks like and says. No GPUI types except icon names.
 
 use gpui_kit::assets::IconName;
-use trace_core::{Ns, Span, SpanKind, SpanStatus, TraceState};
+use trace_core::{Ns, Span, SpanKind, SpanStatus, Totals, TraceState};
 use trace_view::{format_cost, format_duration, format_tokens};
 
 /// Which palette column a span paints with.
@@ -144,13 +144,29 @@ pub fn kind_label(k: SpanKind) -> &'static str {
     }
 }
 
-/// `6.9s · $0.12`; the cost part only when the span billed something.
-pub fn bar_label(s: &Span, session_end: Option<Ns>, now: Ns) -> String {
+/// `6.9s · $0.12`. `rollup` is the span's subtree totals, so a parent reads what its whole branch billed;
+/// the cost part shows only when some of it is known.
+pub fn bar_label(s: &Span, rollup: &Totals, session_end: Option<Ns>, now: Ns) -> String {
     let d = format_duration(s.elapsed(session_end, now).ns);
-    match s.usage.as_ref().and_then(|u| u.cost_usd_micros) {
+    match rollup.cost_usd_micros() {
         Some(c) => format!("{d} · {}", format_cost(Some(c))),
         None => d,
     }
+}
+
+/// When the median completed span would draw narrower than 2px at the fitted scale, bars are slivers:
+/// the latest turn is the readable place to open on.
+pub fn focus_turn(state: &TraceState, ns_per_px: f64) -> Option<&Span> {
+    let mut d: Vec<Ns> = state.spans.values().filter_map(|s| Some(s.ended_at_utc_ns? - s.started_at_utc_ns)).collect();
+    if d.is_empty() {
+        return None;
+    }
+    let mid = d.len() / 2;
+    let median = *d.select_nth_unstable(mid).1;
+    if median as f64 / ns_per_px >= 2.0 {
+        return None;
+    }
+    state.spans.values().filter(|s| s.kind == SpanKind::Turn).max_by(|a, b| (a.started_at_utc_ns, &a.span_id).cmp(&(b.started_at_utc_ns, &b.span_id)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,17 +219,17 @@ pub fn descendants<'a>(state: &'a TraceState, id: &trace_core::SpanId, cap: usiz
     out
 }
 
-/// The six cells of the popover's stats panel, in reading order.
-pub fn popover_stats(state: &TraceState, s: &Span, now: Ns) -> [(&'static str, String); 6] {
+/// The six cells of the popover's stats panel, in reading order. Cost and tokens cover the span's subtree (`rollup`).
+pub fn popover_stats(state: &TraceState, s: &Span, rollup: &Totals, now: Ns) -> [(&'static str, String); 6] {
     let origin = state.axis_start().unwrap_or(s.started_at_utc_ns);
-    let usage = s.usage.clone().unwrap_or_default();
-    let tokens = |n: Option<u64>| n.map_or("—".into(), format_tokens);
+    let billed = rollup.billable_records > 0;
+    let tokens = |n: u64| if billed { format_tokens(n) } else { "—".into() };
     [
         ("Duration", format_duration(s.elapsed(state.session.ended_at_utc_ns, now).ns)),
         ("Started", format!("+{}", format_duration(s.started_at_utc_ns - origin))),
-        ("Cost", format_cost(usage.cost_usd_micros)),
-        ("Tokens in", tokens(usage.tokens_input)),
-        ("Tokens out", tokens(usage.tokens_output)),
+        ("Cost", format_cost(rollup.cost_usd_micros())),
+        ("Tokens in", tokens(rollup.tokens_input)),
+        ("Tokens out", tokens(rollup.tokens_output)),
         ("Spans", descendants(state, &s.span_id, usize::MAX).len().to_string()),
     ]
 }
@@ -336,8 +352,10 @@ mod tests {
         assert_eq!(title(&named_after_model), "LLM call");
         assert_eq!(detail(bash, ""), None, "a tool named after itself gets no detail");
         assert_eq!(detail(&s.spans[&"root".into()], "claude-code").as_deref(), Some("claude-code"));
-        assert_eq!(bar_label(llm, None, 40_000 * MS), "3s · $0.05");
-        assert_eq!(bar_label(bash, None, 40_000 * MS), "1s");
+        let label = |id: &str| bar_label(&s.spans[&id.into()], &s.subtree_totals(&id.into()), None, 40_000 * MS);
+        assert_eq!(label("llm"), "3s · $0.05");
+        assert_eq!(label("Bash"), "1s");
+        assert_eq!(label("sub"), "30s · $0.05", "a parent reads its subtree's cost");
     }
 
     #[test]
@@ -353,10 +371,30 @@ mod tests {
     fn popover_stats_read_from_the_span_and_its_subtree() {
         let s = state();
         let sub = &s.spans[&"sub".into()];
-        let stats = popover_stats(&s, sub, 40_000 * MS).map(|(k, v)| format!("{k} {v}"));
-        assert_eq!(stats, ["Duration 30s", "Started +8.1s", "Cost —", "Tokens in —", "Tokens out —", "Spans 2"]);
-        let llm = popover_stats(&s, &s.spans[&"llm".into()], 40_000 * MS).map(|(_, v)| v);
+        let stats = popover_stats(&s, sub, &s.subtree_totals(&"sub".into()), 40_000 * MS).map(|(k, v)| format!("{k} {v}"));
+        assert_eq!(stats, ["Duration 30s", "Started +8.1s", "Cost $0.05", "Tokens in 41.2k", "Tokens out 1.4k", "Spans 2"]);
+        let llm = popover_stats(&s, &s.spans[&"llm".into()], &s.subtree_totals(&"llm".into()), 40_000 * MS).map(|(_, v)| v);
         assert_eq!(llm, ["3s", "+9s", "$0.05", "41.2k", "1.4k", "0"]);
+        let bash = popover_stats(&s, &s.spans[&"Bash".into()], &s.subtree_totals(&"Bash".into()), 40_000 * MS).map(|(_, v)| v);
+        assert_eq!(bash[2..5], ["—", "—", "—"], "nothing billed reads unknown, not zero");
+    }
+
+    #[test]
+    fn opens_on_the_latest_turn_only_when_bars_would_be_slivers() {
+        let mut events = vec![
+            ev(1, 0, None, json!({"event_type": "session.started", "body": {"project_id": "p"}})),
+            start(2, 0, "root", None, json!({"kind": "agent"})),
+        ];
+        for (i, t) in [0, 3_600_000 * MS].into_iter().enumerate() {
+            let seq = 10 * (i as u64 + 1);
+            let turn = format!("turn{i}");
+            events.push(start(seq, t, &turn, Some("root"), json!({"kind": "turn"})));
+            events.push(ev(seq + 1, t + 5_000 * MS, Some(&turn), json!({"event_type": "span.ended", "body": {"status": "succeeded"}})));
+        }
+        let s = TraceState::from_events("s1".into(), &events);
+        let hour_over_1000px = 3_605_000.0 * MS as f64 / 1000.0;
+        assert_eq!(focus_turn(&s, hour_over_1000px).map(|t| t.name.as_str()), Some("turn1"), "5s turns are 1.4px wide in an hour");
+        assert!(focus_turn(&s, 10.0 * MS as f64).is_none(), "at 10ms/px a 5s turn is 500px: the fit is readable");
     }
 
     #[test]

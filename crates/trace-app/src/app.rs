@@ -1,5 +1,5 @@
 use crate::Cli;
-use crate::present::{self, Group, LabelAt};
+use crate::present::{self, Group, LabelAt, Tone};
 use crate::theme::{KindColors, Palette, Pill};
 use chrono::{Local, TimeZone};
 use gpui_kit::assets::IconName;
@@ -33,6 +33,14 @@ const REVEAL: Duration = Duration::from_millis(360);
 const POLL: Duration = Duration::from_millis(100);
 const WATCH: Duration = Duration::from_secs(2);
 const LABEL_SIZE: f32 = 11.5;
+const OVERVIEW_H: f32 = 40.;
+const STRIP_H: f32 = 28.;
+const SIDEBAR_AUTO_BELOW: f32 = 1100.;
+const SIDEBAR_ANIM: Duration = Duration::from_millis(240);
+const FOLD_ANIM: Duration = Duration::from_millis(240);
+/// Left edge of the sidebar toggle, just right of the traffic lights.
+const TOGGLE_X: f32 = 84.;
+const BENCH_FRAMES: usize = 300;
 
 fn tnum() -> FontFeatures {
     FontFeatures(Arc::new(vec![("tnum".into(), 1)]))
@@ -46,11 +54,15 @@ fn ease(t: f32) -> f32 {
 /// Pixel geometry of the trace card for one frame.
 #[derive(Clone, Copy)]
 struct Geo {
+    /// Window x of the card's inner left edge.
+    left: f32,
     name_w: f32,
     tl_w: f32,
     vp: Viewport,
     now: Ns,
     origin: Ns,
+    /// The whole session, as the overview strip shows it.
+    overview: (Ns, Ns),
 }
 
 impl Geo {
@@ -60,6 +72,38 @@ impl Geo {
         }
         self.vp.col_of(t) as f32
     }
+
+    /// Visible time window.
+    fn window(&self) -> (Ns, Ns) {
+        (self.vp.start_ns, self.vp.end_ns(self.tl_w as u16))
+    }
+
+    /// Overview strip x of `t`.
+    fn ov_x(&self, t: Ns) -> f32 {
+        let (a, b) = self.overview;
+        ((t - a) as f64 / (b - a).max(1) as f64 * f64::from(self.tl_w)) as f32
+    }
+
+    fn ov_t(&self, x: f32) -> Ns {
+        let (a, b) = self.overview;
+        a + (f64::from(x / self.tl_w) * (b - a) as f64) as Ns
+    }
+}
+
+/// What a press on the overview strip grabbed.
+#[derive(Clone, Copy)]
+enum LensDrag {
+    Move { grab_ns: Ns },
+    Start,
+    End,
+}
+
+/// `--bench-scroll`: frame intervals and render build times in milliseconds.
+struct Bench {
+    last: Instant,
+    intervals: Vec<f32>,
+    builds: Vec<f32>,
+    rows: Vec<f32>,
 }
 
 pub struct TraceApp {
@@ -84,6 +128,15 @@ pub struct TraceApp {
     reveal_until: Instant,
     error: Option<String>,
     scrubber: Rc<Cell<Bounds<Pixels>>>,
+    /// The user's explicit sidebar choice; `None` follows the window width.
+    sidebar_pref: Option<bool>,
+    /// Width animation: from, to, started.
+    sidebar_anim: (f32, f32, Instant),
+    fold_anim: Option<(SpanId, Instant)>,
+    lens_drag: Option<LensDrag>,
+    /// `--viewport` seconds, applied on first layout.
+    initial_window: Option<(f64, f64)>,
+    bench: Option<Bench>,
     _subs: Vec<Subscription>,
 }
 
@@ -142,8 +195,17 @@ impl TraceApp {
             reveal_until: Instant::now(),
             error: None,
             scrubber: Rc::new(Cell::new(Bounds::default())),
+            sidebar_pref: None,
+            sidebar_anim: (0., 0., Instant::now() - SIDEBAR_ANIM),
+            fold_anim: None,
+            lens_drag: None,
+            initial_window: cli.viewport,
+            bench: cli.bench_scroll.then(|| Bench { last: Instant::now(), intervals: Vec::new(), builds: Vec::new(), rows: Vec::new() }),
             _subs: subs,
         };
+        let w = this.sidebar_target(window.viewport_size().width.to_f64() as f32);
+        this.sidebar_anim.0 = w;
+        this.sidebar_anim.1 = w;
         apply_theme(this.dark(window), cx);
         this.refresh_sessions(cx);
         this.journal_seq = this.store.max_journal_seq().unwrap_or(0);
@@ -258,7 +320,84 @@ impl TraceApp {
             Mode::Replay { clock, .. } => clock.playing,
             Mode::Static => false,
         };
-        running || now < self.reveal_until
+        let fold = self.fold_anim.as_ref().is_some_and(|(_, t)| t.elapsed() < FOLD_ANIM);
+        running || now < self.reveal_until || fold
+    }
+
+    fn sidebar_target(&mut self, vw: f32) -> f32 {
+        let wide = vw >= SIDEBAR_AUTO_BELOW;
+        if wide && self.sidebar_pref == Some(true) {
+            self.sidebar_pref = None;
+        }
+        if self.sidebar_pref.unwrap_or(wide) { SIDEBAR_W } else { 0. }
+    }
+
+    /// Current sidebar width, and whether it is still animating.
+    fn sidebar_w(&mut self, vw: f32) -> (f32, bool) {
+        let target = self.sidebar_target(vw);
+        let (from, to, t0) = self.sidebar_anim;
+        let t = t0.elapsed().as_secs_f32() / SIDEBAR_ANIM.as_secs_f32();
+        let cur = from + (to - from) * ease(t);
+        if target != to {
+            self.sidebar_anim = (cur, target, Instant::now());
+            return (cur, true);
+        }
+        (cur, t < 1.)
+    }
+
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_pref = Some(self.sidebar_anim.1 == 0.);
+    }
+
+    fn toggle_fold(&mut self, id: &SpanId) {
+        if let Some(doc) = &mut self.doc {
+            if !doc.collapsed.remove(id) {
+                doc.collapsed.insert(id.clone());
+            }
+            doc.refresh();
+            self.fold_anim = Some((id.clone(), Instant::now()));
+        }
+    }
+
+    /// Shows `[a, b]` across the timeline, which stops following.
+    fn set_window(&mut self, a: Ns, b: Ns, tl_w: f32) {
+        self.zoomed = true;
+        let Some(doc) = &mut self.doc else { return };
+        if let Mode::Live { following, .. } = &mut doc.mode {
+            *following = false;
+        }
+        doc.viewport = Some(Viewport::fit(a, b.max(a + 1), tl_w as u16));
+    }
+
+    fn lens_down(&mut self, x: f32, g: Geo) {
+        let Some(vp) = self.doc.as_ref().and_then(|d| d.viewport) else { return };
+        let (a, b) = (vp.start_ns, vp.end_ns(g.tl_w as u16));
+        let (xa, xb) = (g.ov_x(a), g.ov_x(b));
+        let tol = ((xb - xa) / 4.).clamp(1., 5.);
+        let t = g.ov_t(x);
+        self.lens_drag = Some(if (x - xa).abs() <= tol {
+            LensDrag::Start
+        } else if (x - xb).abs() <= tol {
+            LensDrag::End
+        } else if (xa..xb).contains(&x) {
+            LensDrag::Move { grab_ns: t - a }
+        } else {
+            LensDrag::Move { grab_ns: (b - a) / 2 }
+        });
+        self.lens_move(x, g);
+    }
+
+    fn lens_move(&mut self, x: f32, g: Geo) {
+        let (Some(drag), Some(vp)) = (self.lens_drag, self.doc.as_ref().and_then(|d| d.viewport)) else { return };
+        let (a, b) = (vp.start_ns, vp.end_ns(g.tl_w as u16));
+        let t = g.ov_t(x);
+        let min = ((g.overview.1 - g.overview.0) / 2000).max(1_000_000);
+        let (a, b) = match drag {
+            LensDrag::Move { grab_ns } => (t - grab_ns, t - grab_ns + (b - a)),
+            LensDrag::Start => (t.min(b - min), b),
+            LensDrag::End => (a, t.max(a + min)),
+        };
+        self.set_window(a, b, g.tl_w);
     }
 
     fn import(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
@@ -309,7 +448,7 @@ impl TraceApp {
     fn select(&mut self, i: usize) {
         if let Some(doc) = &mut self.doc {
             doc.select(i);
-            self.list.scroll_to_item(doc.selected_row, ScrollStrategy::Top);
+            self.list.scroll_to_item(doc.selected_row, ScrollStrategy::Nearest);
         }
     }
 
@@ -364,6 +503,11 @@ impl TraceApp {
             self.open_span_search(window, cx);
             return;
         }
+        if ks.modifiers.platform && (ks.key == "\\" || (ks.modifiers.alt && ks.key == "s")) {
+            self.toggle_sidebar();
+            cx.notify();
+            return;
+        }
         if ks.modifiers.platform || ks.modifiers.control {
             return;
         }
@@ -373,6 +517,7 @@ impl TraceApp {
             return;
         }
         let Some(doc) = &mut self.doc else { return };
+        let folds = doc.collapsed.len();
         match key.as_str() {
             "j" | "down" => doc.move_by(1),
             "k" | "up" => doc.move_by(-1),
@@ -411,7 +556,10 @@ impl TraceApp {
             _ => return,
         }
         if let Some(doc) = &self.doc {
-            self.list.scroll_to_item(doc.selected_row, ScrollStrategy::Top);
+            if doc.collapsed.len() != folds {
+                self.fold_anim = doc.selected.clone().map(|id| (id, Instant::now()));
+            }
+            self.list.scroll_to_item(doc.selected_row, ScrollStrategy::Nearest);
         }
         cx.notify();
     }
@@ -452,12 +600,16 @@ fn apply_theme(dark: bool, cx: &mut App) {
 
 impl Render for TraceApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.tick() {
+        let built = Instant::now();
+        let vw = window.viewport_size().width.to_f64() as f32;
+        let (sw, sliding) = self.sidebar_w(vw);
+        if self.tick() || sliding || self.bench.is_some() {
             window.request_animation_frame();
         }
         let pal = Palette::new(self.dark(window));
-        let vw = window.viewport_size().width.to_f64() as f32;
-        div()
+        let main_pl = MAIN_PAD * (1. - sw / SIDEBAR_W);
+        let card_left = sw + main_pl;
+        let root = div()
             .id("root")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
@@ -468,7 +620,7 @@ impl Render for TraceApp {
             .font_family(".SystemUIFont")
             .text_size(px(13.))
             .text_color(pal.ink)
-            .child(self.render_sidebar(&pal, cx))
+            .child(div().w(px(sw)).flex_shrink_0().h_full().overflow_hidden().child(div().ml(px(sw - SIDEBAR_W)).h_full().child(self.render_sidebar(&pal, cx))))
             .child(
                 div()
                     .flex_1()
@@ -476,20 +628,24 @@ impl Render for TraceApp {
                     .h_full()
                     .flex()
                     .flex_col()
+                    .pl(px(main_pl))
                     .pr(px(MAIN_PAD))
                     .pb(px(MAIN_PAD))
-                    .child(self.render_header(&pal, window, cx))
+                    .child(self.render_header(&pal, (TOGGLE_X + 28. + 10. - card_left - 6.).max(0.), window, cx))
                     .child(match self.doc.is_some() {
-                        true => self.render_card(&pal, vw, window, cx).into_any_element(),
+                        true => self.render_card(&pal, vw, card_left, window, cx).into_any_element(),
                         false => self.render_empty(&pal, cx).into_any_element(),
                     }),
             )
-            .when_some(self.error.clone(), |el, e| el.child(toast(&pal, e, cx)))
+            .child(self.render_sidebar_toggle(&pal, cx))
+            .when_some(self.error.clone(), |el, e| el.child(toast(&pal, e, card_left, cx)));
+        self.bench_step(built, cx);
+        root
     }
 }
 
-fn toast(pal: &Palette, msg: String, cx: &mut Context<TraceApp>) -> impl IntoElement {
-    div().absolute().bottom(px(24.)).left(px(SIDEBAR_W + 24.)).child(
+fn toast(pal: &Palette, msg: String, left: f32, cx: &mut Context<TraceApp>) -> impl IntoElement {
+    div().absolute().bottom(px(24.)).left(px(left + 12.)).child(
         div()
             .id("toast")
             .max_w(px(560.))
@@ -543,7 +699,6 @@ impl TraceApp {
         }
         div()
             .w(px(SIDEBAR_W))
-            .flex_shrink_0()
             .h_full()
             .flex()
             .flex_col()
@@ -689,7 +844,57 @@ fn pill(p: Pill, label: &str, dot: Option<(bool, ElementId)>) -> impl IntoElemen
 // ── Header ─────────────────────────────────────────────────────────────────
 
 impl TraceApp {
-    fn render_header(&self, pal: &Palette, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar_toggle(&self, pal: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("sidebar-toggle")
+            .absolute()
+            .left(px(TOGGLE_X))
+            .top(px((HEADER_H - 28.) / 2.))
+            .size(px(28.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(7.))
+            .cursor_pointer()
+            .hover(|s| s.bg(pal.hover.opacity(4.)))
+            .child(Icon::new(IconName::PanelLeft).size(px(16.)).text_color(pal.text))
+            .tooltip(|w, cx| Tooltip::new("Toggle sidebar  ⌘⌥S").build(w, cx))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.toggle_sidebar();
+                cx.notify();
+            }))
+    }
+
+    fn bench_step(&mut self, built: Instant, cx: &mut Context<Self>) {
+        let Some(b) = &mut self.bench else { return };
+        let now = Instant::now();
+        b.builds.push((now - built).as_secs_f32() * 1e3);
+        b.intervals.push((now - b.last).as_secs_f32() * 1e3);
+        b.last = now;
+        let frame = b.intervals.len();
+        if frame > BENCH_FRAMES {
+            let stats = |v: &mut Vec<f32>| {
+                v.sort_by(f32::total_cmp);
+                let at = |q: f32| v[((v.len() - 1) as f32 * q) as usize];
+                format!("p50 {:.2}ms p95 {:.2}ms max {:.2}ms", at(0.5), at(0.95), at(1.))
+            };
+            let mut iv = b.intervals[10..].to_vec();
+            let mut bd = b.builds[10..].to_vec();
+            let mut rw = b.rows[10.min(b.rows.len())..].to_vec();
+            println!("bench-scroll: {} frames, rows {}", iv.len(), self.doc.as_ref().map_or(0, |d| d.rows.len()));
+            println!("frame interval {}", stats(&mut iv));
+            println!("render build   {}", stats(&mut bd));
+            println!("rows build     {}", stats(&mut rw));
+            cx.quit();
+            return;
+        }
+        let rows = self.doc.as_ref().map_or(0, |d| d.rows.len()) as f32;
+        let span = (rows * ROW_H - 600.).clamp(1., 1200.);
+        self.list.0.borrow().base_handle.set_offset(point(px(0.), px(-((frame as f32 * 37.) % span))));
+        self.pan_px(if frame % 60 < 30 { 4. } else { -4. });
+    }
+
+    fn render_header(&self, pal: &Palette, inset: f32, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut right = div().flex().items_center().gap(px(8.));
         let mut subtitle = String::new();
         if let Some(doc) = &self.doc {
@@ -755,7 +960,8 @@ impl TraceApp {
             .flex()
             .items_center()
             .gap(px(10.))
-            .px(px(6.))
+            .pl(px(6. + inset))
+            .pr(px(6.))
             .child(Icon::new(IconName::Sparkle).size(px(16.)).text_color(pal.accent))
             .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).text_color(pal.ink).child("Trace"))
             .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(13.)).text_color(pal.muted).child(subtitle))
@@ -787,30 +993,49 @@ fn tool_button(id: &'static str, icon: IconName, label: Option<&str>, on: bool, 
 // ── Trace card ─────────────────────────────────────────────────────────────
 
 impl TraceApp {
-    fn geo(&mut self, vw: f32) -> Option<Geo> {
-        let zoomed = self.zoomed;
+    fn geo(&mut self, vw: f32, card_left: f32) -> Option<Geo> {
         let doc = self.doc.as_mut()?;
-        let card_w = vw - SIDEBAR_W - MAIN_PAD - 2.;
+        let card_w = vw - card_left - MAIN_PAD - 2.;
         let name_w = (card_w * 0.3).clamp(230., 300.);
         let tl_w = (card_w - name_w - TL_PAD_R).max(40.);
+        let overview = match &doc.mode {
+            Mode::Replay { replay, .. } => (replay.start().unwrap_or(0), replay.end().unwrap_or(0)),
+            _ => (doc.state.axis_start().unwrap_or(doc.now), doc.now),
+        };
         if doc.viewport.is_none() {
-            let fit_w = if matches!(doc.mode, Mode::Live { .. }) { tl_w } else { tl_w * 0.86 };
-            doc.viewport = Some(doc.fit(fit_w as u16));
+            if let Some((a, b)) = self.initial_window.take() {
+                self.zoomed = true;
+                if let Mode::Live { following, .. } = &mut doc.mode {
+                    *following = false;
+                }
+                let at = |s: f64| overview.0 + (s * 1e9) as Ns;
+                doc.viewport = Some(Viewport::fit(at(a), at(b), tl_w as u16));
+            } else {
+                let fit_w = if matches!(doc.mode, Mode::Live { .. }) { tl_w } else { tl_w * 0.86 };
+                let fit = doc.fit(fit_w as u16);
+                let focus = if matches!(doc.mode, Mode::Replay { .. }) { None } else { focus_window(doc, fit.ns_per_cell, fit_w) };
+                doc.viewport = Some(focus.as_ref().map_or(fit, |f| f.1));
+                if let Some((id, _)) = focus.filter(|_| doc.selected.is_none())
+                    && let Some(i) = doc.rows.iter().position(|r| r.kind == RowKind::Span(id.clone()))
+                {
+                    doc.select(i);
+                    self.list.scroll_to_item(i, ScrollStrategy::Top);
+                }
+            }
         }
         let mut vp = doc.layout(tl_w as u16);
-        if !zoomed && matches!(doc.mode, Mode::Live { following: true, .. }) {
-            vp = Viewport::fit(doc.state.axis_start().unwrap_or(doc.now), doc.now, (tl_w * 0.9) as u16);
+        if !self.zoomed && matches!(doc.mode, Mode::Live { following: true, .. }) {
+            let fit_w = tl_w * 0.9;
+            let fit = Viewport::fit(overview.0, doc.now, fit_w as u16);
+            vp = focus_window(doc, fit.ns_per_cell, fit_w).map_or(fit, |f| f.1);
             doc.viewport = Some(vp);
         }
-        let origin = match &doc.mode {
-            Mode::Replay { replay, .. } => replay.start().unwrap_or(0),
-            _ => doc.state.axis_start().unwrap_or(doc.now),
-        };
-        Some(Geo { name_w, tl_w, vp, now: doc.now, origin })
+        let origin = overview.0;
+        Some(Geo { left: card_left + 1., name_w, tl_w, vp, now: doc.now, origin, overview })
     }
 
-    fn render_card(&mut self, pal: &Palette, vw: f32, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let g = self.geo(vw).expect("render_card runs with a document");
+    fn render_card(&mut self, pal: &Palette, vw: f32, card_left: f32, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let g = self.geo(vw, card_left).expect("render_card runs with a document");
         let doc = self.doc.as_ref().expect("checked by caller");
         let ticks = tick_times(&g.vp, f64::from(g.tl_w), g.origin, 90.);
         let show_now = !matches!(doc.mode, Mode::Static);
@@ -847,18 +1072,33 @@ impl TraceApp {
             .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, _, cx| {
                 let d = ev.delta.pixel_delta(px(ROW_H));
                 let (dx, dy) = (d.x.to_f64() as f32, d.y.to_f64() as f32);
-                let x = ev.position.x.to_f64() as f32 - SIDEBAR_W - 1. - g.name_w;
-                if ev.modifiers.platform {
-                    this.zoom_at(f64::from((1.0 - dy * 0.01).clamp(0.5, 2.0)), x);
-                } else if dx.abs() > dy.abs() {
+                if dx.abs() > dy.abs() {
                     this.pan_px(-dx);
-                } else {
-                    return;
+                    cx.notify();
                 }
-                cx.notify();
             }))
+            .child(canvas(|_, _, _| {}, {
+                let this = cx.entity().downgrade();
+                move |bounds, _, window, _| {
+                    window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, _, cx| {
+                        if phase != DispatchPhase::Capture || !ev.modifiers.platform || !bounds.contains(&ev.position) {
+                            return;
+                        }
+                        let dy = ev.delta.pixel_delta(px(ROW_H)).y.to_f64() as f32;
+                        let x = ev.position.x.to_f64() as f32 - g.left - g.name_w;
+                        this.update(cx, |this, cx| {
+                            this.zoom_at(f64::from((1.0 - dy * 0.01).clamp(0.5, 2.0)), x);
+                            cx.notify();
+                        })
+                        .ok();
+                        cx.stop_propagation();
+                    });
+                }
+            })
+            .absolute()
+            .inset_0())
             .on_pinch(cx.listener(move |this, ev: &PinchEvent, _, cx| {
-                let x = ev.position.x.to_f64() as f32 - SIDEBAR_W - 1. - g.name_w;
+                let x = ev.position.x.to_f64() as f32 - g.left - g.name_w;
                 this.zoom_at(f64::from(1.0 / (1.0 + ev.delta).max(0.2)), x);
                 cx.notify();
             }))
@@ -867,7 +1107,18 @@ impl TraceApp {
                 el.child(div().absolute().top_0().bottom_0().left(px(g.name_w + now_x.round())).w(px(1.)).bg(pal.now))
             })
             .child(
-                uniform_list("rows", count, cx.processor(move |this, range: std::ops::Range<usize>, window, cx| range.map(|ix| this.render_row(ix, g, window, cx)).collect::<Vec<_>>()))
+                uniform_list(
+                    "rows",
+                    count,
+                    cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
+                        let t0 = Instant::now();
+                        let rows = range.map(|ix| this.render_row(ix, g, window, cx)).collect::<Vec<_>>();
+                        if let Some(b) = &mut this.bench {
+                            b.rows.push(t0.elapsed().as_secs_f32() * 1e3);
+                        }
+                        rows
+                    }),
+                )
                     .track_scroll(&self.list)
                     .size_full()
                     .pb(px(if matches!(doc.mode, Mode::Replay { .. }) { 72. } else { 8. })),
@@ -875,6 +1126,7 @@ impl TraceApp {
             
             .child(gpui_kit::component::scroll::Scrollbar::vertical(&self.list));
         let stats = self.render_stats(pal);
+        let overview = self.render_overview(pal, g, cx);
         let transport = matches!(doc.mode, Mode::Replay { .. }).then(|| self.render_transport(pal, &g, cx));
         let _ = window;
         div()
@@ -890,14 +1142,140 @@ impl TraceApp {
             .shadow(vec![soft_shadow(pal, 0.04, 1., 3.)])
             .overflow_hidden()
             .child(stats)
+            .child(overview)
             .child(axis)
             .child(body)
             .when(show_now && (0.0..=g.tl_w).contains(&now_x), |el| {
                 let x = g.name_w + now_x.round();
-                el.child(div().absolute().top(px(STATS_H + AXIS_H - 3.)).left(px(x - 3. + 0.5)).size(px(6.)).rounded_full().bg(pal.accent))
-                    .child(div().absolute().top(px(STATS_H + AXIS_H - 10.)).bottom(px(0.)).left(px(x)).w(px(1.)).bg(pal.now).h(px(10.)))
+                let top = STATS_H + OVERVIEW_H + AXIS_H;
+                el.child(div().absolute().top(px(top - 3.)).left(px(x - 3. + 0.5)).size(px(6.)).rounded_full().bg(pal.accent))
+                    .child(div().absolute().top(px(top - 10.)).bottom(px(0.)).left(px(x)).w(px(1.)).bg(pal.now).h(px(10.)))
             })
             .children(transport)
+    }
+
+    /// The whole session as a density strip, with the visible window as a lens: click jumps, drag moves,
+    /// dragging an edge zooms.
+    fn render_overview(&self, pal: &Palette, g: Geo, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        const BUCKET: f32 = 2.;
+        let doc = self.doc.as_ref().expect("overview needs a document");
+        let session_end = doc.state.session.ended_at_utc_ns;
+        let n = (g.tl_w / BUCKET).ceil().max(1.) as usize;
+        let mut counts = vec![[0u32; 4]; n];
+        for s in doc.state.spans.values().filter(|s| matches!(s.kind, SpanKind::Llm | SpanKind::Tool | SpanKind::Wait) || s.status == SpanStatus::Failed) {
+            let col = |t: Ns| ((g.ov_x(t) / BUCKET).floor().max(0.) as usize).min(n - 1);
+            let (a, b) = (col(s.started_at_utc_ns), col(s.effective_end(session_end, g.now)));
+            let tone = present::tone(s) as usize;
+            counts[a..=b.max(a)].iter_mut().for_each(|c| c[tone] += 1);
+        }
+        let peak = counts.iter().map(|c| c.iter().sum::<u32>()).max().unwrap_or(0).max(1) as f32;
+        let tones = [Tone::Agent, Tone::Llm, Tone::Tool, Tone::Error];
+        let marks: Vec<(f32, f32, Hsla)> = counts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                let total = c.iter().sum::<u32>();
+                if total == 0 {
+                    return None;
+                }
+                let tone = if c[3] > 0 { 3 } else { (0..3).max_by_key(|&k| c[k]).unwrap_or(0) };
+                let h = 4. + (STRIP_H - 12. - 4.) * (1. + total as f32).ln() / (1. + peak).ln();
+                Some((i as f32 * BUCKET, h, pal.kind(tones[tone]).mark))
+            })
+            .collect();
+        let (a, b) = g.window();
+        let lx0 = g.ov_x(a).clamp(0., g.tl_w - 6.);
+        let lx1 = g.ov_x(b).clamp(lx0 + 6., g.tl_w);
+        let this = cx.entity().downgrade();
+        let strip = canvas(|_, _, _| {}, move |bounds, _, window, _| {
+            let mid = bounds.origin.y + bounds.size.height / 2.;
+            for (x, h, color) in &marks {
+                let o = point(bounds.origin.x + px(*x), mid - px(h / 2.));
+                window.paint_quad(fill(Bounds::new(o, size(px(BUCKET - 0.5), px(*h))), *color).corner_radii(px(0.75)));
+            }
+            let local = move |p: Point<Pixels>| (p.x - bounds.origin.x).to_f64() as f32;
+            let down = this.clone();
+            window.on_mouse_event(move |ev: &MouseDownEvent, phase, _, cx| {
+                if phase == DispatchPhase::Bubble && ev.button == MouseButton::Left && bounds.contains(&ev.position) {
+                    down.update(cx, |this, cx| {
+                        this.lens_down(local(ev.position), g);
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            });
+            let drag = this.clone();
+            window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
+                if phase == DispatchPhase::Bubble && ev.pressed_button == Some(MouseButton::Left) {
+                    drag.update(cx, |this, cx| {
+                        if this.lens_drag.is_some() {
+                            this.lens_move(local(ev.position), g);
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                }
+            });
+            window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                if phase == DispatchPhase::Bubble {
+                    this.update(cx, |this, _| this.lens_drag = None).ok();
+                }
+            });
+        });
+        let grip = || div().w(px(2.)).h(px(10.)).rounded_full().bg(pal.faint);
+        let span_label = format!("{} – {}", format_duration(a - g.origin), format_duration(b - g.origin));
+        div()
+            .h(px(OVERVIEW_H))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .border_b_1()
+            .border_color(pal.line)
+            .child(
+                div()
+                    .w(px(g.name_w))
+                    .flex_shrink_0()
+                    .pl(px(16.))
+                    .pr(px(12.))
+                    .flex()
+                    .items_baseline()
+                    .gap(px(6.))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_size(px(12.))
+                    .font_features(tnum())
+                    .child(div().text_color(pal.text).font_weight(FontWeight::MEDIUM).child(span_label))
+                    .child(div().text_color(pal.muted).child(format!("of {}", format_duration(g.overview.1 - g.overview.0)))),
+            )
+            .child(
+                div()
+                    .id("overview")
+                    .w(px(g.tl_w))
+                    .h(px(STRIP_H))
+                    .relative()
+                    .rounded(px(7.))
+                    .bg(pal.wash)
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(2.))
+                            .bottom(px(2.))
+                            .left(px(lx0))
+                            .w(px(lx1 - lx0))
+                            .rounded(px(6.))
+                            .bg(pal.card)
+                            .border_1()
+                            .border_color(pal.line)
+                            .shadow(vec![soft_shadow(pal, 0.08, 1., 3.)])
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .px(px(2.))
+                            .when(lx1 - lx0 >= 24., |el| el.child(grip()).child(grip())),
+                    )
+                    .child(strip.absolute().inset_0()),
+            )
     }
 
     fn render_stats(&self, pal: &Palette) -> impl IntoElement {
@@ -980,16 +1358,16 @@ impl TraceApp {
                 .items_center()
                 .justify_center()
                 .when(row.has_children, |el| {
+                    let progress = match &self.fold_anim {
+                        Some((a, t)) if a == id => ease(t.elapsed().as_secs_f32() / FOLD_ANIM.as_secs_f32()),
+                        _ => 1.,
+                    };
+                    let folded = if row.collapsed { progress } else { 1. - progress };
                     el.cursor_pointer()
-                        .child(Icon::new(if row.collapsed { IconName::ChevronRight } else { IconName::ChevronDown }).size(px(12.)).text_color(pal.muted))
+                        .child(Icon::new(IconName::ChevronDown).size(px(12.)).text_color(pal.muted).rotate(radians(-std::f32::consts::FRAC_PI_2 * folded)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            if let Some(doc) = &mut this.doc {
-                                if !doc.collapsed.remove(&chevron_id) {
-                                    doc.collapsed.insert(chevron_id.clone());
-                                }
-                                doc.refresh();
-                            }
+                            this.toggle_fold(&chevron_id);
                             cx.notify();
                         }))
                 }),
@@ -1140,7 +1518,7 @@ impl TraceApp {
             bar = bar.child(div().absolute().top(px((BAR_H - 2. - 6.) / 2.)).left(px(kx0.max(1.))).w(px((kx1 - kx0.max(1.)).max(2.))).h(px(6.)).rounded(px(2.)).bg(mark.opacity(0.6)));
         }
         cell = cell.child(bar);
-        let label = present::bar_label(s, session_end, g.now);
+        let label = present::bar_label(s, &doc.state.subtree_totals(&s.span_id), session_end, g.now);
         let lw = text_width(window, &label, LABEL_SIZE);
         let tag_w = if slowest { 58. } else { 0. };
         let at = present::label_at(bx, bw, lw + tag_w, g.tl_w);
@@ -1199,7 +1577,7 @@ impl TraceApp {
             SpanStatus::Running if open => (pal.brand, "Running"),
             _ => (Pill { bg: pal.chip, fg: pal.text }, "Unknown"),
         };
-        let stats = present::popover_stats(&doc.state, s, doc.now);
+        let stats = present::popover_stats(&doc.state, s, &doc.state.subtree_totals(&s.span_id), doc.now);
         let cell = |(k, v): &(&'static str, String)| {
             div()
                 .flex_1()
@@ -1530,6 +1908,14 @@ fn icon_tile(icon: IconName, color: Hsla, size: f32, pal: &Palette) -> impl Into
         .border_color(pal.line)
         .shadow(vec![soft_shadow(pal, 0.04, 1., 1.)])
         .child(Icon::new(icon).size(px((size * 0.6).round())).text_color(color))
+}
+
+/// The latest turn's window when the whole-trace fit would draw bars as slivers.
+fn focus_window(doc: &TraceDoc, ns_per_px: f64, fit_w: f32) -> Option<(SpanId, Viewport)> {
+    let t = present::focus_turn(&doc.state, ns_per_px)?;
+    let end = t.effective_end(doc.state.session.ended_at_utc_ns, doc.now);
+    let pad = (end - t.started_at_utc_ns) / 25;
+    Some((t.span_id.clone(), Viewport::fit(t.started_at_utc_ns - pad, end + pad, fit_w as u16)))
 }
 
 fn clock_time(ns: Ns) -> String {

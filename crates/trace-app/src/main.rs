@@ -29,6 +29,18 @@ pub struct Cli {
     pub popover: bool,
     #[arg(long, value_parser = ["light", "dark"])]
     pub appearance: Option<String>,
+    /// Open with the timeline showing this window, in seconds from the trace start: `START,END`.
+    #[arg(long, value_parser = parse_window)]
+    pub viewport: Option<(f64, f64)>,
+    /// Scroll and pan every frame for 300 frames, print frame timing, and quit.
+    #[arg(long, hide = true)]
+    pub bench_scroll: bool,
+}
+
+fn parse_window(v: &str) -> Result<(f64, f64), String> {
+    let (a, b) = v.split_once(',').ok_or("expected START,END")?;
+    let n = |x: &str| x.trim().parse::<f64>().map_err(|e| e.to_string());
+    Ok((n(a)?, n(b)?))
 }
 
 /// `TW_WINDOW=x,y,w,h` in logical points.
