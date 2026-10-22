@@ -5,7 +5,7 @@ use ratatui::widgets::TableState;
 use std::collections::HashSet;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use trace_core::{
-    CanonicalEvent, Ns, Replay, ReplayClock, SessionId, SessionStatus, Span, SpanId, TraceState,
+    CanonicalEvent, Ns, Replay, ReplayClock, SessionId, SessionStatus, Span, SpanId, TraceState, wire_name,
 };
 use trace_render::{Row, RowKind, Theme, Viewport, WaterfallState, flatten};
 use trace_storage::{SessionFilter, SessionSummary, Store};
@@ -781,8 +781,8 @@ pub fn matcher(query: &str) -> impl Fn(&Span) -> bool + use<> {
     move |s: &Span| {
         let fields = [
             ("name", s.name.to_lowercase()),
-            ("kind", label(&s.kind)),
-            ("status", label(&s.status)),
+            ("kind", wire_name(&s.kind)),
+            ("status", wire_name(&s.status)),
             ("model", s.model.as_deref().unwrap_or("").to_lowercase()),
             ("tool", s.tool_name.as_deref().unwrap_or("").to_lowercase()),
         ];
@@ -794,10 +794,3 @@ pub fn matcher(query: &str) -> impl Fn(&Span) -> bool + use<> {
     }
 }
 
-/// The serde name of a snake_case enum, e.g. `failed`.
-pub fn label<T: serde::Serialize>(t: &T) -> String {
-    serde_json::to_value(t)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_default()
-}

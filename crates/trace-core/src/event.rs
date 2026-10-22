@@ -230,3 +230,8 @@ impl CanonicalEvent {
 pub fn sort_events(events: &mut [CanonicalEvent]) {
     events.sort_by(CanonicalEvent::order_cmp);
 }
+
+/// The serde wire name of a unit enum value, e.g. `SpanStatus::Failed` -> "failed".
+pub fn wire_name<T: Serialize>(v: &T) -> String {
+    serde_json::to_value(v).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default()
+}

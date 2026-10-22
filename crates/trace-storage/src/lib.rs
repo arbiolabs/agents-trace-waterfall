@@ -250,7 +250,7 @@ impl Store {
             sql.push_str(&clause.replace('?', &format!("?{}", args.len())));
         };
         if let Some(s) = filter.status {
-            bind(&mut sql, " AND status = ?", label(&s));
+            bind(&mut sql, " AND status = ?", wire_name(&s));
         }
         if let Some(p) = &filter.project {
             bind(&mut sql, " AND project_id = ?", p.clone());
@@ -306,7 +306,7 @@ impl Store {
             let mut stmt = self.conn.prepare(
                 "SELECT session_id, last_event_at FROM sessions WHERE status = ?1 AND last_event_at < ?2 ORDER BY session_id",
             )?;
-            let rows = stmt.query_map(params![label(&SessionStatus::Live), stale_before_ns], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let rows = stmt.query_map(params![wire_name(&SessionStatus::Live), stale_before_ns], |r| Ok((r.get(0)?, r.get(1)?)))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
         let events: Vec<_> = stale
@@ -415,10 +415,6 @@ fn redact_value(v: &mut Value) {
 }
 
 /// snake_case serde name of a trace-core enum.
-fn label<T: serde::Serialize>(v: &T) -> String {
-    serde_json::to_value(v).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default()
-}
-
 fn session_events(conn: &Connection, id: &SessionId) -> Result<Vec<CanonicalEvent>> {
     let mut stmt = conn.prepare("SELECT json FROM events WHERE session_id = ?1")?;
     let rows = stmt.query_map([&id.0], |r| r.get::<_, String>(0))?;
@@ -482,8 +478,8 @@ fn project(conn: &Connection, id: &SessionId) -> Result<()> {
                 s.span_id.0,
                 s.parent_span_id.as_ref().map(|p| &p.0),
                 s.name,
-                label(&s.kind),
-                label(&s.status),
+                wire_name(&s.kind),
+                wire_name(&s.status),
                 s.started_at_utc_ns,
                 s.ended_at_utc_ns,
                 s.model,
@@ -503,7 +499,7 @@ fn project(conn: &Connection, id: &SessionId) -> Result<()> {
                     n(u.cache_read),
                     n(u.cache_write),
                     n(u.cost_usd_micros),
-                    label(&u.cost_provenance),
+                    wire_name(&u.cost_provenance),
                     s.usage_final,
                 ],
             )?;
@@ -524,7 +520,7 @@ fn project(conn: &Connection, id: &SessionId) -> Result<()> {
             s.source_adapter,
             s.harness,
             s.host,
-            label(&s.status),
+            wire_name(&s.status),
             s.started_at_utc_ns,
             s.ended_at_utc_ns,
             st.last_occurred_at_utc_ns,

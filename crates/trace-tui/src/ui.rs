@@ -1,4 +1,4 @@
-use crate::app::{App, Focus, Inspector, Mode, Screen, Tab, View, label};
+use crate::app::{App, Focus, Inspector, Mode, Screen, Tab, View};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span as TSpan};
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, Paragraph, Row as TRow, StatefulWidget, Table, Wrap,
 };
-use trace_core::{CostProvenance, Ns, SLOWEST_DEFAULT_KINDS, SessionStatus};
+use trace_core::{CostProvenance, Ns, SLOWEST_DEFAULT_KINDS, SessionStatus, wire_name};
 use trace_render::{Glyphs, Theme, WaterfallWidget, format_cost, format_duration, format_tokens};
 
 const WIDE: u16 = 120;
@@ -48,7 +48,7 @@ fn hints(app: &App) -> String {
     match (app.screen, &app.view) {
         (Screen::Help, _) => "j/k scroll · Esc/? back · q quit".into(),
         (Screen::Sessions, _) => {
-            let status = app.filter.status.map_or("all".into(), |s| label(&s));
+            let status = app.filter.status.map_or("all".into(), |s| wire_name(&s));
             format!("[{status}] j/k move · Enter open · / filter · F status · ? help · q quit")
         }
         (Screen::Waterfall, None) => String::new(),
@@ -157,7 +157,7 @@ fn sessions(app: &mut App, f: &mut Frame, area: Rect) {
     let title = format!(
         " Sessions ({}) status:{} filter:{} ",
         app.sessions.len(),
-        app.filter.status.map_or("all".into(), |s| label(&s)),
+        app.filter.status.map_or("all".into(), |s| wire_name(&s)),
         app.filter.text.as_deref().unwrap_or("—")
     );
     let table = Table::new(rows, widths)
@@ -295,7 +295,7 @@ fn summary(v: &View) -> Line<'static> {
     };
     Line::from(vec![
         TSpan::styled(
-            format!("{} ", label(&st.session.status)),
+            format!("{} ", wire_name(&st.session.status)),
             Style::new().add_modifier(Modifier::BOLD),
         ),
         TSpan::raw(format!(
@@ -377,7 +377,7 @@ pub fn inspector_lines(v: &View, tab: Tab) -> Vec<Line<'static>> {
                         None => format!("{p} (not arrived)"),
                     });
             out.extend([
-                format!("{}  [{} · {}]", s.name, label(&s.kind), label(&s.status)),
+                format!("{}  [{} · {}]", s.name, wire_name(&s.kind), wire_name(&s.status)),
                 format!("span      {}", s.span_id),
                 format!("parent    {parent}"),
                 format!(

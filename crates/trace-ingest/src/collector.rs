@@ -129,10 +129,13 @@ async fn serve(
                 }
                 Err(e) => eprintln!("collector: accept: {e}"),
             },
-            _ = reconcile.tick() => {
-                // A full queue means the writer is busy; the next tick retries.
-                let _ = tx.try_send(Cmd::Reconcile);
-            }
+            _ = reconcile.tick() => match tx.try_send(Cmd::Reconcile) {
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    eprintln!("collector: writer stopped; shutting down");
+                    break;
+                }
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+            },
             _ = int.recv() => break,
             _ = term.recv() => break,
             _ = &mut stop => break,
