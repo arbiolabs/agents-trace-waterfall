@@ -1,0 +1,12 @@
+[package]
+name = "trace-render"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+ratatui.workspace = true
+trace-core.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
