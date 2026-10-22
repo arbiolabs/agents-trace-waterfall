@@ -1,0 +1,23 @@
+[package]
+name = "trace-tui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "trace-tui"
+path = "src/main.rs"
+
+[dependencies]
+trace-core.workspace = true
+trace-storage.workspace = true
+trace-ingest.workspace = true
+trace-render.workspace = true
+trace-adapter-sdk.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+base64 = "0.22.1"
