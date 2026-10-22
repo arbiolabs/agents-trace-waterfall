@@ -28,7 +28,7 @@ pub struct Row {
 pub fn flatten(state: &TraceState, collapsed: &HashSet<SpanId>, keep: Option<&dyn Fn(&Span) -> bool>) -> Vec<Row> {
     let mut out = Vec::new();
     for id in state.roots() {
-        visit(state, id, 0, false, collapsed, keep, &mut out);
+        visit(state, id, 0, collapsed, keep, &mut out);
     }
     let unresolved = state.unresolved();
     if !unresolved.is_empty() {
@@ -36,7 +36,7 @@ pub fn flatten(state: &TraceState, collapsed: &HashSet<SpanId>, keep: Option<&dy
         out.push(Row { kind: RowKind::UnresolvedHeader, depth: 0, has_children: true, collapsed: false, retry: false });
         let mut any = false;
         for id in unresolved {
-            any |= visit(state, id, 1, false, collapsed, keep, &mut out);
+            any |= visit(state, id, 1, collapsed, keep, &mut out);
         }
         if !any {
             out.truncate(header);
@@ -45,39 +45,54 @@ pub fn flatten(state: &TraceState, collapsed: &HashSet<SpanId>, keep: Option<&dy
     out
 }
 
-/// Returns whether this subtree contains a kept span. `hidden` means an ancestor is collapsed.
+struct Frame<'a> {
+    kids: &'a [SpanId],
+    next: usize,
+    depth: u16,
+    hide_kids: bool,
+    mark: usize,
+    any: bool,
+}
+
+/// Iterative pre-order walk. Returns whether the subtree contains a kept span.
 fn visit(
     state: &TraceState,
-    id: &SpanId,
+    root: &SpanId,
     depth: u16,
-    hidden: bool,
     collapsed: &HashSet<SpanId>,
     keep: Option<&dyn Fn(&Span) -> bool>,
     out: &mut Vec<Row>,
 ) -> bool {
-    let span = &state.spans[id];
-    let kids = state.children(id);
-    let is_collapsed = !kids.is_empty() && collapsed.contains(id);
-    let mark = out.len();
-    if !hidden {
-        out.push(Row { kind: RowKind::Span(id.clone()), depth, has_children: !kids.is_empty(), collapsed: is_collapsed, retry: span.retry_of.is_some() });
-    }
-    let Some(keep) = keep else {
-        if !hidden && !is_collapsed {
-            for k in kids {
-                visit(state, k, depth + 1, false, collapsed, None, out);
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut enter = Some((root, depth, false));
+    loop {
+        if let Some((id, depth, hidden)) = enter.take() {
+            let span = &state.spans[id];
+            let kids = state.children(id);
+            let is_collapsed = !kids.is_empty() && collapsed.contains(id);
+            let mark = out.len();
+            if !hidden {
+                out.push(Row { kind: RowKind::Span(id.clone()), depth, has_children: !kids.is_empty(), collapsed: is_collapsed, retry: span.retry_of.is_some() });
             }
+            let hide_kids = hidden || is_collapsed;
+            let kids = if keep.is_none() && hide_kids { &[] } else { kids };
+            stack.push(Frame { kids, next: 0, depth, hide_kids, mark, any: keep.is_none_or(|k| k(span)) });
         }
-        return true;
-    };
-    let mut any = keep(span);
-    for k in kids {
-        any |= visit(state, k, depth + 1, hidden || is_collapsed, collapsed, Some(keep), out);
+        let top = stack.last_mut().expect("stack holds the root until it returns");
+        if let Some(kid) = top.kids.get(top.next) {
+            top.next += 1;
+            enter = Some((kid, top.depth.saturating_add(1), top.hide_kids));
+            continue;
+        }
+        let done = stack.pop().expect("non-empty");
+        if !done.any {
+            out.truncate(done.mark);
+        }
+        match stack.last_mut() {
+            Some(parent) => parent.any |= done.any,
+            None => return done.any,
+        }
     }
-    if !any {
-        out.truncate(mark);
-    }
-    any
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -90,7 +105,7 @@ impl Viewport {
     const MIN_NS_PER_CELL: f64 = 1e-3;
 
     pub fn fit(start: Ns, end: Ns, width: u16) -> Self {
-        Self { start_ns: start, ns_per_cell: (end - start).max(1) as f64 / f64::from(width.max(1)) }
+        Self { start_ns: start, ns_per_cell: end.saturating_sub(start).max(1) as f64 / f64::from(width.max(1)) }
     }
 
     /// `factor` < 1 zooms in. `anchor_ns` stays at the same column.
@@ -106,11 +121,11 @@ impl Viewport {
     }
 
     pub fn end_ns(&self, width: u16) -> Ns {
-        self.start_ns + (f64::from(width) * self.ns_per_cell).round() as Ns
+        self.start_ns.saturating_add((f64::from(width) * self.ns_per_cell).round() as Ns)
     }
 
     pub fn col_of(&self, t: Ns) -> f64 {
-        (t - self.start_ns) as f64 / self.ns_per_cell
+        t.saturating_sub(self.start_ns) as f64 / self.ns_per_cell
     }
 }
 
@@ -136,16 +151,16 @@ const MIN_TICK_GAP: f64 = 10.0;
 pub fn ticks(vp: &Viewport, width: u16, origin_ns: Ns) -> Vec<(u16, String)> {
     let nice = (0..10).flat_map(|k| [1, 2, 5].map(|m| m * 10i64.pow(k))).chain(TICK_STEPS_S.map(|s| s * 1_000_000_000));
     let Some(step) = nice.into_iter().find(|&s| s as f64 / vp.ns_per_cell >= MIN_TICK_GAP) else { return Vec::new() };
-    let mut k = (vp.start_ns - origin_ns).div_euclid(step);
+    let mut k = vp.start_ns.saturating_sub(origin_ns).div_euclid(step);
     let mut out = Vec::new();
     loop {
-        let t = origin_ns + k * step;
+        let Some(t) = k.checked_mul(step).and_then(|o| origin_ns.checked_add(o)) else { return out };
         let col = vp.col_of(t).floor();
         if col >= f64::from(width) {
             return out;
         }
         if col >= 0.0 {
-            out.push((col as u16, format_duration(t - origin_ns)));
+            out.push((col as u16, format_duration(t.saturating_sub(origin_ns))));
         }
         k += 1;
     }
@@ -158,9 +173,11 @@ fn one_decimal(v: f64) -> String {
 
 /// `0s`, `850ns`, `12.5µs`, `250ms`, `1.5s`, `2m`, `2m30s`, `1h5m`.
 pub fn format_duration(ns: Ns) -> String {
-    if ns < 0 {
-        return format!("-{}", format_duration(-ns));
-    }
+    let sign = if ns < 0 { "-" } else { "" };
+    format!("{sign}{}", format_abs(ns.unsigned_abs()))
+}
+
+fn format_abs(ns: u64) -> String {
     let f = ns as f64;
     match ns {
         0 => "0s".into(),
@@ -206,15 +223,20 @@ pub enum Glyphs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Palette {
+    Color,
+    Mono,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     pub glyphs: Glyphs,
-    /// false = monochrome; statuses stay distinguishable by glyph.
-    pub color: bool,
+    pub palette: Palette,
 }
 
 impl Default for Theme {
     fn default() -> Self {
-        Self { glyphs: Glyphs::Unicode, color: true }
+        Self { glyphs: Glyphs::Unicode, palette: Palette::Color }
     }
 }
 
@@ -227,7 +249,10 @@ impl Theme {
     }
 
     fn fg(&self, c: Color) -> Style {
-        if self.color { Style::new().fg(c) } else { Style::new() }
+        match self.palette {
+            Palette::Color => Style::new().fg(c),
+            Palette::Mono => Style::new(),
+        }
     }
 }
 
@@ -284,7 +309,7 @@ pub struct WaterfallWidget<'a> {
     /// Tick labels are relative to this, normally `TraceState::axis_start`.
     pub origin_ns: Ns,
     pub theme: &'a Theme,
-    /// Shrinks to half the area on narrow terminals.
+    /// Clamped to the area. The full area width draws the tree alone, with no timeline.
     pub tree_width: u16,
     /// Unfocused selection is bold instead of reversed.
     pub focused: bool,
@@ -298,7 +323,7 @@ impl StatefulWidget for WaterfallWidget<'_> {
             return;
         }
         let th = self.theme;
-        let tw = self.tree_width.min(area.width / 2);
+        let tw = self.tree_width.min(area.width);
         let sep_x = area.x + tw;
         let tl_x = sep_x + 1;
         let tl_w = area.width.saturating_sub(tw + 1);

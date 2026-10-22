@@ -3,6 +3,9 @@ use base64::Engine;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::widgets::TableState;
 use std::collections::HashSet;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use trace_core::{
     CanonicalEvent, Ns, Replay, ReplayClock, SessionId, SessionStatus, Span, SpanId, TraceState, wire_name,
@@ -86,8 +89,7 @@ pub struct Inspector {
 pub struct View {
     pub state: TraceState,
     pub mode: Mode,
-    /// Last journal_seq read for this session.
-    pub cursor: i64,
+    pub last_journal_seq: i64,
     pub collapsed: HashSet<SpanId>,
     pub search: String,
     pub rows: Vec<Row>,
@@ -103,11 +105,11 @@ pub struct View {
 }
 
 impl View {
-    fn new(state: TraceState, mode: Mode, cursor: i64) -> Self {
+    fn new(state: TraceState, mode: Mode, last_journal_seq: i64) -> Self {
         let mut v = Self {
             state,
             mode,
-            cursor,
+            last_journal_seq,
             collapsed: HashSet::new(),
             search: String::new(),
             rows: Vec::new(),
@@ -379,7 +381,7 @@ impl App {
     pub fn open(&mut self, id: SessionId) -> anyhow::Result<()> {
         let rows = self.store.events_since(0, Some(&id))?;
         anyhow::ensure!(!rows.is_empty(), "session {id} has no events");
-        let cursor = rows.last().map_or(0, |r| r.0);
+        let last_journal_seq = rows.last().map_or(0, |r| r.0);
         let mut state = TraceState::new(id);
         for (_, e) in &rows {
             state.apply(e);
@@ -393,7 +395,7 @@ impl App {
         } else {
             Mode::Static
         };
-        self.view = Some(View::new(state, mode, cursor));
+        self.view = Some(View::new(state, mode, last_journal_seq));
         self.screen = Screen::Waterfall;
         Ok(())
     }
@@ -450,11 +452,11 @@ impl App {
             } => {
                 let new = self
                     .store
-                    .events_since(v.cursor, Some(&v.state.session.session_id))?;
+                    .events_since(v.last_journal_seq, Some(&v.state.session.session_id))?;
                 let Some((seq, _)) = new.last() else {
                     return Ok(());
                 };
-                v.cursor = *seq;
+                v.last_journal_seq = *seq;
                 let new = new.into_iter().map(|(_, e)| e);
                 if paused_at.is_some() {
                     buffered.extend(new);
@@ -743,14 +745,8 @@ impl App {
             }
             (KeyCode::Char('x'), _) => {
                 if let Some(s) = v.selected_span() {
-                    let path = format!("span-{}.json", s.span_id);
-                    let res = serde_json::to_string_pretty(s)
-                        .map_err(anyhow::Error::from)
-                        .and_then(|j| {
-                            std::fs::write(&path, j).with_context(|| format!("writing {path}"))
-                        });
-                    self.message = Some(match res {
-                        Ok(()) => format!("exported {path}"),
+                    self.message = Some(match export_span(Path::new("."), s) {
+                        Ok(p) => format!("exported {}", p.display()),
                         Err(e) => format!("error: {e:#}"),
                     });
                 }
@@ -758,6 +754,33 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// Writes `dir/span-<id>.json` readable only by the owner. The untrusted id is reduced to `[A-Za-z0-9._-]`.
+pub fn export_span(dir: &Path, s: &Span) -> anyhow::Result<PathBuf> {
+    let id: String = s
+        .span_id
+        .to_string()
+        .chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '-' => c,
+            _ => '_',
+        })
+        .collect();
+    let path = dir.join(format!("span-{id}.json"));
+    let json = serde_json::to_string_pretty(s)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .and_then(|mut f| {
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            f.write_all(json.as_bytes())
+        })
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
 }
 
 pub fn wall_ns() -> Ns {

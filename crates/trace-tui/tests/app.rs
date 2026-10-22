@@ -395,3 +395,37 @@ fn inspector_says_not_captured_for_missing_output() {
         .collect();
     assert_eq!(err, ["exit status 1: 2 tests failed"]);
 }
+
+#[test]
+fn events_tab_saturates_extreme_offsets() {
+    let mut app = opened(&sample());
+    press(&mut app, "jj");
+    let v = app.view.as_mut().unwrap();
+    let id = v.selected.clone().unwrap();
+    let s = v.state.spans.get_mut(&id).unwrap();
+    s.started_at_utc_ns = i64::MAX;
+    s.events[0].timestamp_utc_ns = i64::MIN;
+    let lines: Vec<String> = inspector_lines(app.view.as_ref().unwrap(), Tab::Events)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(lines, ["+-2562047h47m first_token"]);
+}
+
+#[test]
+fn span_export_sanitizes_the_id_and_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let app = opened(&sample());
+    let mut span = app.view.as_ref().unwrap().selected_span().unwrap().clone();
+    span.span_id = SpanId::from("../x/y");
+    let dir = std::env::temp_dir().join(format!("trace-tui-export-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = trace_tui::app::export_span(&dir, &span).unwrap();
+    assert_eq!(path, dir.join("span-.._x_y.json"));
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    let back: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(back["span_id"], "../x/y");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

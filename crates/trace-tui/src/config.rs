@@ -1,7 +1,7 @@
 use anyhow::Context;
 use serde::Deserialize;
 use std::path::PathBuf;
-use trace_render::{Glyphs, Theme};
+use trace_render::{Glyphs, Palette, Theme};
 
 /// `~/.config/trace-waterfall/config.toml`, or `$TRACE_WATERFALL_CONFIG`. A missing file means defaults.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -81,13 +81,13 @@ impl Config {
     }
 
     pub fn theme(&self) -> Theme {
-        let (glyphs, color) = match self.theme {
-            ThemeName::Default => (Glyphs::Unicode, true),
-            ThemeName::Ascii => (Glyphs::Ascii, true),
-            ThemeName::Monochrome => (Glyphs::Unicode, false),
-            ThemeName::AsciiMonochrome => (Glyphs::Ascii, false),
+        let (glyphs, palette) = match self.theme {
+            ThemeName::Default => (Glyphs::Unicode, Palette::Color),
+            ThemeName::Ascii => (Glyphs::Ascii, Palette::Color),
+            ThemeName::Monochrome => (Glyphs::Unicode, Palette::Mono),
+            ThemeName::AsciiMonochrome => (Glyphs::Ascii, Palette::Mono),
         };
-        Theme { glyphs, color }
+        Theme { glyphs, palette }
     }
 }
 
@@ -143,7 +143,7 @@ mod tests {
             c.theme(),
             Theme {
                 glyphs: Glyphs::Ascii,
-                color: false
+                palette: Palette::Mono
             }
         );
         assert_eq!(c.retention.metadata_days, Some(7));

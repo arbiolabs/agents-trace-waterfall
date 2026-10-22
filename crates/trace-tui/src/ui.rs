@@ -108,31 +108,40 @@ fn session_glyph(s: SessionStatus, th: &Theme) -> &'static str {
     }
 }
 
+struct Col {
+    header: &'static str,
+    width: u16,
+    wide_only: bool,
+}
+
+const fn col(header: &'static str, width: u16, wide_only: bool) -> Col {
+    Col {
+        header,
+        width,
+        wide_only,
+    }
+}
+
+const SESSION_COLS: [Col; 10] = [
+    col("", 1, false),
+    col("id", 10, false),
+    col("project", 14, false),
+    col("source", 14, true),
+    col("started", 19, true),
+    col("dur", 7, false),
+    col("model", 14, true),
+    col("tok in/out", 11, false),
+    col("cost", 8, false),
+    col("err", 3, false),
+];
+
 fn sessions(app: &mut App, f: &mut Frame, area: Rect) {
-    // Below 100 columns, source, start time and model drop out; the waterfall header still shows them.
     let wide = area.width >= 100;
-    let cols: &[usize] = if wide {
-        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-    } else {
-        &[0, 1, 2, 5, 7, 8, 9]
-    };
-    let header = [
-        "",
-        "id",
-        "project",
-        "source",
-        "started",
-        "dur",
-        "model",
-        "tok in/out",
-        "cost",
-        "err",
-    ];
-    let widths = [1, 10, 14, 14, 19, 7, 14, 11, 8, 3];
+    let cols = || SESSION_COLS.iter().filter(move |c| wide || !c.wide_only);
     let rows = app.sessions.iter().map(|s| {
         let end = s.ended_at_utc_ns.or(s.last_event_at_utc_ns);
         let dur = match (s.started_at_utc_ns, end) {
-            (Some(a), Some(b)) => format_duration((b - a).max(0)),
+            (Some(a), Some(b)) => format_duration(b.saturating_sub(a).max(0)),
             _ => "—".into(),
         };
         let cells = [
@@ -151,9 +160,15 @@ fn sessions(app: &mut App, f: &mut Frame, area: Rect) {
             format_cost(s.totals.cost_usd_micros()),
             s.totals.failed_spans.to_string(),
         ];
-        TRow::new(cols.iter().map(|&i| cells[i].clone()))
+        TRow::new(
+            SESSION_COLS
+                .iter()
+                .zip(cells)
+                .filter(|(c, _)| wide || !c.wide_only)
+                .map(|(_, cell)| cell),
+        )
     });
-    let widths = cols.iter().map(|&i| Constraint::Length(widths[i]));
+    let widths = cols().map(|c| Constraint::Length(c.width));
     let title = format!(
         " Sessions ({}) status:{} filter:{} ",
         app.sessions.len(),
@@ -162,7 +177,7 @@ fn sessions(app: &mut App, f: &mut Frame, area: Rect) {
     );
     let table = Table::new(rows, widths)
         .header(
-            TRow::new(cols.iter().map(|&i| Cell::from(header[i])))
+            TRow::new(cols().map(|c| Cell::from(c.header)))
                 .style(Style::new().add_modifier(Modifier::BOLD)),
         )
         .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
@@ -189,21 +204,8 @@ fn waterfall(app: &mut App, f: &mut Frame, area: Rect) {
     if w < COMPACT {
         match v.focus {
             Focus::Inspector => inspector(v, f, body),
-            Focus::Timeline => draw_waterfall(v, &theme, f.buffer_mut(), body, 14),
-            Focus::Tree => {
-                // Tree only, full width: render with a timeline off to the right of a scratch buffer, then copy the tree half.
-                let mut scratch = Buffer::empty(Rect::new(0, 0, w * 2 + 1, body.height));
-                let tl_before = v.timeline_width;
-                let scratch_area = scratch.area;
-                draw_waterfall(v, &theme, &mut scratch, scratch_area, w);
-                v.timeline_width = tl_before;
-                let buf = f.buffer_mut();
-                for y in 0..body.height {
-                    for x in 0..w {
-                        buf[(body.x + x, body.y + y)] = scratch[(x, y)].clone();
-                    }
-                }
-            }
+            Focus::Timeline => draw_waterfall(v, &theme, f.buffer_mut(), body, 14.min(w / 2)),
+            Focus::Tree => draw_waterfall(v, &theme, f.buffer_mut(), body, w),
         }
         return;
     }
@@ -235,25 +237,29 @@ fn waterfall(app: &mut App, f: &mut Frame, area: Rect) {
             (a, Some(b))
         }
     };
-    draw_waterfall(v, &theme, f.buffer_mut(), wf_area, 36);
+    draw_waterfall(v, &theme, f.buffer_mut(), wf_area, 36.min(wf_area.width / 2));
     if let Some(a) = ins_area {
         inspector(v, f, a);
     }
 }
 
+/// `tree_width` equal to `area.width` draws the tree alone and leaves the timeline state untouched.
 fn draw_waterfall(v: &mut View, theme: &Theme, buf: &mut Buffer, area: Rect, tree_width: u16) {
-    let tw = tree_width.min(area.width / 2);
-    let tl_w = area.width.saturating_sub(tw + 1);
-    v.timeline_width = tl_w;
-    let mut vp = v.viewport.unwrap_or_else(|| v.fit(tl_w));
-    v.viewport = Some(vp);
-    if let Mode::Live {
-        following: true, ..
-    } = v.mode
-    {
-        vp.start_ns = v.now - (f64::from(tl_w) * vp.ns_per_cell * 0.95) as Ns;
+    let tl_w = area.width.saturating_sub(tree_width.saturating_add(1));
+    if tl_w > 0 {
+        v.timeline_width = tl_w;
+        let mut vp = v.viewport.unwrap_or_else(|| v.fit(tl_w));
+        if let Mode::Live {
+            following: true, ..
+        } = v.mode
+        {
+            vp.start_ns = v
+                .now
+                .saturating_sub((f64::from(tl_w) * vp.ns_per_cell * 0.95) as Ns);
+        }
         v.viewport = Some(vp);
     }
+    let vp = v.viewport.unwrap_or_else(|| v.fit(1));
     let origin = v.state.axis_start().unwrap_or(v.now);
     let widget = WaterfallWidget {
         state: &v.state,
@@ -262,7 +268,7 @@ fn draw_waterfall(v: &mut View, theme: &Theme, buf: &mut Buffer, area: Rect, tre
         viewport: vp,
         origin_ns: origin,
         theme,
-        tree_width: tw,
+        tree_width,
         focused: v.focus != Focus::Inspector,
     };
     widget.render(area, buf, &mut v.wf);
@@ -285,7 +291,11 @@ fn summary(v: &View) -> Line<'static> {
         format!(
             "{} {}",
             s.name,
-            format_duration(s.ended_at_utc_ns.unwrap_or(s.started_at_utc_ns) - s.started_at_utc_ns)
+            format_duration(
+                s.ended_at_utc_ns
+                    .unwrap_or(s.started_at_utc_ns)
+                    .saturating_sub(s.started_at_utc_ns),
+            )
         )
     });
     let search = if v.search.is_empty() {
@@ -358,7 +368,7 @@ pub fn inspector_lines(v: &View, tab: Tab) -> Vec<Line<'static>> {
     };
     let st = &v.state;
     let origin = st.axis_start().unwrap_or(s.started_at_utc_ns);
-    let at = |t: Ns| format!("{} (+{})", utc(t), format_duration(t - origin));
+    let at = |t: Ns| format!("{} (+{})", utc(t), format_duration(t.saturating_sub(origin)));
     let opt = |o: &Option<String>| o.clone().unwrap_or_else(|| "—".into());
     let mut out: Vec<String> = Vec::new();
     match tab {
@@ -456,7 +466,7 @@ pub fn inspector_lines(v: &View, tab: Tab) -> Vec<Line<'static>> {
                     .map_or(String::new(), |p| format!(" payload={p}"));
                 out.push(format!(
                     "+{} {}{attrs}{payload}",
-                    format_duration(e.timestamp_utc_ns - s.started_at_utc_ns),
+                    format_duration(e.timestamp_utc_ns.saturating_sub(s.started_at_utc_ns)),
                     e.name
                 ));
             }

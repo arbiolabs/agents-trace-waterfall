@@ -162,7 +162,7 @@ fn renders_unicode_rows() {
 fn renders_ascii_mono_rows() {
     let s = sample();
     let rows = flatten(&s, &HashSet::from([SpanId::from("root")]), None);
-    let theme = Theme { glyphs: Glyphs::Ascii, color: false };
+    let theme = Theme { glyphs: Glyphs::Ascii, palette: Palette::Mono };
     let buf = render(&s, &rows, &theme, 81, 5, &mut WaterfallState::default());
     assert_eq!(
         lines(&buf),
@@ -214,4 +214,39 @@ fn ten_thousand_spans_render_fast() {
     println!("flatten+render 10k spans: {took:?}");
     assert_eq!(rows.len(), 10_001);
     assert!(took.as_millis() < 100, "{took:?}");
+}
+
+#[test]
+fn extreme_timestamps_saturate_instead_of_overflowing() {
+    assert_eq!([i64::MIN, i64::MAX, i64::MIN + 1].map(format_duration), ["-2562047h47m", "2562047h47m", "-2562047h47m"]);
+    assert_eq!(Viewport::fit(i64::MIN, i64::MAX, 10), Viewport { start_ns: i64::MIN, ns_per_cell: i64::MAX as f64 / 10.0 });
+}
+
+#[test]
+fn flattens_a_hundred_thousand_deep_chain() {
+    const N: usize = 100_000;
+    let mut events = vec![start(0, 0, "s0", None, "tool")];
+    for i in 1..N {
+        events.push(start(i as u64, i as Ns, &format!("s{i}"), Some(&format!("s{}", i - 1)), "tool"));
+    }
+    events.push(end(N as u64, N as Ns, &format!("s{}", N - 1), "failed"));
+    let s = TraceState::from_events("s1".into(), &events);
+    let rows = flatten(&s, &HashSet::new(), None);
+    assert_eq!((rows.len(), rows[1].depth, rows[65_535].depth, rows[N - 1].depth), (N, 1, u16::MAX, u16::MAX));
+    let failed = |sp: &Span| sp.status == SpanStatus::Failed;
+    assert_eq!(flatten(&s, &HashSet::new(), Some(&failed)).len(), N);
+    let collapsed = HashSet::from([SpanId::from("s1")]);
+    assert_eq!(ids(&s, &flatten(&s, &collapsed, Some(&failed))), ["s0", " s1"]);
+}
+
+#[test]
+fn tree_width_equal_to_area_draws_tree_only() {
+    let s = sample();
+    let rows = flatten(&s, &HashSet::from([SpanId::from("root")]), None);
+    let area = Rect::new(0, 0, 30, 4);
+    let mut buf = Buffer::empty(area);
+    let theme = Theme { glyphs: Glyphs::Ascii, palette: Palette::Mono };
+    WaterfallWidget { state: &s, rows: &rows, now: 800 * MS, viewport: Viewport::fit(0, 1000 * MS, 1), origin_ns: 0, theme: &theme, tree_width: 30, focused: true }
+        .render(area, &mut buf, &mut WaterfallState::default());
+    assert_eq!(lines(&buf), ["", "+Ao root                 800ms", "  Unresolved", "   Wo orphan             100ms"]);
 }

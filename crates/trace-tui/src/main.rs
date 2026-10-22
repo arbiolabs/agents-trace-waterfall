@@ -1,4 +1,5 @@
 use anyhow::{Context, bail};
+use clap::builder::{PossibleValue, TypedValueParser};
 use clap::{Parser, Subcommand, ValueEnum};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use std::io::Write;
@@ -9,7 +10,6 @@ use trace_storage::{SessionFilter, Store};
 use trace_tui::app::{App, wall_ns};
 use trace_tui::config::Config;
 
-/// Live sessions silent this long are reconciled as interrupted by the collector.
 const STALE_AFTER: Duration = Duration::from_secs(300);
 const DAY_NS: i64 = 86_400_000_000_000;
 
@@ -33,8 +33,7 @@ enum Cmd {
     /// Replay a recorded session on a virtual clock.
     Replay {
         id: String,
-        /// One of 0.25, 0.5, 1, 2, 5, 10.
-        #[arg(long, default_value_t = 1.0)]
+        #[arg(long, default_value = "1", value_parser = speed_parser())]
         speed: f64,
         #[arg(long, value_enum, default_value_t = At::Start)]
         at: At,
@@ -87,6 +86,13 @@ enum Format {
     Jsonl,
 }
 
+fn speed_parser() -> impl TypedValueParser<Value = f64> {
+    clap::builder::PossibleValuesParser::new(
+        SPEEDS.map(|s| PossibleValue::new(&*s.to_string().leak())),
+    )
+    .map(|s| s.parse::<f64>().expect("SPEEDS entries parse as f64"))
+}
+
 fn parse_tail(s: &str) -> Result<(String, PathBuf), String> {
     let (a, p) = s.split_once('=').ok_or("expected adapter=path")?;
     if !trace_ingest::ADAPTERS.contains(&a) {
@@ -116,15 +122,10 @@ fn main() -> anyhow::Result<()> {
             let id = resolve(&app.store, &id)?;
             app.open(id)
         }),
-        Some(Cmd::Replay { id, speed, at }) => {
-            if !SPEEDS.contains(&speed) {
-                bail!("--speed must be one of {SPEEDS:?}");
-            }
-            run_tui(&cfg, SessionFilter::default(), |app| {
-                let id = resolve(&app.store, &id)?;
-                app.open_replay(id, speed, matches!(at, At::End))
-            })
-        }
+        Some(Cmd::Replay { id, speed, at }) => run_tui(&cfg, SessionFilter::default(), |app| {
+            let id = resolve(&app.store, &id)?;
+            app.open_replay(id, speed, matches!(at, At::End))
+        }),
         Some(Cmd::Import { file, adapter }) => {
             let mut store = Store::open(&db)?;
             let out = trace_ingest::import_file(&mut store, &file, &adapter)?;
