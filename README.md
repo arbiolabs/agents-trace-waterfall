@@ -23,6 +23,18 @@ trace-tui live
 trace-tui collector start --tail claude-code=$HOME/.claude/projects
 ```
 
+## Desktop app
+
+`trace-waterfall` is a native macOS app built with GPUI and gpui-kit. It reads the same database as the TUI and follows the system light or dark appearance. See [docs/design.md](docs/design.md) for its design.
+
+```sh
+cargo build --release -p trace-app
+./target/release/trace-waterfall                 # sessions sidebar plus the waterfall
+./target/release/trace-waterfall --open 7ad34f22 # open a session by id prefix
+```
+
+Click a span for its details. Drag the overview strip to move through long sessions. Drop a `.jsonl` file on the window to import it. The keyboard shortcuts match the TUI.
+
 ## Commands
 
 | Command | Purpose |
@@ -69,7 +81,9 @@ path = "~/.claude/projects"
 | `trace-storage` | SQLite journal, projections, retention, redaction. |
 | `trace-ingest` | Collector daemon, socket server, adapters (`canonical`, `claude-code`). |
 | `trace-render` | Waterfall widget, time axis, tree flattening, clipping. |
+| `trace-view` | The session document shared by the TUI and the desktop app: live polling, replay, folding, viewport. |
 | `trace-tui` | CLI and Ratatui app. |
+| `trace-app` | GPUI desktop app (`trace-waterfall`). |
 | `trace-adapter-sdk` | Harness integration: recorder, socket client, JSONL helpers. Depends only on `trace-core`. |
 | `examples/simulated-live` | Deterministic agent run generator for demos, fixtures, and perf tests. |
 

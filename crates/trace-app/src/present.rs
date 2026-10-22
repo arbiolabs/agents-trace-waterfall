@@ -119,9 +119,14 @@ pub fn detail(s: &Span, harness: &str) -> Option<String> {
             .filter(|t| !t.eq_ignore_ascii_case(&s.name))
             .or_else(|| nonempty(s.provider.as_deref())),
         SpanKind::Agent => nonempty(Some(harness)).or_else(|| nonempty(s.agent_name.as_deref())),
-        SpanKind::Subagent => s.model.as_deref().map(pretty_model).or_else(|| nonempty(s.agent_name.as_deref())),
+        SpanKind::Subagent => s.model.as_deref().map(pretty_model).or_else(|| nonempty(s.agent_name.as_deref()).map(short_id)),
         _ => None,
     }
+}
+
+/// Opaque hex ids (harness agent ids) shorten to 7 characters, like git hashes; names pass through.
+fn short_id(v: String) -> String {
+    if v.len() > 12 && v.chars().all(|c| c.is_ascii_hexdigit()) { v[..7].to_owned() } else { v }
 }
 
 /// The row title. An LLM span named after its model reads `LLM call`, since the detail already names the model.
@@ -262,6 +267,12 @@ pub fn group(live: bool, started: Option<Ns>, today_start: Ns) -> Group {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn opaque_agent_ids_shorten_but_names_do_not() {
+        assert_eq!(super::short_id("a000974c519f6187a".into()), "a000974");
+        assert_eq!(super::short_id("explorer".into()), "explorer");
+    }
+
     use super::*;
     use serde_json::json;
     use trace_core::CanonicalEvent;
