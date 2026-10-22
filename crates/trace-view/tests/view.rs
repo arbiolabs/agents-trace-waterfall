@@ -149,3 +149,18 @@ fn fine_ticks_deep_into_a_session_stay_distinct() {
     let labels: Vec<String> = ticks(&vp, 50, 0).into_iter().map(|(_, l)| l).collect();
     assert_eq!(labels, ["7h4m", "+1s", "+2s", "+3s", "+4s"]);
 }
+
+#[test]
+fn resolves_unique_session_prefixes() {
+    let started = |session: &str, seq| {
+        let mut e = ev(seq, 0, None, json!({"event_type": "session.started", "body": {"project_id": "p"}}));
+        e.session_id = session.into();
+        e
+    };
+    let mut store = trace_storage::Store::open_in_memory().unwrap();
+    store.append(&[started("abc1", 1), started("abc2", 2), started("abc", 3)]).unwrap();
+    assert_eq!(resolve_session(&store, "abc1").unwrap(), SessionId::from("abc1"));
+    assert_eq!(resolve_session(&store, "abc").unwrap(), SessionId::from("abc"), "an exact id wins over its extensions");
+    assert!(resolve_session(&store, "ab").unwrap_err().to_string().contains("ambiguous"));
+    assert!(resolve_session(&store, "zz").unwrap_err().to_string().contains("no session"));
+}

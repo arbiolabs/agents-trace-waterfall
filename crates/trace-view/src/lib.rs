@@ -4,7 +4,7 @@
 
 mod doc;
 
-pub use doc::{EXPAND_ALL_LIMIT, Mode, TraceDoc, export_span, matcher, wall_ns};
+pub use doc::{EXPAND_ALL_LIMIT, Mode, TraceDoc, export_span, matcher, resolve_session, wall_ns};
 use std::collections::HashSet;
 use trace_core::{Ns, Span, SpanId, TraceState};
 

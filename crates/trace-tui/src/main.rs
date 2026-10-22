@@ -120,11 +120,11 @@ fn main() -> anyhow::Result<()> {
             |_| Ok(()),
         ),
         Some(Cmd::Open { id }) => run_tui(&cfg, SessionFilter::default(), |app| {
-            let id = resolve(&app.store, &id)?;
+            let id = trace_view::resolve_session(&app.store, &id)?;
             app.open(id)
         }),
         Some(Cmd::Replay { id, speed, at }) => run_tui(&cfg, SessionFilter::default(), |app| {
-            let id = resolve(&app.store, &id)?;
+            let id = trace_view::resolve_session(&app.store, &id)?;
             app.open_replay(id, speed, matches!(at, At::End))
         }),
         Some(Cmd::Import { file, adapter }) => {
@@ -150,7 +150,7 @@ fn main() -> anyhow::Result<()> {
                 );
             }
             let store = Store::open(&db)?;
-            let id = resolve(&store, &id)?;
+            let id = trace_view::resolve_session(&store, &id)?;
             let events = store.session_events(&id)?;
             match output {
                 Some(p) => trace_adapter_sdk::write_jsonl(
@@ -212,28 +212,6 @@ fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
-    }
-}
-
-/// A full id or a unique prefix of one.
-fn resolve(store: &Store, prefix: &str) -> anyhow::Result<SessionId> {
-    let hits: Vec<SessionId> = store
-        .list_sessions(&SessionFilter::default())?
-        .into_iter()
-        .map(|s| s.session_id)
-        .filter(|id| id.0.starts_with(prefix))
-        .collect();
-    match hits.as_slice() {
-        [one] => Ok(one.clone()),
-        [] => bail!("no session matches {prefix:?}"),
-        many if many.iter().any(|id| id.0 == prefix) => Ok(SessionId(prefix.to_owned())),
-        many => bail!(
-            "{prefix:?} is ambiguous: {}",
-            many.iter()
-                .map(|i| i.0.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
     }
 }
 

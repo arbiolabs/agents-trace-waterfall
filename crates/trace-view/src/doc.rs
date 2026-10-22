@@ -6,7 +6,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use trace_core::{CanonicalEvent, Ns, Replay, ReplayClock, SessionId, SessionStatus, Span, SpanId, TraceState, wire_name};
-use trace_storage::Store;
+use trace_storage::{SessionFilter, Store};
 
 pub const EXPAND_ALL_LIMIT: usize = 5_000;
 
@@ -385,5 +385,17 @@ pub fn matcher(query: &str) -> impl Fn(&Span) -> bool + use<> {
         terms
             .iter()
             .all(|(k, v)| fields.iter().any(|(f, val)| k.as_deref().is_none_or(|k| k == *f) && val.contains(v.as_str())))
+    }
+}
+
+/// A full id or a unique prefix of one.
+pub fn resolve_session(store: &Store, prefix: &str) -> anyhow::Result<SessionId> {
+    let hits: Vec<SessionId> =
+        store.list_sessions(&SessionFilter::default())?.into_iter().map(|s| s.session_id).filter(|id| id.0.starts_with(prefix)).collect();
+    match hits.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => anyhow::bail!("no session matches {prefix:?}"),
+        many if many.iter().any(|id| id.0 == prefix) => Ok(SessionId(prefix.to_owned())),
+        many => anyhow::bail!("{prefix:?} is ambiguous: {}", many.iter().map(|i| i.0.as_str()).collect::<Vec<_>>().join(", ")),
     }
 }
