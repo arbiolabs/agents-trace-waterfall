@@ -150,27 +150,33 @@ const MIN_TICK_GAP: f64 = 10.0;
 
 /// Tick columns and labels relative to `origin_ns` (the axis start), spaced at least 10 cells apart.
 pub fn ticks(vp: &Viewport, width: u16, origin_ns: Ns) -> Vec<(u16, String)> {
+    tick_times(vp, f64::from(width), origin_ns, MIN_TICK_GAP).into_iter().map(|(t, l)| (vp.col_of(t).floor() as u16, l)).collect()
+}
+
+/// Tick times and labels relative to `origin_ns`, spaced at least `min_gap` cells apart, for frontends that
+/// place ticks at fractional cells (pixels).
+pub fn tick_times(vp: &Viewport, width: f64, origin_ns: Ns, min_gap: f64) -> Vec<(Ns, String)> {
     let nice = (0..10).flat_map(|k| [1, 2, 5].map(|m| m * 10i64.pow(k))).chain(TICK_STEPS_S.map(|s| s * 1_000_000_000));
-    let Some(step) = nice.into_iter().find(|&s| s as f64 / vp.ns_per_cell >= MIN_TICK_GAP) else { return Vec::new() };
+    let Some(step) = nice.into_iter().find(|&s| s as f64 / vp.ns_per_cell >= min_gap) else { return Vec::new() };
     let mut k = vp.start_ns.saturating_sub(origin_ns).div_euclid(step);
     let mut times = Vec::new();
     while let Some(t) = k.checked_mul(step).and_then(|o| origin_ns.checked_add(o)) {
         let col = vp.col_of(t).floor();
-        if col >= f64::from(width) {
+        if col >= width {
             break;
         }
         if col >= 0.0 {
-            times.push((col as u16, t));
+            times.push(t);
         }
         k += 1;
     }
     let label = |t: Ns| format_duration(t.saturating_sub(origin_ns));
-    let mut out: Vec<_> = times.iter().map(|&(c, t)| (c, label(t))).collect();
+    let mut out: Vec<_> = times.iter().map(|&t| (t, label(t))).collect();
     // Deep into a long session the formatter drops seconds, so fine ticks would all read alike;
     // then label the first tick and show the rest as offsets from it.
     if out.windows(2).any(|w| w[0].1 == w[1].1) {
-        let first = times[0].1;
-        for (o, &(_, t)) in out.iter_mut().zip(&times).skip(1) {
+        let first = times[0];
+        for (o, &t) in out.iter_mut().zip(&times).skip(1) {
             o.1 = format!("+{}", format_duration(t - first));
         }
     }

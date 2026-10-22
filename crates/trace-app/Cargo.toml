@@ -1,0 +1,24 @@
+[package]
+name = "trace-app"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "trace-waterfall"
+path = "src/main.rs"
+
+[dependencies]
+trace-core.workspace = true
+trace-storage.workspace = true
+trace-ingest.workspace = true
+trace-view.workspace = true
+trace-tui = { path = "../trace-tui" }
+anyhow.workspace = true
+clap.workspace = true
+gpui-kit = "0.8.0"
+gpui-pre-macos = { version = "0.3.9", features = ["runtime_shaders"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+serde_json.workspace = true

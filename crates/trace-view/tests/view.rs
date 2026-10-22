@@ -164,3 +164,10 @@ fn resolves_unique_session_prefixes() {
     assert!(resolve_session(&store, "ab").unwrap_err().to_string().contains("ambiguous"));
     assert!(resolve_session(&store, "zz").unwrap_err().to_string().contains("no session"));
 }
+
+#[test]
+fn tick_times_respect_a_pixel_gap() {
+    let vp = Viewport { start_ns: 0, ns_per_cell: 100.0 * MS as f64 };
+    let t = tick_times(&vp, 450.0, 0, 80.0);
+    assert_eq!(t, vec![(0, "0s".to_string()), (10_000 * MS, "10s".into()), (20_000 * MS, "20s".into()), (30_000 * MS, "30s".into()), (40_000 * MS, "40s".into())]);
+}
