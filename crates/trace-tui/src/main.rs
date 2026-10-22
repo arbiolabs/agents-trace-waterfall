@@ -55,6 +55,7 @@ enum Cmd {
         #[arg(long)]
         include_payloads: bool,
     },
+    /// Background ingestion process that keeps recording while the TUI is closed
     Collector {
         #[command(subcommand)]
         cmd: CollectorCmd,

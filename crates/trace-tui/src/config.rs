@@ -58,7 +58,13 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        let mut c: Self = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        c.db = c.db.map(expand_home);
+        c.socket = c.socket.map(expand_home);
+        for t in &mut c.tail {
+            t.path = expand_home(std::mem::take(&mut t.path));
+        }
+        Ok(c)
     }
 
     /// `$TRACE_WATERFALL_DB`, then config, then the storage default.
@@ -91,6 +97,13 @@ fn env_path(k: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn expand_home(p: PathBuf) -> PathBuf {
+    match p.strip_prefix("~") {
+        Ok(rest) => home().join(rest),
+        Err(_) => p,
+    }
+}
+
 fn home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -100,6 +113,12 @@ fn home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expands_leading_tilde_only() {
+        assert_eq!(expand_home("~/x".into()), home().join("x"));
+        assert_eq!(expand_home("/a/~/x".into()), PathBuf::from("/a/~/x"));
+    }
 
     #[test]
     fn parses_full_file() {
