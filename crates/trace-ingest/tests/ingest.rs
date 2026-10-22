@@ -39,6 +39,7 @@ fn env() -> Env {
 
 fn config(env: &Env, tail: &[(&str, &Path)], stale_after: Duration) -> CollectorConfig {
     CollectorConfig {
+        capture: Default::default(),
         socket_path: env.sock.clone(),
         db_path: env.db.clone(),
         stale_after,
@@ -541,4 +542,41 @@ fn doctor_reports_live_collector_and_adapter_blind_spots() {
         (false, false),
         "socket removed after shutdown"
     );
+}
+
+#[test]
+fn collector_strips_previews_unless_project_opted_in() {
+    let env = env();
+    let mut cfg = config(&env, &[], YEAR);
+    cfg.capture.projects = vec!["opted-in".into()];
+    let c = start(cfg);
+    let session = |sid: &str, project: &str| -> Vec<CanonicalEvent> {
+        let mut seq = 0;
+        let mut ev = |span: Option<&str>, body: Value| {
+            seq += 1;
+            let mut v = json!({"source_id": format!("src-{sid}"), "source_seq": seq, "event_id": format!("{sid}-{seq}"),
+                "observed_at_utc_ns": seq, "occurred_at_utc_ns": seq, "session_id": sid, "span_id": span});
+            v.as_object_mut().unwrap().extend(body.as_object().unwrap().clone());
+            serde_json::from_value::<CanonicalEvent>(v).unwrap()
+        };
+        vec![
+            ev(None, json!({"event_type": "session.started", "body": {"project_id": project}})),
+            ev(Some("x"), json!({"event_type": "span.started", "body": {"name": "x", "kind": "tool", "input_preview": "IN"}})),
+            ev(Some("x"), json!({"event_type": "span.ended", "body": {"status": "succeeded", "output_preview": "OUT"}})),
+        ]
+    };
+    for (sid, project) in [("a", "opted-in"), ("b", "other")] {
+        let events = session(sid, project);
+        let mut client = Client::new(&env.sock, events[0].source_id.clone(), 100);
+        client.send(&events).unwrap();
+        assert_eq!(client.flush(Duration::from_secs(5)).unwrap(), Some(3));
+    }
+    c.stop();
+    let store = Store::open(&env.db).unwrap();
+    let previews = |sid: &str| {
+        let x = &store.load_session(&sid.into()).unwrap().spans[&SpanId::from("x")];
+        (x.input_preview.clone(), x.output_preview.clone())
+    };
+    assert_eq!(previews("a"), (Some("IN".into()), Some("OUT".into())));
+    assert_eq!(previews("b"), (None, None));
 }

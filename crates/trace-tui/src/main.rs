@@ -175,6 +175,7 @@ fn main() -> anyhow::Result<()> {
                 db_path: db,
                 stale_after: STALE_AFTER,
                 tail: all,
+                capture: cfg.capture.clone(),
             })
         }
         Some(Cmd::Doctor) => {

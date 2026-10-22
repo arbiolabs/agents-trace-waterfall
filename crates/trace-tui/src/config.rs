@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use trace_render::{Glyphs, Theme};
 
 /// `~/.config/trace-waterfall/config.toml`, or `$TRACE_WATERFALL_CONFIG`. A missing file means defaults.
-/// Unknown keys (such as `[capture]`, which the collector owns) are ignored.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -13,6 +12,7 @@ pub struct Config {
     pub theme: ThemeName,
     pub retention: Retention,
     pub tail: Vec<Tail>,
+    pub capture: trace_ingest::Capture,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -102,7 +102,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_full_file_and_ignores_capture() {
+    fn parses_full_file() {
         let c: Config = toml::from_str(
             r#"
             db = "/tmp/t.db"
@@ -119,6 +119,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.db, Some(PathBuf::from("/tmp/t.db")));
+        assert_eq!((c.capture.payloads, c.capture.projects.as_slice()), (false, ["p".to_string()].as_slice()));
         assert_eq!(
             c.theme(),
             Theme {

@@ -10,12 +10,13 @@ use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use trace_adapter_sdk::{
     MAX_LINE_BYTES, PROTOCOL_VERSION, RawEvent, SourceInfo, TraceAdapter, system_now_ns,
 };
-use trace_core::{CanonicalEvent, EventBody, SCHEMA_VERSION};
+use trace_core::{CanonicalEvent, EventBody, SCHEMA_VERSION, SessionId};
 use trace_storage::{AppendOutcome, SessionFilter, Store};
 
 pub struct CollectorConfig {
@@ -25,6 +26,36 @@ pub struct CollectorConfig {
     pub stale_after: Duration,
     /// Files to tail with a named adapter, e.g. ("claude-code", ~/.claude/projects).
     pub tail: Vec<(String, PathBuf)>,
+    pub capture: Capture,
+}
+
+/// Opt-in payload capture (docs/privacy.md). Without it the collector strips input and output previews.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct Capture {
+    pub payloads: bool,
+    pub projects: Vec<String>,
+}
+
+impl Capture {
+    /// `projects` maps sessions to projects as `session.started` events pass through.
+    // ponytail: the map lives in memory, so after a restart previews of already-started sessions are stripped
+    // (the safe side); look the project up in the store if that matters.
+    pub fn strip(&self, projects: &mut HashMap<SessionId, String>, events: &mut [CanonicalEvent]) {
+        for e in events {
+            if let EventBody::SessionStarted { project_id, .. } = &e.body {
+                projects.insert(e.session_id.clone(), project_id.clone());
+            }
+            if self.payloads || projects.get(&e.session_id).is_some_and(|p| self.projects.contains(p)) {
+                continue;
+            }
+            match &mut e.body {
+                EventBody::SpanStarted { input_preview, .. } => *input_preview = None,
+                EventBody::SpanEnded { output_preview, .. } => *output_preview = None,
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Runs until SIGINT/SIGTERM. Blocking; owns its own Tokio runtime.

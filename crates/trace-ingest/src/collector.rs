@@ -1,4 +1,4 @@
-use crate::{CollectorConfig, adapter_by_name, validate};
+use crate::{Capture, CollectorConfig, adapter_by_name, validate};
 use anyhow::{Context, anyhow, bail, ensure};
 use serde::Deserialize;
 use serde_json::json;
@@ -48,8 +48,8 @@ pub fn run_collector_until(
     claim_socket(&cfg.socket_path)?;
     let store = Store::open(&cfg.db_path)?;
     let (tx, rx) = mpsc::channel(WRITE_QUEUE);
-    let stale_after = cfg.stale_after;
-    let writer = std::thread::spawn(move || write_loop(store, rx, stale_after));
+    let (stale_after, capture) = (cfg.stale_after, cfg.capture.clone());
+    let writer = std::thread::spawn(move || write_loop(store, rx, stale_after, capture));
     let stop_tail = Arc::new(AtomicBool::new(false));
     let tail = (!cfg.tail.is_empty()).then(|| {
         let (files, offsets, tx, stop) = (
@@ -142,15 +142,17 @@ async fn serve(
     Ok(())
 }
 
-fn write_loop(mut store: Store, mut rx: mpsc::Receiver<Cmd>, stale_after: Duration) {
+fn write_loop(mut store: Store, mut rx: mpsc::Receiver<Cmd>, stale_after: Duration, capture: Capture) {
     reconcile(&mut store, stale_after);
+    let mut projects = HashMap::new();
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
             Cmd::Append {
-                events,
+                mut events,
                 source,
                 reply,
             } => {
+                capture.strip(&mut projects, &mut events);
                 let r = store
                     .append(&events)
                     .and_then(|_| source.map_or(Ok(None), |s| store.source_cursor(&s)));
