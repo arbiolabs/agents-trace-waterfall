@@ -299,7 +299,8 @@ impl Store {
     }
 
     /// Ends stale `live` sessions with a synthetic `session.ended {status: interrupted}` at their last
-    /// event time. The event id is derived from the session, so re-running is idempotent.
+    /// event time. The event id is derived from the session and that time, so re-running is idempotent
+    /// while a session revived by later activity can be interrupted again.
     pub fn reconcile_interrupted(&mut self, stale_before_ns: Ns, now_ns: Ns) -> Result<Vec<SessionId>> {
         let stale: Vec<(String, Ns)> = {
             let mut stmt = self.conn.prepare(
@@ -314,7 +315,7 @@ impl Store {
                 schema_version: SCHEMA_VERSION,
                 source_id: COLLECTOR_SOURCE.into(),
                 source_seq: 0,
-                event_id: EventId(format!("interrupted:{id}")),
+                event_id: EventId(format!("interrupted:{id}:{last}")),
                 observed_at_utc_ns: now_ns,
                 occurred_at_utc_ns: *last,
                 session_id: id.as_str().into(),

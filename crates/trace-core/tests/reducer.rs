@@ -173,3 +173,12 @@ fn replay_clock_scales_and_stops_at_end() {
     c.faster();
     assert_eq!(c.speed(), 10.0);
 }
+
+#[test]
+fn activity_after_interruption_revives_session() {
+    let interrupted = ev(9, 50, None, json!({"event_type": "session.ended", "body": {"status": "interrupted"}}));
+    let s = TraceState::from_events("s1".into(), &[start(1, 10, "x", None, "tool"), interrupted.clone(), end(2, 60, "x", "succeeded")]);
+    assert_eq!((s.session.status, s.session.ended_at_utc_ns), (SessionStatus::Live, None));
+    let still = TraceState::from_events("s1".into(), &[start(1, 10, "x", None, "tool"), interrupted]);
+    assert_eq!(still.session.status, SessionStatus::Interrupted);
+}

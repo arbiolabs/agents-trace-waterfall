@@ -192,7 +192,7 @@ fn reconcile_interrupted_is_idempotent() {
     let interrupted = store.list_sessions(&SessionFilter { status: Some(SessionStatus::Interrupted), ..Default::default() }).unwrap();
     assert_eq!(interrupted.iter().map(|s| s.session_id.0.as_str()).collect::<Vec<_>>(), vec!["stale"]);
     let synthetic = store.session_events(&"stale".into()).unwrap().pop().unwrap();
-    assert_eq!((synthetic.source_id.0.as_str(), synthetic.event_id.0.as_str()), ("collector", "interrupted:stale"));
+    assert_eq!((synthetic.source_id.0.as_str(), synthetic.event_id.0.as_str()), ("collector", "interrupted:stale:31"));
     assert_eq!(store.max_journal_seq().unwrap(), 18);
 }
 

@@ -95,6 +95,14 @@ impl TraceState {
             return false;
         }
         self.event_count += 1;
+        // An interruption is a guess from silence; later activity proves the session was still live.
+        if self.session.status == SessionStatus::Interrupted
+            && !matches!(e.body, EventBody::SessionEnded { .. })
+            && self.session.ended_at_utc_ns.is_some_and(|t| e.occurred_at_utc_ns > t)
+        {
+            self.session.status = SessionStatus::Live;
+            self.session.ended_at_utc_ns = None;
+        }
         self.last_occurred_at_utc_ns = Some(self.last_occurred_at_utc_ns.map_or(e.occurred_at_utc_ns, |t| t.max(e.occurred_at_utc_ns)));
         self.reduce(e);
         true
