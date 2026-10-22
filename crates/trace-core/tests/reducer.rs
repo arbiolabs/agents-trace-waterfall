@@ -100,6 +100,30 @@ fn final_usage_supersedes_provisional_and_is_not_double_counted() {
 }
 
 #[test]
+fn subtree_totals_count_each_span_once() {
+    let s = TraceState::from_events("s1".into(), &[
+        start(1, 0, "root", None, "agent"),
+        usage(2, 1, "root", 1_000, 100, true),
+        start(3, 2, "sub", Some("root"), "subagent"),
+        usage(4, 3, "sub", 10, 1, true),
+        start(5, 4, "llm", Some("sub"), "llm"),
+        usage(6, 5, "llm", 20, 2, false),
+        usage(7, 6, "llm", 30, 3, true),
+        start(8, 7, "tool", Some("sub"), "tool"),
+        start(9, 8, "other", None, "agent"),
+        usage(10, 9, "other", 5_000, 500, true),
+    ]);
+    let sum = |id: &str| {
+        let t = s.subtree_totals(&id.into());
+        (t.tokens_input, t.cost_usd_micros(), t.billable_records)
+    };
+    assert_eq!(sum("root"), (1_040, Some(104), 3), "own usage plus the final usage of each descendant");
+    assert_eq!(sum("sub"), (40, Some(4), 2));
+    assert_eq!(sum("tool"), (0, None, 0), "nothing billed means unknown cost");
+    assert_eq!(s.subtree_totals(&"root".into()).tokens_input + sum("other").0, s.totals().tokens_input);
+}
+
+#[test]
 fn unknown_cost_is_not_a_number() {
     let s = TraceState::from_events("s1".into(), &[
         start(1, 0, "x", None, "llm"),

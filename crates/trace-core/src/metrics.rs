@@ -35,6 +35,23 @@ pub struct Totals {
 }
 
 impl Totals {
+    fn add(&mut self, s: &Span) {
+        if s.status == SpanStatus::Failed {
+            self.failed_spans += 1;
+        }
+        let Some(u) = &s.usage else { return };
+        self.billable_records += 1;
+        self.tokens_input += u.tokens_input.unwrap_or(0);
+        self.tokens_output += u.tokens_output.unwrap_or(0);
+        self.cache_read += u.cache_read.unwrap_or(0);
+        self.cache_write += u.cache_write.unwrap_or(0);
+        match (u.cost_usd_micros, u.cost_provenance) {
+            (Some(c), CostProvenance::Actual) => self.cost_actual_usd_micros += c,
+            (Some(c), CostProvenance::Estimate) => self.cost_estimate_usd_micros += c,
+            _ => self.cost_unknown_records += 1,
+        }
+    }
+
     pub fn cost_usd_micros(&self) -> Option<u64> {
         (self.billable_records > self.cost_unknown_records).then(|| self.cost_actual_usd_micros + self.cost_estimate_usd_micros)
     }
@@ -53,21 +70,19 @@ impl TraceState {
     /// Aggregated from each span's own usage. Ancestors never contribute, so nothing is counted twice.
     pub fn totals(&self) -> Totals {
         let mut t = Totals::default();
-        for s in self.spans.values() {
-            if s.status == SpanStatus::Failed {
-                t.failed_spans += 1;
+        self.spans.values().for_each(|s| t.add(s));
+        t
+    }
+
+    /// Totals over `id` and every descendant, each span's own usage counted once. Iterative, O(subtree).
+    pub fn subtree_totals(&self, id: &SpanId) -> Totals {
+        let mut t = Totals::default();
+        let mut stack = vec![id];
+        while let Some(k) = stack.pop() {
+            if let Some(s) = self.spans.get(k) {
+                t.add(s);
             }
-            let Some(u) = &s.usage else { continue };
-            t.billable_records += 1;
-            t.tokens_input += u.tokens_input.unwrap_or(0);
-            t.tokens_output += u.tokens_output.unwrap_or(0);
-            t.cache_read += u.cache_read.unwrap_or(0);
-            t.cache_write += u.cache_write.unwrap_or(0);
-            match (u.cost_usd_micros, u.cost_provenance) {
-                (Some(c), CostProvenance::Actual) => t.cost_actual_usd_micros += c,
-                (Some(c), CostProvenance::Estimate) => t.cost_estimate_usd_micros += c,
-                _ => t.cost_unknown_records += 1,
-            }
+            stack.extend(self.children(k));
         }
         t
     }
