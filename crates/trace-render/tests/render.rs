@@ -250,3 +250,11 @@ fn tree_width_equal_to_area_draws_tree_only() {
         .render(area, &mut buf, &mut WaterfallState::default());
     assert_eq!(lines(&buf), ["", "+Ao root                 800ms", "  Unresolved", "   Wo orphan             100ms"]);
 }
+
+#[test]
+fn fine_ticks_deep_into_a_session_stay_distinct() {
+    let seven_hours: Ns = 7 * 3600 * 1_000_000_000 + 4 * 60 * 1_000_000_000;
+    let vp = Viewport { start_ns: seven_hours, ns_per_cell: 100_000_000.0 };
+    let labels: Vec<String> = ticks(&vp, 50, 0).into_iter().map(|(_, l)| l).collect();
+    assert_eq!(labels, ["7h4m", "+1s", "+2s", "+3s", "+4s"]);
+}

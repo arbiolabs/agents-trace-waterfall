@@ -152,18 +152,28 @@ pub fn ticks(vp: &Viewport, width: u16, origin_ns: Ns) -> Vec<(u16, String)> {
     let nice = (0..10).flat_map(|k| [1, 2, 5].map(|m| m * 10i64.pow(k))).chain(TICK_STEPS_S.map(|s| s * 1_000_000_000));
     let Some(step) = nice.into_iter().find(|&s| s as f64 / vp.ns_per_cell >= MIN_TICK_GAP) else { return Vec::new() };
     let mut k = vp.start_ns.saturating_sub(origin_ns).div_euclid(step);
-    let mut out = Vec::new();
-    loop {
-        let Some(t) = k.checked_mul(step).and_then(|o| origin_ns.checked_add(o)) else { return out };
+    let mut times = Vec::new();
+    while let Some(t) = k.checked_mul(step).and_then(|o| origin_ns.checked_add(o)) {
         let col = vp.col_of(t).floor();
         if col >= f64::from(width) {
-            return out;
+            break;
         }
         if col >= 0.0 {
-            out.push((col as u16, format_duration(t.saturating_sub(origin_ns))));
+            times.push((col as u16, t));
         }
         k += 1;
     }
+    let label = |t: Ns| format_duration(t.saturating_sub(origin_ns));
+    let mut out: Vec<_> = times.iter().map(|&(c, t)| (c, label(t))).collect();
+    // Deep into a long session the formatter drops seconds, so fine ticks would all read alike;
+    // then label the first tick and show the rest as offsets from it.
+    if out.windows(2).any(|w| w[0].1 == w[1].1) {
+        let first = times[0].1;
+        for (o, &(_, t)) in out.iter_mut().zip(&times).skip(1) {
+            o.1 = format!("+{}", format_duration(t - first));
+        }
+    }
+    out
 }
 
 fn one_decimal(v: f64) -> String {
