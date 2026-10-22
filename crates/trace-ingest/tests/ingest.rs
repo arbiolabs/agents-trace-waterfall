@@ -622,3 +622,31 @@ fn import_applies_capture_policy() {
     assert_eq!(previews(Capture::default()), (None, None));
     assert_eq!(previews(Capture { projects: vec!["p".into()], ..Capture::default() }), (Some("IN".into()), Some("OUT".into())));
 }
+
+#[test]
+fn reserved_collector_source_is_refused() {
+    let env = env();
+    let c = start(config(&env, &[], YEAR));
+    let reply = raw(&env.sock, &[hello("collector")]);
+    c.stop();
+    assert_eq!(reply, vec![json!({"type": "error", "message": "source_id \"collector\" is reserved for the collector"})]);
+}
+
+#[test]
+fn exported_journal_with_interruption_reimports() {
+    let env = env();
+    let mut store = Store::open(&env.db).unwrap();
+    let mut events = read_events("tests/fixtures/interrupted.jsonl");
+    store.append(&events).unwrap();
+    let last = events.iter().map(|e| e.occurred_at_utc_ns).max().unwrap();
+    assert_eq!(store.reconcile_interrupted(last + 1, last + 2).unwrap().len(), 1);
+    let sid = events[0].session_id.clone();
+    events = store.session_events(&sid).unwrap();
+    let file = env.dir.join("export.jsonl");
+    trace_adapter_sdk::write_jsonl(std::fs::File::create(&file).unwrap(), &events).unwrap();
+
+    let mut fresh = Store::open(&env.dir.join("fresh.db")).unwrap();
+    let out = import_file(&mut fresh, &file, "canonical", &Default::default()).unwrap();
+    assert_eq!((out.inserted, out.duplicates), (events.len(), 0));
+    assert_eq!(fresh.load_session(&sid).unwrap().session.status, SessionStatus::Interrupted);
+}

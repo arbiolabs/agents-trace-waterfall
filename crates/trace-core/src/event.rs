@@ -239,9 +239,6 @@ impl CanonicalEvent {
         if self.source_id.0.is_empty() || id.0.is_empty() || self.session_id.0.is_empty() {
             return Err("source_id, event_id and session_id must be non-empty".into());
         }
-        if self.source_seq < 1 {
-            return Err(format!("event {id}: source_seq starts at 1"));
-        }
         let session_level = matches!(self.body, EventBody::SessionStarted { .. } | EventBody::SessionEnded { .. } | EventBody::Heartbeat {});
         if !session_level && self.span_id.is_none() {
             return Err(format!("event {id}: {} needs a span_id", self.body.type_name()));

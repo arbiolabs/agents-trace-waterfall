@@ -142,7 +142,7 @@ impl TraceAdapter for ClaudeCode {
         }
         let v: Value = serde_json::from_str(&raw.line)?;
         let mut st = self.state.borrow_mut();
-        let Some(ts) = v["timestamp"].as_str().and_then(parse_utc) else {
+        let Some(ts) = v["timestamp"].as_str().and_then(parse_utc).filter(|t| VALID_TIME_NS.contains(t)) else {
             return Ok(Vec::new());
         };
         let prev = st.prev_ts.replace(ts).unwrap_or(ts);

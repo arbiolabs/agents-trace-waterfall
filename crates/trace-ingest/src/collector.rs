@@ -15,7 +15,7 @@ use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
 use trace_adapter_sdk::{MAX_LINE_BYTES, PROTOCOL_VERSION, RawEvent, TraceAdapter, system_now_ns};
-use trace_core::{CanonicalEvent, Ns, SourceId};
+use trace_core::{COLLECTOR_SOURCE, CanonicalEvent, Ns, SourceId};
 use trace_storage::Store;
 
 const RECONCILE_EVERY: Duration = Duration::from_secs(30);
@@ -223,6 +223,10 @@ async fn converse(
     ensure!(
         protocol == PROTOCOL_VERSION,
         "unsupported protocol {protocol}; this collector speaks {PROTOCOL_VERSION}"
+    );
+    ensure!(
+        source_id.0 != COLLECTOR_SOURCE,
+        "source_id {COLLECTOR_SOURCE:?} is reserved for the collector"
     );
     let cursor = ask(tx, |reply| Cmd::Cursor {
         source: source_id.clone(),
