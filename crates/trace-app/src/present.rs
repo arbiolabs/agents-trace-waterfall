@@ -124,6 +124,14 @@ pub fn detail(s: &Span, harness: &str) -> Option<String> {
     }
 }
 
+/// The row title. An LLM span named after its model reads `LLM call`, since the detail already names the model.
+pub fn title(s: &Span) -> String {
+    match (&s.kind, s.model.as_deref()) {
+        (SpanKind::Llm, Some(m)) if m == s.name => kind_label(SpanKind::Llm).to_owned(),
+        _ => s.name.clone(),
+    }
+}
+
 pub fn kind_label(k: SpanKind) -> &'static str {
     match k {
         SpanKind::Agent => "Agent",
@@ -322,6 +330,10 @@ mod tests {
         assert_eq!(glyph(bash), (IconName::SquareTerminal, Ink::Kind(Tone::Tool)));
         assert_eq!(tone(bash), Tone::Error, "a failed span paints with the error palette");
         assert_eq!(detail(llm, "").as_deref(), Some("Sonnet 5.5"));
+        assert_eq!(title(llm), "llm");
+        let mut named_after_model = llm.clone();
+        named_after_model.name = "claude-sonnet-5-5".into();
+        assert_eq!(title(&named_after_model), "LLM call");
         assert_eq!(detail(bash, ""), None, "a tool named after itself gets no detail");
         assert_eq!(detail(&s.spans[&"root".into()], "claude-code").as_deref(), Some("claude-code"));
         assert_eq!(bar_label(llm, None, 40_000 * MS), "3s · $0.05");

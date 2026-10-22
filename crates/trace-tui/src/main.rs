@@ -5,7 +5,7 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
-use trace_core::{SPEEDS, SessionId, SessionStatus};
+use trace_core::{SPEEDS, SessionStatus};
 use trace_storage::{SessionFilter, Store};
 use trace_tui::app::App;
 use trace_tui::config::Config;

@@ -79,6 +79,8 @@ pub struct TraceApp {
     last_frame: Instant,
     last_poll: Instant,
     seen: HashMap<SpanId, Instant>,
+    /// The user zoomed, so following keeps their scale instead of fitting the whole trace.
+    zoomed: bool,
     reveal_until: Instant,
     error: Option<String>,
     scrubber: Rc<Cell<Bounds<Pixels>>>,
@@ -136,6 +138,7 @@ impl TraceApp {
             last_frame: Instant::now(),
             last_poll: Instant::now(),
             seen: HashMap::new(),
+            zoomed: false,
             reveal_until: Instant::now(),
             error: None,
             scrubber: Rc::new(Cell::new(Bounds::default())),
@@ -210,6 +213,7 @@ impl TraceApp {
                 self.seen = doc.state.spans.keys().map(|k| (k.clone(), now)).collect();
                 self.reveal_until = now + REVEAL;
                 self.doc = Some(doc);
+                self.zoomed = false;
                 self.popover = false;
                 self.hovered = None;
                 self.error = None;
@@ -298,6 +302,7 @@ impl TraceApp {
     fn toggle_follow(&mut self) {
         if let Some(TraceDoc { mode: Mode::Live { following, .. }, .. }) = &mut self.doc {
             *following = !*following;
+            self.zoomed &= !*following;
         }
     }
 
@@ -320,6 +325,7 @@ impl TraceApp {
     }
 
     fn zoom_at(&mut self, factor: f64, anchor_x: f32) {
+        self.zoomed = true;
         let Some(doc) = &mut self.doc else { return };
         if let Mode::Live { following, .. } = &mut doc.mode {
             *following = false;
@@ -331,6 +337,7 @@ impl TraceApp {
     }
 
     fn zoom_to_span(&mut self, id: &SpanId) {
+        self.zoomed = true;
         let Some(doc) = &mut self.doc else { return };
         let Some(s) = doc.state.spans.get(id) else { return };
         let end = s.effective_end(doc.state.session.ended_at_utc_ns, doc.now);
@@ -379,8 +386,10 @@ impl TraceApp {
                 self.span_search_open = false;
             }
             "e" => self.error = doc.toggle_descendants(),
-            "+" | "=" => doc.zoom(0.5),
-            "-" => doc.zoom(2.0),
+            "+" | "=" | "-" => {
+                doc.zoom(if key == "-" { 2.0 } else { 0.5 });
+                self.zoomed = true;
+            }
             "H" if matches!(doc.mode, Mode::Replay { .. }) => doc.seek_by(-1),
             "L" if matches!(doc.mode, Mode::Replay { .. }) => doc.seek_by(1),
             "H" => doc.pan(-1.0),
@@ -433,6 +442,10 @@ fn apply_theme(dark: bool, cx: &mut App) {
         t.primary_hover = p.accent.opacity(0.9);
         t.primary_active = p.accent.opacity(0.8);
         t.primary_foreground = gpui_kit::white();
+        t.button_primary = p.accent;
+        t.button_primary_hover = p.accent.opacity(0.9);
+        t.button_primary_active = p.accent.opacity(0.8);
+        t.button_primary_foreground = gpui_kit::white();
         t.selection = p.accent.opacity(0.25);
     });
 }
@@ -775,6 +788,7 @@ fn tool_button(id: &'static str, icon: IconName, label: Option<&str>, on: bool, 
 
 impl TraceApp {
     fn geo(&mut self, vw: f32) -> Option<Geo> {
+        let zoomed = self.zoomed;
         let doc = self.doc.as_mut()?;
         let card_w = vw - SIDEBAR_W - MAIN_PAD - 2.;
         let name_w = (card_w * 0.3).clamp(230., 300.);
@@ -783,7 +797,11 @@ impl TraceApp {
             let fit_w = if matches!(doc.mode, Mode::Live { .. }) { tl_w } else { tl_w * 0.86 };
             doc.viewport = Some(doc.fit(fit_w as u16));
         }
-        let vp = doc.layout(tl_w as u16);
+        let mut vp = doc.layout(tl_w as u16);
+        if !zoomed && matches!(doc.mode, Mode::Live { following: true, .. }) {
+            vp = Viewport::fit(doc.state.axis_start().unwrap_or(doc.now), doc.now, (tl_w * 0.9) as u16);
+            doc.viewport = Some(vp);
+        }
         let origin = match &doc.mode {
             Mode::Replay { replay, .. } => replay.start().unwrap_or(0),
             _ => doc.state.axis_start().unwrap_or(doc.now),
@@ -845,15 +863,16 @@ impl TraceApp {
                 cx.notify();
             }))
             .child(grid)
+            .when(show_now && (0.0..=g.tl_w).contains(&now_x), |el| {
+                el.child(div().absolute().top_0().bottom_0().left(px(g.name_w + now_x.round())).w(px(1.)).bg(pal.now))
+            })
             .child(
                 uniform_list("rows", count, cx.processor(move |this, range: std::ops::Range<usize>, window, cx| range.map(|ix| this.render_row(ix, g, window, cx)).collect::<Vec<_>>()))
                     .track_scroll(&self.list)
                     .size_full()
                     .pb(px(if matches!(doc.mode, Mode::Replay { .. }) { 72. } else { 8. })),
             )
-            .when(show_now && (0.0..=g.tl_w).contains(&now_x), |el| {
-                el.child(div().absolute().top_0().bottom_0().left(px(g.name_w + now_x.round())).w(px(1.)).bg(pal.now))
-            })
+            
             .child(gpui_kit::component::scroll::Scrollbar::vertical(&self.list));
         let stats = self.render_stats(pal);
         let transport = matches!(doc.mode, Mode::Replay { .. }).then(|| self.render_transport(pal, &g, cx));
@@ -992,9 +1011,9 @@ impl TraceApp {
                             .text_size(px(13.))
                             .when(row.has_children, |el| el.font_weight(FontWeight::MEDIUM))
                             .text_color(pal.ink)
-                            .child(s.name.clone()),
+                            .child(present::title(s)),
                     )
-                    .when_some(detail, |el, d| el.child(div().flex_shrink_0().max_w(px(140.)).truncate().text_size(px(12.5)).text_color(pal.muted).child(d)))
+                    .when_some(detail, |el, d| el.child(div().flex_shrink(8.).min_w(px(0.)).max_w(px(160.)).truncate().text_size(px(12.5)).text_color(pal.muted).child(d)))
                     .when(row.collapsed, |el| {
                         el.child(
                             div()
@@ -1211,7 +1230,7 @@ impl TraceApp {
             .gap(px(14.))
             .p(px(16.))
             .rounded(px(16.))
-            .bg(pal.card)
+            .bg(pal.pop)
             .border_1()
             .border_color(pal.line)
             .shadow(vec![soft_shadow(pal, 0.12, 16., 40.), soft_shadow(pal, 0.06, 2., 6.)])
@@ -1234,7 +1253,7 @@ impl TraceApp {
                             .min_w(px(0.))
                             .flex()
                             .flex_col()
-                            .child(div().truncate().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).text_color(pal.ink).child(s.name.clone()))
+                            .child(div().truncate().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).text_color(pal.ink).child(present::title(s)))
                             .child(div().truncate().text_size(px(12.)).text_color(pal.muted).child(sub)),
                     )
                     .child(pill(status, label, None))
@@ -1341,7 +1360,7 @@ impl TraceApp {
                 .pl(px(8.))
                 .pr(px(16.))
                 .rounded_full()
-                .bg(pal.card)
+                .bg(pal.pop)
                 .border_1()
                 .border_color(pal.line)
                 .shadow(vec![soft_shadow(pal, 0.10, 8., 24.), soft_shadow(pal, 0.05, 1., 3.)])
