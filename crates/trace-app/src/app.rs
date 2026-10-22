@@ -1006,7 +1006,8 @@ impl TraceApp {
                     .overflow_hidden()
                     .child(
                         div()
-                            .min_w(px(24.))
+                            .flex_shrink_0()
+                            .max_w(relative(0.8))
                             .truncate()
                             .text_size(px(13.))
                             .when(row.has_children, |el| el.font_weight(FontWeight::MEDIUM))
@@ -1136,7 +1137,7 @@ impl TraceApp {
                 continue;
             }
             let mark = pal.kind(present::tone(k)).mark;
-            bar = bar.child(div().absolute().top(px((BAR_H - 2. - 6.) / 2.)).left(px(kx0.max(1.))).w(px((kx1 - kx0.max(1.)).max(2.))).h(px(6.)).rounded(px(2.)).bg(mark.opacity(0.85)));
+            bar = bar.child(div().absolute().top(px((BAR_H - 2. - 6.) / 2.)).left(px(kx0.max(1.))).w(px((kx1 - kx0.max(1.)).max(2.))).h(px(6.)).rounded(px(2.)).bg(mark.opacity(0.6)));
         }
         cell = cell.child(bar);
         let label = present::bar_label(s, session_end, g.now);
