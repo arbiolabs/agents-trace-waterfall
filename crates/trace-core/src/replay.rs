@@ -2,34 +2,44 @@ use crate::event::*;
 use crate::state::TraceState;
 
 pub const SPEEDS: [f64; 6] = [0.25, 0.5, 1.0, 2.0, 5.0, 10.0];
-pub const CHECKPOINT_EVERY: usize = 500;
+/// Checkpoints are at least this many events apart.
+pub const MIN_CHECKPOINT_INTERVAL: usize = 500;
+/// Upper bound on checkpoints after the initial empty state, so memory stays O(n) instead of O(n²).
+pub const MAX_CHECKPOINTS: usize = 64;
 
 /// A recorded journal plus checkpoints, so seeking never refolds the whole history.
 /// Replay only reads recorded events; it never invokes tools or models.
 pub struct Replay {
     session_id: SessionId,
     events: Vec<CanonicalEvent>,
-    /// `checkpoints[i]` is the state after applying `events[..i * CHECKPOINT_EVERY]`.
+    /// `checkpoints[i]` is the state after applying `events[..i * interval]`.
     checkpoints: Vec<TraceState>,
+    interval: usize,
 }
 
 impl Replay {
     pub fn new(session_id: SessionId, mut events: Vec<CanonicalEvent>) -> Self {
         events.retain(|e| e.session_id == session_id);
         sort_events(&mut events);
+        // ponytail: a seek refolds up to n/64 events; add a delta-based checkpoint if long sessions seek slowly.
+        let interval = MIN_CHECKPOINT_INTERVAL.max(events.len().div_ceil(MAX_CHECKPOINTS));
         let mut checkpoints = vec![TraceState::new(session_id.clone())];
         let mut state = checkpoints[0].clone();
-        for chunk in events.chunks(CHECKPOINT_EVERY) {
+        for chunk in events.chunks(interval) {
             for e in chunk {
                 state.apply(e);
             }
             checkpoints.push(state.clone());
         }
-        Self { session_id, events, checkpoints }
+        Self { session_id, events, checkpoints, interval }
     }
 
     pub fn events(&self) -> &[CanonicalEvent] {
         &self.events
+    }
+
+    pub fn checkpoint_count(&self) -> usize {
+        self.checkpoints.len()
     }
 
     pub fn session_id(&self) -> &SessionId {
@@ -52,9 +62,9 @@ impl Replay {
     /// State after the first `n` events in replay order.
     pub fn state_after(&self, n: usize) -> TraceState {
         let n = n.min(self.events.len());
-        let cp = n / CHECKPOINT_EVERY;
+        let cp = n / self.interval;
         let mut s = self.checkpoints[cp].clone();
-        for e in &self.events[cp * CHECKPOINT_EVERY..n] {
+        for e in &self.events[cp * self.interval..n] {
             s.apply(e);
         }
         s

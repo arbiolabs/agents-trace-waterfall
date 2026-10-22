@@ -174,11 +174,78 @@ fn replay_clock_scales_and_stops_at_end() {
     assert_eq!(c.speed(), 10.0);
 }
 
+fn session_ended(source: &str, seq: u64, t: Ns, status: &str) -> CanonicalEvent {
+    let mut e = ev(seq, t, None, json!({"event_type": "session.ended", "body": {"status": status}}));
+    e.source_id = source.into();
+    e.event_id = EventId(format!("{source}-end-{seq}"));
+    e
+}
+
+fn outcome(s: &TraceState) -> (SessionStatus, Option<Ns>, Option<&str>) {
+    (s.session.status, s.session.ended_at_utc_ns, s.session.ended_by.as_ref().map(|b| b.0.as_str()))
+}
+
 #[test]
-fn activity_after_interruption_revives_session() {
-    let interrupted = ev(9, 50, None, json!({"event_type": "session.ended", "body": {"status": "interrupted"}}));
+fn activity_after_collector_interruption_revives_session() {
+    let interrupted = session_ended(COLLECTOR_SOURCE, 0, 50, "interrupted");
     let s = TraceState::from_events("s1".into(), &[start(1, 10, "x", None, "tool"), interrupted.clone(), end(2, 60, "x", "succeeded")]);
-    assert_eq!((s.session.status, s.session.ended_at_utc_ns), (SessionStatus::Live, None));
+    assert_eq!(outcome(&s), (SessionStatus::Live, None, None));
     let still = TraceState::from_events("s1".into(), &[start(1, 10, "x", None, "tool"), interrupted]);
-    assert_eq!(still.session.status, SessionStatus::Interrupted);
+    assert_eq!(outcome(&still), (SessionStatus::Interrupted, Some(50), Some("collector")));
+}
+
+#[test]
+fn harness_reported_interruption_is_final() {
+    let s = TraceState::from_events("s1".into(), &[start(1, 10, "x", None, "tool"), session_ended("src", 2, 50, "interrupted"), end(3, 60, "x", "cancelled")]);
+    assert_eq!(outcome(&s), (SessionStatus::Interrupted, Some(50), Some("src")));
+}
+
+#[test]
+fn session_outcome_does_not_depend_on_apply_order() {
+    let events = [
+        start(1, 10, "x", None, "tool"),
+        session_ended("src", 2, 90, "completed"),
+        session_ended(COLLECTOR_SOURCE, 0, 50, "interrupted"),
+        session_ended("other", 1, 90, "failed"),
+    ];
+    let orders: [[usize; 4]; 4] = [[0, 1, 2, 3], [0, 2, 1, 3], [3, 2, 1, 0], [1, 3, 0, 2]];
+    for order in orders {
+        let s = TraceState::from_events("s1".into(), order.iter().map(|&i| &events[i]));
+        assert_eq!(outcome(&s), (SessionStatus::Completed, Some(90), Some("src")), "order {order:?}");
+    }
+}
+
+#[test]
+fn replay_checkpoints_stay_bounded_and_seek_matches_full_fold() {
+    let events: Vec<_> = (0..25_000)
+        .flat_map(|i| [start(2 * i + 1, i as Ns * 10, &format!("s{i}"), None, "tool"), end(2 * i + 2, i as Ns * 10 + 5, &format!("s{i}"), "succeeded")])
+        .collect();
+    let r = Replay::new("s1".into(), events.clone());
+    assert_eq!(r.events().len(), 50_000);
+    assert!(r.checkpoint_count() <= 65, "{} checkpoints", r.checkpoint_count());
+    for t in [0, 123_457, 249_995] {
+        let manual = TraceState::from_events("s1".into(), events.iter().filter(|e| e.occurred_at_utc_ns <= t));
+        assert_eq!(r.state_at(t), manual, "t={t}");
+    }
+}
+
+#[test]
+fn validate_rejects_bad_envelopes() {
+    let ok = start(1, 10, "x", None, "tool");
+    assert_eq!(ok.validate(), Ok(()));
+    let mut no_span = ok.clone();
+    no_span.span_id = None;
+    assert_eq!(no_span.validate(), Err("event e1: span.started needs a span_id".into()));
+    let mut early = ok.clone();
+    early.observed_at_utc_ns = -1;
+    assert_eq!(early.validate(), Err("event e1: observed_at_utc_ns -1 is outside 1970-01-01..2200-01-01".into()));
+    let mut late = ok.clone();
+    late.occurred_at_utc_ns = 7_258_118_400_000_000_000;
+    assert_eq!(late.validate(), Err("event e1: occurred_at_utc_ns 7258118400000000000 is outside 1970-01-01..2200-01-01".into()));
+    let mut schema = ok.clone();
+    schema.schema_version = 2;
+    assert_eq!(schema.validate(), Err("event e1: schema_version 2 is not 1".into()));
+    let mut empty = ok;
+    empty.session_id = SessionId::default();
+    assert_eq!(empty.validate(), Err("source_id, event_id and session_id must be non-empty".into()));
 }

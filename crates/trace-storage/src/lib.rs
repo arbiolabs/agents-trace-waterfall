@@ -96,8 +96,6 @@ CREATE INDEX payloads_by_session ON payloads (session_id);
 CREATE INDEX payloads_by_stored ON payloads (stored_at);
 "#];
 
-const COLLECTOR_SOURCE: &str = "collector";
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AppendOutcome {
     pub inserted: usize,
@@ -162,7 +160,8 @@ impl Store {
     fn init(conn: Connection) -> Result<Self> {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // FULL so an acked commit survives power loss, not only a process crash (docs/protocol.md).
+        conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "secure_delete", "ON")?;
         let mut store = Self { conn };
         store.migrate()?;

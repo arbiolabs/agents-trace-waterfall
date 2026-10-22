@@ -10,6 +10,8 @@ The client and the collector resolve the path in this order:
 2. `$XDG_RUNTIME_DIR/trace-waterfall.sock`
 3. `~/.local/state/trace-waterfall/collector.sock`
 
+Both defaults are private to your user. Do not point the socket at a shared directory such as `/tmp`, where another local user can create the path first and receive your events.
+
 `trace_adapter_sdk::default_socket_path()` returns the resolved path.
 
 ## Framing
@@ -39,7 +41,9 @@ A canonical event is the JSON form of `trace_core::CanonicalEvent`: one flat obj
 
 ## Cursor
 
-The cursor is the highest `source_seq` for the source such that every sequence number from 1 to the cursor is persisted. It is `null` when sequence 1 is not persisted.
+The cursor is the highest `source_seq` for the source such that every sequence number from the lowest one the collector has persisted for that source up to the cursor is persisted. It is `null` before the collector has persisted any event from the source.
+
+The count starts at the lowest persisted sequence number, not at 1. A source whose first delivered event is 3, because 1 and 2 were dropped, gets cursor 3 once 3 is persisted. If 1 and 2 arrive later, the cursor counts from 1 again.
 
 `source_seq` starts at 1 and increases by 1 for each event from a source. A `source_id` names one sequence stream. A process that restarts its numbering must use a new `source_id`, or the collector treats the new events as already persisted.
 
@@ -51,17 +55,19 @@ The cursor is the highest `source_seq` for the source such that every sequence n
 
 ## Delivery
 
-- The server sends `ack` only after it writes every event in the frame to durable storage.
+- The server sends `ack` only after the frame's events are committed to SQLite with `synchronous=FULL`. An acked event survives a collector crash and a power loss. On macOS, `fsync` does not flush the drive's write cache, so power-loss durability there depends on the drive.
+- The server validates every event in a frame before it writes any of them. One invalid event makes the server reply `error` for the whole frame and close the connection.
 - On `ack`, the client removes the frame's events from its buffer.
 - On `error`, or if the connection closes before `ack`, the client keeps the events and resends them after it reconnects.
 - The server deduplicates on `(source_id, event_id)`. A resent event that the server already persisted has no effect.
-- The client sends one `events` frame at a time and waits for its reply.
+- The client has at most one message outstanding. It sends the next `events` frame only after the reply to the previous one.
 
 ## Errors and limits
 
 - If `hello` names a protocol other than `1`, the server sends `error` and closes the connection.
 - If a line exceeds 1 MiB, the server sends `error` and closes the connection.
-- `Client::send` rejects an event whose serialized frame would exceed 1 MiB, and an event whose `source_id` differs from the client's.
+- An event is valid when `schema_version` is `1`; `source_id`, `event_id` and `session_id` are non-empty; `source_seq` is at least 1; span events (`span.*`, `usage.reported`, `artifact.recorded`) carry a `span_id`; and `occurred_at_utc_ns` and `observed_at_utc_ns` lie from 1970-01-01 up to but not including 2200-01-01. `trace_core::CanonicalEvent::validate` implements these checks for the client, the server and `trace-tui import --adapter canonical`.
+- `Client::send` returns an error and buffers none of the batch if any event is invalid, comes from another `source_id`, or would make a frame exceed 1 MiB. Because the client rejects such events before sending, the collector never sees them and the source keeps flowing.
 
 ## Reconnect and loss
 
@@ -69,4 +75,6 @@ The cursor is the highest `source_seq` for the source such that every sequence n
 
 Unacked events wait in a bounded buffer. When the buffer is full, the client drops the oldest event and increments `Client::dropped()`. Delivery is lossy once that count is non-zero. A dropped event leaves a gap in `source_seq`, so the cursor stops below the gap. Later frames are still acked and persisted.
 
-`Client::flush(timeout)` returns the collector cursor once the buffer is empty. It returns an error that states the unacked and dropped counts if the timeout passes first.
+`Client::send` does not wait for acks. It buffers, writes a frame when none is outstanding, and reads any reply that is already there, waiting at most a few milliseconds. It also never waits for a reconnect backoff. A large frame can block on the socket write for up to 5 s if the collector stops reading.
+
+`Client::flush(timeout)` waits for acks. It returns the collector cursor once the buffer is empty. It returns an error that states the unacked and dropped counts if the timeout passes first.

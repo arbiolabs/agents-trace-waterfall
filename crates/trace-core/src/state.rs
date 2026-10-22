@@ -14,6 +14,8 @@ pub struct Session {
     pub started_at_utc_ns: Option<Ns>,
     pub ended_at_utc_ns: Option<Ns>,
     pub status: SessionStatus,
+    /// Source of the `session.ended` that set `status`.
+    pub ended_by: Option<SourceId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -71,6 +73,8 @@ pub struct TraceState {
     /// Events that reference a span whose `span.started` has not arrived yet.
     pending: BTreeMap<SpanId, Vec<CanonicalEvent>>,
     seen: BTreeSet<(SourceId, EventId)>,
+    /// The `session.ended` latest in replay order, so live and replay agree on the outcome.
+    end: Option<CanonicalEvent>,
     pub event_count: usize,
     pub last_occurred_at_utc_ns: Option<Ns>,
 }
@@ -95,17 +99,29 @@ impl TraceState {
             return false;
         }
         self.event_count += 1;
-        // An interruption is a guess from silence; later activity proves the session was still live.
-        if self.session.status == SessionStatus::Interrupted
-            && !matches!(e.body, EventBody::SessionEnded { .. })
-            && self.session.ended_at_utc_ns.is_some_and(|t| e.occurred_at_utc_ns > t)
-        {
-            self.session.status = SessionStatus::Live;
-            self.session.ended_at_utc_ns = None;
-        }
         self.last_occurred_at_utc_ns = Some(self.last_occurred_at_utc_ns.map_or(e.occurred_at_utc_ns, |t| t.max(e.occurred_at_utc_ns)));
         self.reduce(e);
+        self.resolve_session_end();
         true
+    }
+
+    /// The collector's interruption is a guess from silence; activity after it proves the session was still live.
+    /// An interruption the harness reported itself is final.
+    fn revived_after_interruption(&self, end: &CanonicalEvent) -> bool {
+        end.source_id.0 == COLLECTOR_SOURCE
+            && matches!(end.body, EventBody::SessionEnded { status: SessionStatus::Interrupted })
+            && self.last_occurred_at_utc_ns.is_some_and(|t| t > end.occurred_at_utc_ns)
+    }
+
+    fn resolve_session_end(&mut self) {
+        let (status, at, by) = match &self.end {
+            Some(end @ CanonicalEvent { body: EventBody::SessionEnded { status }, .. }) if !self.revived_after_interruption(end) => {
+                (*status, Some(end.occurred_at_utc_ns), Some(end.source_id.clone()))
+            }
+            _ => (SessionStatus::Live, None, None),
+        };
+        let s = &mut self.session;
+        (s.status, s.ended_at_utc_ns, s.ended_by) = (status, at, by);
     }
 
     fn reduce(&mut self, e: &CanonicalEvent) {
@@ -121,9 +137,10 @@ impl TraceState {
                 s.labels.extend(labels.clone());
                 s.started_at_utc_ns = Some(t);
             }
-            EventBody::SessionEnded { status } => {
-                self.session.status = *status;
-                self.session.ended_at_utc_ns = Some(t);
+            EventBody::SessionEnded { .. } => {
+                if self.end.as_ref().is_none_or(|w| e.order_cmp(w).is_gt()) {
+                    self.end = Some(e.clone());
+                }
             }
             EventBody::Heartbeat {} => {}
             EventBody::SpanStarted { parent_span_id, name, kind, model, provider, tool_name, agent_name, retry_of, input_preview, attributes } => {

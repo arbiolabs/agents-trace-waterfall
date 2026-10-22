@@ -127,7 +127,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::Import { file, adapter }) => {
             let mut store = Store::open(&db)?;
-            let out = trace_ingest::import_file(&mut store, &file, &adapter)?;
+            let out = trace_ingest::import_file(&mut store, &file, &adapter, &cfg.capture)?;
             println!(
                 "imported {} events ({} duplicates) into {}",
                 out.inserted,

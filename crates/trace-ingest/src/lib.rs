@@ -16,7 +16,7 @@ use std::time::Duration;
 use trace_adapter_sdk::{
     MAX_LINE_BYTES, PROTOCOL_VERSION, RawEvent, SourceInfo, TraceAdapter, system_now_ns,
 };
-use trace_core::{CanonicalEvent, EventBody, SCHEMA_VERSION, SessionId};
+use trace_core::{CanonicalEvent, EventBody, SessionId};
 use trace_storage::{AppendOutcome, SessionFilter, Store};
 
 pub struct CollectorConfig {
@@ -172,8 +172,8 @@ pub fn adapter_by_name(name: &str) -> Option<Box<dyn TraceAdapter>> {
 
 pub const ADAPTERS: &[&str] = &["canonical", "claude-code"];
 
-/// Import a JSONL file through the named adapter into the store.
-pub fn import_file(store: &mut Store, path: &Path, adapter: &str) -> anyhow::Result<AppendOutcome> {
+/// Import a JSONL file through the named adapter into the store, applying the same capture policy as the collector.
+pub fn import_file(store: &mut Store, path: &Path, adapter: &str, capture: &Capture) -> anyhow::Result<AppendOutcome> {
     let a = adapter_by_name(adapter).with_context(|| {
         format!(
             "unknown adapter {adapter:?}; known: {}",
@@ -183,7 +183,9 @@ pub fn import_file(store: &mut Store, path: &Path, adapter: &str) -> anyhow::Res
     let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut out = AppendOutcome::default();
     let mut batch = Vec::new();
+    let mut projects = HashMap::new();
     let mut flush = |batch: &mut Vec<CanonicalEvent>| -> anyhow::Result<()> {
+        capture.strip(&mut projects, batch);
         let r = store.append(batch)?;
         out.inserted += r.inserted;
         out.duplicates += r.duplicates;
@@ -207,36 +209,6 @@ pub fn import_file(store: &mut Store, path: &Path, adapter: &str) -> anyhow::Res
     Ok(out)
 }
 
-/// Envelope checks for events from outside the process (socket frames, canonical JSONL).
-pub(crate) fn validate(e: &CanonicalEvent) -> anyhow::Result<()> {
-    ensure!(
-        e.schema_version == SCHEMA_VERSION,
-        "event {}: schema_version {} is not {SCHEMA_VERSION}",
-        e.event_id,
-        e.schema_version
-    );
-    ensure!(
-        !e.source_id.0.is_empty() && !e.event_id.0.is_empty() && !e.session_id.0.is_empty(),
-        "source_id, event_id and session_id must be non-empty"
-    );
-    ensure!(
-        e.source_seq >= 1,
-        "event {}: source_seq starts at 1",
-        e.event_id
-    );
-    let session_level = matches!(
-        e.body,
-        EventBody::SessionStarted { .. } | EventBody::SessionEnded { .. } | EventBody::Heartbeat {}
-    );
-    ensure!(
-        session_level || e.span_id.is_some(),
-        "event {}: {} needs a span_id",
-        e.event_id,
-        e.body.type_name()
-    );
-    Ok(())
-}
-
 struct Canonical;
 
 impl TraceAdapter for Canonical {
@@ -254,7 +226,7 @@ impl TraceAdapter for Canonical {
             return Ok(Vec::new());
         }
         let e: CanonicalEvent = serde_json::from_str(&raw.line)?;
-        validate(&e)?;
+        e.validate().map_err(anyhow::Error::msg)?;
         Ok(vec![e])
     }
 }

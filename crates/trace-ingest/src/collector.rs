@@ -1,4 +1,4 @@
-use crate::{Capture, CollectorConfig, adapter_by_name, validate};
+use crate::{Capture, CollectorConfig, adapter_by_name};
 use anyhow::{Context, anyhow, bail, ensure};
 use serde::Deserialize;
 use serde_json::json;
@@ -238,7 +238,7 @@ async fn converse(
         let Msg::Events { events } = msg else {
             bail!("unexpected second hello")
         };
-        events.iter().try_for_each(validate)?;
+        events.iter().try_for_each(CanonicalEvent::validate).map_err(anyhow::Error::msg)?;
         let cursor = ask(tx, |reply| Cmd::Append {
             events,
             source: Some(source_id.clone()),
