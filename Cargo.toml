@@ -12,6 +12,7 @@ trace-core = { path = "crates/trace-core" }
 trace-storage = { path = "crates/trace-storage" }
 trace-ingest = { path = "crates/trace-ingest" }
 trace-render = { path = "crates/trace-render" }
+trace-view = { path = "crates/trace-view" }
 trace-adapter-sdk = { path = "crates/trace-adapter-sdk" }
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }

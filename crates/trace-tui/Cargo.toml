@@ -13,6 +13,7 @@ trace-core.workspace = true
 trace-storage.workspace = true
 trace-ingest.workspace = true
 trace-render.workspace = true
+trace-view.workspace = true
 trace-adapter-sdk.workspace = true
 anyhow.workspace = true
 clap.workspace = true

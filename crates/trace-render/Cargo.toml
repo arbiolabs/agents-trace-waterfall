@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 ratatui.workspace = true
 trace-core.workspace = true
+trace-view.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

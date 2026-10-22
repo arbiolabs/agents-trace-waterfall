@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 use trace_core::*;
 use trace_render::*;
+use trace_view::{Row, Viewport, flatten};
 
 const MS: Ns = 1_000_000;
 
@@ -47,15 +48,6 @@ fn sample() -> TraceState {
     TraceState::from_events("s1".into(), &events)
 }
 
-fn ids(state: &TraceState, rows: &[Row]) -> Vec<String> {
-    rows.iter()
-        .map(|r| match &r.kind {
-            RowKind::Span(id) => format!("{}{}", " ".repeat(r.depth as usize), state.spans[id].name),
-            RowKind::UnresolvedHeader => "<unresolved>".into(),
-        })
-        .collect()
-}
-
 fn lines(buf: &Buffer) -> Vec<String> {
     let a = buf.area;
     (a.y..a.bottom()).map(|y| (a.x..a.right()).map(|x| buf[(x, y)].symbol()).collect::<String>().trim_end().to_owned()).collect()
@@ -68,73 +60,6 @@ fn render(state: &TraceState, rows: &[Row], theme: &Theme, w: u16, h: u16, sel: 
     WaterfallWidget { state, rows, now: 800 * MS, viewport: Viewport::fit(0, 1000 * MS, tl_w), origin_ns: 0, theme, tree_width: 30, focused: true }
         .render(area, &mut buf, sel);
     buf
-}
-
-#[test]
-fn bar_span_clips_and_marks() {
-    let vp = Viewport { start_ns: 100, ns_per_cell: 10.0 };
-    assert_eq!(bar_span(120, 155, &vp, 10), Some((2, 6)));
-    assert_eq!(bar_span(50, 130, &vp, 10), Some((0, 3)), "clipped at left edge");
-    assert_eq!(bar_span(180, 400, &vp, 10), Some((8, 10)), "clipped at right edge");
-    assert_eq!(bar_span(0, 500, &vp, 10), Some((0, 10)), "spans the whole viewport");
-    assert_eq!(bar_span(142, 142, &vp, 10), Some((4, 5)), "zero duration");
-    assert_eq!(bar_span(141, 143, &vp, 10), Some((4, 5)), "sub-cell");
-    assert_eq!(bar_span(100, 100, &vp, 10), Some((0, 1)), "zero duration at left edge");
-    assert_eq!(bar_span(200, 200, &vp, 10), Some((9, 10)), "zero duration at right edge");
-    assert_eq!(bar_span(10, 100, &vp, 10), None, "ends exactly at left edge");
-    assert_eq!(bar_span(200, 300, &vp, 10), None, "starts exactly at right edge");
-    assert_eq!(bar_span(10, 20, &vp, 10), None);
-    assert_eq!(bar_span(150, 160, &vp, 0), None);
-}
-
-#[test]
-fn viewport_zoom_keeps_anchor_and_pans() {
-    let mut vp = Viewport::fit(0, 1000, 10);
-    assert_eq!(vp, Viewport { start_ns: 0, ns_per_cell: 100.0 });
-    vp.zoom(0.5, 500);
-    assert_eq!(vp, Viewport { start_ns: 250, ns_per_cell: 50.0 });
-    assert_eq!(vp.col_of(500), 5.0);
-    vp.pan(-2.0);
-    assert_eq!((vp.start_ns, vp.end_ns(10)), (150, 650));
-}
-
-#[test]
-fn ticks_and_formatting() {
-    let vp = Viewport::fit(0, 1000 * MS, 50);
-    assert_eq!(ticks(&vp, 50, 0), [(0, "0s".to_string()), (10, "200ms".into()), (20, "400ms".into()), (30, "600ms".into()), (40, "800ms".into())]);
-    let vp = Viewport { start_ns: 30_000 * MS, ns_per_cell: 3e9 };
-    assert_eq!(ticks(&vp, 40, 0), [(0, "30s".to_string()), (10, "1m".into()), (20, "1m30s".into()), (30, "2m".into())]);
-    assert_eq!(
-        [0, 850, 12_500, 250 * MS, 1500 * MS, 120_000 * MS, 3_900_000 * MS, -250 * MS].map(format_duration),
-        ["0s", "850ns", "12.5µs", "250ms", "1.5s", "2m", "1h5m", "-250ms"]
-    );
-    assert_eq!([None, Some(1234), Some(1_234_567)].map(format_cost), ["—", "$0.0012", "$1.23"]);
-    assert_eq!([999, 1000, 12_345, 1_500_000].map(format_tokens), ["999", "1k", "12.3k", "1.5M"]);
-}
-
-#[test]
-fn flatten_orders_collapses_and_groups_unresolved() {
-    let s = sample();
-    let rows = flatten(&s, &HashSet::new(), None);
-    assert_eq!(ids(&s, &rows), ["root", " llm1", " tool1", " tool2", "<unresolved>", " orphan"]);
-    assert!(rows[0].has_children && !rows[0].collapsed && !rows[1].has_children);
-
-    let collapsed = HashSet::from([SpanId::from("root")]);
-    let rows = flatten(&s, &collapsed, None);
-    assert_eq!(ids(&s, &rows), ["root", "<unresolved>", " orphan"]);
-    assert!(rows[0].collapsed);
-}
-
-#[test]
-fn filter_keeps_ancestors_even_when_collapsed() {
-    let s = sample();
-    let failed = |sp: &Span| sp.status == SpanStatus::Failed;
-    let rows = flatten(&s, &HashSet::new(), Some(&failed));
-    assert_eq!(ids(&s, &rows), ["root", " tool1"]);
-    let collapsed = HashSet::from([SpanId::from("root")]);
-    assert_eq!(ids(&s, &flatten(&s, &collapsed, Some(&failed))), ["root"]);
-    let waits = |sp: &Span| sp.kind == SpanKind::Wait;
-    assert_eq!(ids(&s, &flatten(&s, &HashSet::new(), Some(&waits))), ["<unresolved>", " orphan"]);
 }
 
 #[test]
@@ -217,29 +142,6 @@ fn ten_thousand_spans_render_fast() {
 }
 
 #[test]
-fn extreme_timestamps_saturate_instead_of_overflowing() {
-    assert_eq!([i64::MIN, i64::MAX, i64::MIN + 1].map(format_duration), ["-2562047h47m", "2562047h47m", "-2562047h47m"]);
-    assert_eq!(Viewport::fit(i64::MIN, i64::MAX, 10), Viewport { start_ns: i64::MIN, ns_per_cell: i64::MAX as f64 / 10.0 });
-}
-
-#[test]
-fn flattens_a_hundred_thousand_deep_chain() {
-    const N: usize = 100_000;
-    let mut events = vec![start(0, 0, "s0", None, "tool")];
-    for i in 1..N {
-        events.push(start(i as u64, i as Ns, &format!("s{i}"), Some(&format!("s{}", i - 1)), "tool"));
-    }
-    events.push(end(N as u64, N as Ns, &format!("s{}", N - 1), "failed"));
-    let s = TraceState::from_events("s1".into(), &events);
-    let rows = flatten(&s, &HashSet::new(), None);
-    assert_eq!((rows.len(), rows[1].depth, rows[65_535].depth, rows[N - 1].depth), (N, 1, u16::MAX, u16::MAX));
-    let failed = |sp: &Span| sp.status == SpanStatus::Failed;
-    assert_eq!(flatten(&s, &HashSet::new(), Some(&failed)).len(), N);
-    let collapsed = HashSet::from([SpanId::from("s1")]);
-    assert_eq!(ids(&s, &flatten(&s, &collapsed, Some(&failed))), ["s0", " s1"]);
-}
-
-#[test]
 fn tree_width_equal_to_area_draws_tree_only() {
     let s = sample();
     let rows = flatten(&s, &HashSet::from([SpanId::from("root")]), None);
@@ -249,12 +151,4 @@ fn tree_width_equal_to_area_draws_tree_only() {
     WaterfallWidget { state: &s, rows: &rows, now: 800 * MS, viewport: Viewport::fit(0, 1000 * MS, 1), origin_ns: 0, theme: &theme, tree_width: 30, focused: true }
         .render(area, &mut buf, &mut WaterfallState::default());
     assert_eq!(lines(&buf), ["", "+Ao root                 800ms", "  Unresolved", "   Wo orphan             100ms"]);
-}
-
-#[test]
-fn fine_ticks_deep_into_a_session_stay_distinct() {
-    let seven_hours: Ns = 7 * 3600 * 1_000_000_000 + 4 * 60 * 1_000_000_000;
-    let vp = Viewport { start_ns: seven_hours, ns_per_cell: 100_000_000.0 };
-    let labels: Vec<String> = ticks(&vp, 50, 0).into_iter().map(|(_, l)| l).collect();
-    assert_eq!(labels, ["7h4m", "+1s", "+2s", "+3s", "+4s"]);
 }
