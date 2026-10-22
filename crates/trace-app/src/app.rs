@@ -1229,7 +1229,7 @@ impl TraceApp {
         let span_label = if whole {
             "Whole trace".to_owned()
         } else {
-            format!("{} – {}", format_duration((a - g.origin).max(0)), format_duration((b.min(g.overview.1) - g.origin).max(0)))
+            format!("{} at {}", format_duration(b - a), format_duration((a - g.origin).max(0)))
         };
         div()
             .h(px(OVERVIEW_H))
@@ -1273,7 +1273,7 @@ impl TraceApp {
                             .rounded(px(6.))
                             .bg(pal.card)
                             .border_1()
-                            .border_color(pal.faint.opacity(if pal.dark { 1. } else { 0.7 }))
+                            .border_color(if lx1 - lx0 < 24. { pal.accent.opacity(0.7) } else { pal.faint.opacity(if pal.dark { 1. } else { 0.7 }) })
                             .shadow(vec![soft_shadow(pal, 0.10, 1., 3.)])
                             .flex()
                             .items_center()
