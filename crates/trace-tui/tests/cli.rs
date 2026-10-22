@@ -63,7 +63,6 @@ fn export_by_prefix_writes_the_stored_journal() {
 }
 
 #[test]
-#[ignore = "needs trace_ingest::import_file, which is a stub on this branch"]
 fn import_then_export_round_trips() {
     let dir = tmp("roundtrip");
     let r = tui(&dir, &["import", SAMPLE]);
