@@ -1,0 +1,45 @@
+[
+  {
+    "role": "user",
+    "ts": 1792782390865,
+    "content": [
+      {
+        "type": "text",
+        "text": "(text)"
+      },
+      {
+        "type": "text",
+        "text": "(text)"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "ts": 1792782470669,
+    "content": [
+      {
+        "type": "tool_result",
+        "tool_use_id": "call_0a37vv03",
+        "content": ""
+      },
+      {
+        "type": "text",
+        "text": "(text)"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "ts": 1792782509733,
+    "content": [
+      {
+        "type": "text",
+        "text": "(text)"
+      },
+      {
+        "type": "text",
+        "text": "(text)"
+      }
+    ]
+  }
+]

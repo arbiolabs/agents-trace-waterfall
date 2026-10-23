@@ -1,0 +1,88 @@
+[
+  {
+    "ts": 1792782291636,
+    "type": "say",
+    "say": "text",
+    "text": "(text)"
+  },
+  {
+    "ts": 1792782291676,
+    "type": "say",
+    "say": "api_req_started",
+    "text": "{\"apiProtocol\":\"anthropic\",\"tokensIn\":9549,\"tokensOut\":523,\"cacheWrites\":0,\"cacheReads\":0,\"cost\":0.028647000000000002}"
+  },
+  {
+    "ts": 1792782371026,
+    "type": "say",
+    "say": "reasoning",
+    "partial": false,
+    "text": "(text)"
+  },
+  {
+    "ts": 1792782385848,
+    "type": "say",
+    "say": "api_req_retry_delayed",
+    "partial": false,
+    "text": "(text)"
+  },
+  {
+    "ts": 1792782390860,
+    "type": "say",
+    "say": "api_req_started",
+    "text": "{\"apiProtocol\":\"anthropic\",\"tokensIn\":9504,\"tokensOut\":148,\"cacheWrites\":0,\"cacheReads\":0,\"cost\":0.028512}"
+  },
+  {
+    "ts": 1792782466483,
+    "type": "say",
+    "say": "reasoning",
+    "partial": false,
+    "text": "(text)"
+  },
+  {
+    "ts": 1792782470487,
+    "type": "ask",
+    "ask": "tool",
+    "partial": false,
+    "text": "{\"tool\":\"searchFiles\"}"
+  },
+  {
+    "ts": 1792782470664,
+    "type": "say",
+    "say": "api_req_started",
+    "text": "{\"apiProtocol\":\"anthropic\",\"tokensIn\":9675,\"tokensOut\":184,\"cacheWrites\":0,\"cacheReads\":0,\"cost\":0.029025000000000002}"
+  },
+  {
+    "ts": 1792782504581,
+    "type": "say",
+    "say": "reasoning",
+    "partial": false,
+    "text": "(text)"
+  },
+  {
+    "ts": 1792782508316,
+    "type": "say",
+    "say": "text",
+    "partial": false,
+    "text": "(text)"
+  },
+  {
+    "ts": 1792782509728,
+    "type": "say",
+    "say": "api_req_started",
+    "text": "{\"apiProtocol\":\"anthropic\",\"tokensIn\":10042,\"tokensOut\":327,\"cacheWrites\":0,\"cacheReads\":0,\"cost\":0.030126}"
+  },
+  {
+    "ts": 1792782606015,
+    "type": "say",
+    "say": "reasoning",
+    "partial": false,
+    "text": "(text)"
+  },
+  {
+    "ts": 1792782615531,
+    "type": "say",
+    "say": "completion_result",
+    "partial": true,
+    "text": "(text)"
+  }
+]
