@@ -4,7 +4,7 @@
 
 mod doc;
 
-pub use doc::{EXPAND_ALL_LIMIT, Mode, TraceDoc, export_span, matcher, resolve_session, wall_ns};
+pub use doc::{EXPAND_ALL_LIMIT, Mode, TraceDoc, export_span, matcher, resolve_session, wall_ns, write_private};
 use std::collections::HashSet;
 use trace_core::{Ns, Span, SpanId, TraceState};
 
@@ -215,13 +215,17 @@ fn format_abs(ns: u64) -> String {
     }
 }
 
-/// Unknown cost renders as `—`.
+/// Unknown cost renders as `—`. A cent or more reads in cents, `$0.03`, `$1.23`; less than a cent reads to two
+/// significant figures, `$0.0054`, `$0.00012`, so a sub-cent call never rounds to a misleading `$0.00`.
 pub fn format_cost(micros: Option<u64>) -> String {
-    match micros {
-        None => "—".into(),
-        Some(m) if m < 10_000 => format!("${:.4}", m as f64 / 1e6),
-        Some(m) => format!("${:.2}", m as f64 / 1e6),
+    let Some(m) = micros else { return "—".into() };
+    let v = m as f64 / 1e6;
+    if m == 0 || v >= 0.01 {
+        return format!("${v:.2}");
     }
+    let decimals = (1 - v.log10().floor() as i32) as usize;
+    let s = format!("${v:.decimals$}");
+    if s.trim_start_matches('$').parse::<f64>().is_ok_and(|r| r >= 0.01) { format!("${v:.2}") } else { s }
 }
 
 /// `999`, `12.3k`, `1.5M`.

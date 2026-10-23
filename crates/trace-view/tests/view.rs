@@ -91,6 +91,11 @@ fn ticks_and_formatting() {
         ["0s", "850ns", "12.5µs", "250ms", "1.5s", "2m", "1h5m", "-250ms"]
     );
     assert_eq!([None, Some(1234), Some(1_234_567)].map(format_cost), ["—", "$0.0012", "$1.23"]);
+    assert_eq!(
+        [Some(0), Some(5_400), Some(30_000), Some(120), Some(500), Some(9_999), Some(10_000)].map(format_cost),
+        ["$0.00", "$0.0054", "$0.03", "$0.00012", "$0.00050", "$0.01", "$0.01"],
+        "cents at a cent and up, two significant figures below"
+    );
     assert_eq!([999, 1000, 12_345, 1_500_000].map(format_tokens), ["999", "1k", "12.3k", "1.5M"]);
 }
 

@@ -345,19 +345,23 @@ pub fn export_span(dir: &Path, s: &Span) -> anyhow::Result<PathBuf> {
         })
         .collect();
     let path = dir.join(format!("span-{id}.json"));
-    let json = serde_json::to_string_pretty(s)?;
+    write_private(&path, serde_json::to_string_pretty(s)?.as_bytes())?;
+    Ok(path)
+}
+
+/// Writes `bytes` to `path`, readable only by the owner: traces can hold tool inputs and outputs.
+pub fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(&path)
+        .open(path)
         .and_then(|mut f| {
             f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            f.write_all(json.as_bytes())
+            f.write_all(bytes)
         })
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 pub fn wall_ns() -> Ns {

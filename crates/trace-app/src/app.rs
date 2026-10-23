@@ -1,5 +1,5 @@
 use crate::Cli;
-use crate::present::{self, Change, Edge, Grab, Group, LabelAt, Tone, ease};
+use crate::present::{self, Change, Edge, Grab, Group, LabelAt, Shape, Status, Tone, ease};
 use crate::theme::{KindColors, Palette};
 use chrono::{Local, TimeZone};
 use gpui_kit::assets::IconName;
@@ -7,6 +7,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_kit::component::{Icon, Sizable, Theme, ThemeMode};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -34,7 +35,7 @@ const POLL: Duration = Duration::from_millis(100);
 const WATCH: Duration = Duration::from_secs(2);
 const LABEL_SIZE: f32 = 11.5;
 const OVERVIEW_H: f32 = 40.;
-const STRIP_H: f32 = 28.;
+const STRIP_H: f32 = 30.;
 const SIDEBAR_AUTO_BELOW: f32 = 1100.;
 const SIDEBAR_ANIM: Duration = Duration::from_millis(240);
 const FOLD_ANIM: Duration = Duration::from_millis(240);
@@ -45,6 +46,20 @@ const TOGGLE_X: f32 = 84.;
 const BENCH_FRAMES: usize = 300;
 const COLLECTOR_CMD: &str = "trace-tui collector start";
 const COPIED_FOR: Duration = Duration::from_millis(1200);
+/// Room at the overview's right end for the idle gap marker.
+const IDLE_MARK_W: f32 = 104.;
+/// The sidebar tray's opacity over the window's blurred backdrop.
+const SIDEBAR_ALPHA: f32 = 0.7;
+/// Key context of the focused row list, where Enter inspects and ⌘C copies the span name.
+pub const ROWS_CONTEXT: &str = "TraceRows";
+
+gpui_kit::actions!(
+    trace_waterfall,
+    [
+        Quit, About, Import, ExportSession, ToggleSidebar, ZoomIn, ZoomOut, ZoomToFit, Follow, Replay, NextEvent, PrevEvent,
+        Inspect, ZoomToSpan, ToggleBranch, CopySpanName, CopySpanJson, ExportSpanJson, ShowInReplay
+    ]
+);
 
 fn tnum() -> FontFeatures {
     FontFeatures(Arc::new(vec![("tnum".into(), 1)]))
@@ -65,6 +80,10 @@ struct Geo {
     overview: (Ns, Ns),
     /// Where open spans stop: the session end, or the last event while idle.
     end: Option<Ns>,
+    /// Following with now in view, so off-screen spans read from real now.
+    following: bool,
+    /// The last event of an idle live session; the overview ends there and marks the gap to now.
+    idle: Option<Ns>,
     live: bool,
 }
 
@@ -81,15 +100,20 @@ impl Geo {
         (self.vp.start_ns, self.vp.end_ns(self.tl_w as u16))
     }
 
+    /// Width of the overview's time scale: the strip less the idle marker's room.
+    fn ov_w(&self) -> f32 {
+        if self.idle.is_some() { self.tl_w - IDLE_MARK_W } else { self.tl_w }
+    }
+
     /// Overview strip x of `t`.
     fn ov_x(&self, t: Ns) -> f32 {
         let (a, b) = self.overview;
-        ((t - a) as f64 / (b - a).max(1) as f64 * f64::from(self.tl_w)) as f32
+        ((t - a) as f64 / (b - a).max(1) as f64 * f64::from(self.ov_w())) as f32
     }
 
     fn ov_t(&self, x: f32) -> Ns {
         let (a, b) = self.overview;
-        a + (f64::from(x / self.tl_w) * (b - a) as f64) as Ns
+        a + (f64::from(x / self.ov_w()) * (b - a) as f64) as Ns
     }
 }
 
@@ -167,6 +191,12 @@ pub struct TraceApp {
     bench: Option<Bench>,
     /// When the empty state's command was last copied, for the brief check mark.
     copied_at: Option<Instant>,
+    /// The session a sidebar right-click targets, for its context menu.
+    menu_session: Option<SessionId>,
+    /// macOS Increase Contrast.
+    contrast: bool,
+    /// macOS Reduce Transparency: the sidebar drops its translucency.
+    solid_sidebar: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -237,6 +267,9 @@ impl TraceApp {
             initial_window: cli.viewport,
             bench: (cli.bench_scroll || cli.bench_fold).then(|| Bench { last: Instant::now(), intervals: Vec::new(), builds: Vec::new(), rows: Vec::new(), fold: cli.bench_fold.then_some(None) }),
             copied_at: None,
+            menu_session: None,
+            contrast: display_accessibility().0,
+            solid_sidebar: display_accessibility().1,
             _subs: subs,
         };
         let w = this.sidebar_target(window.viewport_size().width.to_f64() as f32);
@@ -287,6 +320,10 @@ impl TraceApp {
         })
         .detach();
         this
+    }
+
+    fn palette(&self, window: &Window) -> Palette {
+        Palette::new(self.dark(window), self.contrast)
     }
 
     fn dark(&self, window: &Window) -> bool {
@@ -472,7 +509,7 @@ impl TraceApp {
         let Some(vp) = self.doc.as_ref().and_then(|d| d.viewport) else { return };
         let (a, b) = (vp.start_ns, vp.end_ns(g.tl_w as u16));
         let t = g.ov_t(x);
-        self.lens_drag = Some(match present::lens_grab(x, present::lens_rect(g.ov_x(a), g.ov_x(b), g.tl_w)) {
+        self.lens_drag = Some(match present::lens_grab(x, present::lens_rect(g.ov_x(a), g.ov_x(b), g.ov_w())) {
             Grab::Start => LensDrag::Start,
             Grab::End => LensDrag::End,
             Grab::Inside => LensDrag::Move { grab_ns: t - a },
@@ -627,13 +664,17 @@ impl TraceApp {
             }
             return;
         }
+        // Space activates a focused button; only the row list takes it as play or pause.
+        if ks.key == "space" && self.doc.is_some() && !self.focus.is_focused(window) {
+            return;
+        }
         let named = ["up", "down", "left", "right", "enter", "escape", "space", "home", "end"];
         let key = if named.contains(&ks.key.as_str()) { ks.key.clone() } else { ks.key_char.clone().unwrap_or_else(|| ks.key.clone()) };
         if ks.modifiers.platform && ks.key == "f" {
             self.open_span_search(window, cx);
             return;
         }
-        if ks.modifiers.platform && (ks.key == "\\" || (ks.modifiers.alt && ks.key == "s")) {
+        if ks.modifiers.platform && ks.key == "\\" {
             self.toggle_sidebar();
             cx.notify();
             return;
@@ -659,19 +700,12 @@ impl TraceApp {
             "l" | "right" => doc.right(),
             "g" | "home" => doc.select(0),
             "G" | "end" => doc.select(usize::MAX),
-            "enter" if doc.selected.is_some() => self.popover = Pop::Open(Instant::now()),
             "escape" if !doc.search.is_empty() => {
                 self.span_search.update(cx, |s, cx| s.set_value("", window, cx));
                 self.span_search_open = false;
             }
             "e" => self.error = doc.toggle_descendants(),
-            "+" | "=" | "-" => {
-                doc.zoom(if key == "-" { 2.0 } else { 0.5 });
-                if let Mode::Live { following, .. } = &mut doc.mode {
-                    *following = false;
-                }
-                self.zoomed = true;
-            }
+            "+" | "=" | "-" => self.zoom_by(if key == "-" { 2.0 } else { 0.5 }),
             "H" if matches!(doc.mode, Mode::Replay { .. }) => doc.seek_by(-1),
             "L" if matches!(doc.mode, Mode::Replay { .. }) => doc.seek_by(1),
             "H" => doc.pan(-1.0),
@@ -706,10 +740,183 @@ impl TraceApp {
         self.span_search.read(cx).focus_handle(cx).focus(window, cx);
         cx.notify();
     }
+
+    fn zoom_by(&mut self, factor: f64) {
+        let Some(doc) = &mut self.doc else { return };
+        doc.zoom(factor);
+        if let Mode::Live { following, .. } = &mut doc.mode {
+            *following = false;
+        }
+        self.zoomed = true;
+    }
+
+    /// Whether the selected span has a branch, and whether it is folded, for the row context menu.
+    fn selected_branch(&self) -> (bool, bool) {
+        let Some(doc) = &self.doc else { return (false, false) };
+        doc.rows.get(doc.selected_row).map_or((false, false), |r| (r.has_children, r.collapsed))
+    }
+
+    /// Asks where to save `bytes`, starting in Downloads with `name`, and writes them owner-only.
+    fn save_as(&mut self, name: String, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        let dir = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join("Downloads");
+        let rx = cx.prompt_for_new_path(&dir, Some(&name));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(path))) = rx.await
+                && let Err(e) = trace_view::write_private(&path, &bytes)
+            {
+                this.update(cx, |this, cx| {
+                    this.error = Some(format!("{e:#}"));
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Saves a session's events as canonical JSONL, which Import reads back.
+    fn export_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let lines: anyhow::Result<Vec<String>> = self.store.session_events(&id).and_then(|evs| evs.iter().map(|e| Ok(serde_json::to_string(e)?)).collect());
+        match lines {
+            Ok(lines) => self.save_as(format!("{id}.jsonl"), (lines.join("\n") + "\n").into_bytes(), cx),
+            Err(e) => self.error = Some(format!("{e:#}")),
+        }
+    }
+
+    /// Opens the session in replay, paused where the selected span starts, with that span selected.
+    fn show_in_replay(&mut self) {
+        let Some((sid, span, at)) = self.doc.as_ref().and_then(|d| d.selected_span().map(|s| (d.session_id().clone(), s.span_id.clone(), s.started_at_utc_ns))) else { return };
+        self.open(sid, true);
+        let Some(doc) = &mut self.doc else { return };
+        doc.seek(|_, _| Some(at));
+        if let Mode::Replay { clock, .. } = &mut doc.mode {
+            clock.playing = false;
+        }
+        doc.refresh();
+        if let Some(i) = doc.rows.iter().position(|r| r.kind == RowKind::Span(span.clone())) {
+            doc.select(i);
+            self.list.scroll_to_item(i, ScrollStrategy::Center);
+        }
+    }
+
+    /// The whole session as the overview shows it, for Zoom to Fit.
+    fn fit_all(&mut self) {
+        let Some(doc) = &self.doc else { return };
+        let (a, b) = match &doc.mode {
+            Mode::Replay { replay, .. } => (replay.start().unwrap_or(0), replay.end().unwrap_or(0)),
+            _ => (doc.state.axis_start().unwrap_or(doc.now), idle(doc).unwrap_or(doc.now)),
+        };
+        let w = f32::from(doc.timeline_width.max(1));
+        self.set_window(a, b, w);
+    }
+
+    /// The menu bar's and the row context menu's commands. Span commands act on the selected span; a
+    /// right-click selects its row first.
+    fn on_actions(&self, root: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
+        fn span(this: &TraceApp) -> Option<Span> {
+            this.doc.as_ref()?.selected_span().cloned()
+        }
+        root.on_action(cx.listener(|_, _: &About, window, cx| {
+            let detail = format!("Version {}\nA waterfall of what your coding agents did, as it happens.", env!("CARGO_PKG_VERSION"));
+            drop(window.prompt(PromptLevel::Info, "Trace Waterfall", Some(&detail), &["OK"], cx));
+        }))
+        .on_action(cx.listener(|this, _: &Import, _, cx| this.prompt_import(cx)))
+        .on_action(cx.listener(|this, _: &ExportSession, _, cx| {
+            if let Some(id) = this.doc.as_ref().map(|d| d.session_id().clone()) {
+                this.export_session(id, cx);
+            }
+        }))
+        .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+            this.toggle_sidebar();
+            cx.notify();
+        }))
+        .on_action(cx.listener(|this, _: &ZoomIn, _, cx| {
+            this.zoom_by(0.5);
+            cx.notify();
+        }))
+        .on_action(cx.listener(|this, _: &ZoomOut, _, cx| {
+            this.zoom_by(2.0);
+            cx.notify();
+        }))
+        .on_action(cx.listener(|this, _: &ZoomToFit, _, cx| {
+            this.fit_all();
+            cx.notify();
+        }))
+        .on_action(cx.listener(|this, _: &Follow, _, cx| {
+            this.toggle_follow();
+            cx.notify();
+        }))
+        .on_action(cx.listener(|this, _: &Replay, _, cx| {
+            this.toggle_replay();
+            cx.notify();
+        }))
+        .on_action(cx.listener(|this, _: &NextEvent, _, cx| {
+            if let Some(doc) = &mut this.doc {
+                doc.seek(|r, c| r.next_event_time(c.position));
+            }
+            cx.notify();
+        }))
+        .on_action(cx.listener(|this, _: &PrevEvent, _, cx| {
+            if let Some(doc) = &mut this.doc {
+                doc.seek(|r, c| r.prev_event_time(c.position));
+            }
+            cx.notify();
+        }))
+        .on_action(cx.listener(|this, _: &Inspect, _, cx| {
+            if this.doc.as_ref().is_some_and(|d| d.selected.is_some()) {
+                this.popover = Pop::Open(Instant::now());
+                cx.notify();
+            }
+        }))
+        .on_action(cx.listener(|this, _: &ZoomToSpan, _, cx| {
+            if let Some(s) = span(this) {
+                this.zoom_to_span(&s.span_id);
+                cx.notify();
+            }
+        }))
+        .on_action(cx.listener(|this, _: &ToggleBranch, _, cx| {
+            if let Some(s) = span(this).filter(|_| this.selected_branch().0) {
+                this.toggle_fold(&s.span_id);
+                cx.notify();
+            }
+        }))
+        .on_action(cx.listener(|this, _: &CopySpanName, _, cx| {
+            if let Some(s) = span(this) {
+                cx.write_to_clipboard(ClipboardItem::new_string(s.name));
+            }
+        }))
+        .on_action(cx.listener(|this, _: &CopySpanJson, _, cx| {
+            if let Some(json) = span(this).and_then(|s| serde_json::to_string_pretty(&s).ok()) {
+                cx.write_to_clipboard(ClipboardItem::new_string(json));
+            }
+        }))
+        .on_action(cx.listener(|this, _: &ExportSpanJson, _, cx| {
+            if let Some((s, json)) = span(this).and_then(|s| Some((s.span_id.clone(), serde_json::to_string_pretty(&s).ok()?))) {
+                this.save_as(format!("span-{s}.json"), json.into_bytes(), cx);
+            }
+        }))
+        .on_action(cx.listener(|this, _: &ShowInReplay, _, cx| {
+            this.show_in_replay();
+            cx.notify();
+        }))
+    }
+}
+
+/// macOS Increase Contrast and Reduce Transparency, read once at launch. `TW_CONTRAST=1` forces Increase
+/// Contrast on, for screenshots.
+fn display_accessibility() -> (bool, bool) {
+    let forced = std::env::var_os("TW_CONTRAST").is_some();
+    #[cfg(target_os = "macos")]
+    {
+        let w = objc2_app_kit::NSWorkspace::sharedWorkspace();
+        (forced || w.accessibilityDisplayShouldIncreaseContrast(), w.accessibilityDisplayShouldReduceTransparency())
+    }
+    #[cfg(not(target_os = "macos"))]
+    (forced, false)
 }
 
 fn apply_theme(dark: bool, cx: &mut App) {
-    let p = Palette::new(dark);
+    let p = Palette::new(dark, false);
     Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
     Theme::update(cx, |t| {
         t.font_family = ".SystemUIFont".into();
@@ -744,23 +951,33 @@ impl Render for TraceApp {
         if self.tick() || sliding || self.bench.is_some() {
             window.request_animation_frame();
         }
-        let pal = Palette::new(self.dark(window));
+        let pal = self.palette(window);
         let main_pl = MAIN_PAD * (1. - sw / SIDEBAR_W);
         let card_left = sw + main_pl;
         let root = div()
             .id("root")
-            .track_focus(&self.focus)
+            .when(self.doc.is_none(), |el| el.track_focus(&self.focus))
             .on_key_down(cx.listener(Self::on_key))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| this.import(paths.paths().to_vec(), cx)))
             .size_full()
             .flex()
-            .bg(pal.tray)
             .font_family(".SystemUIFont")
             .text_size(px(13.))
             .text_color(pal.ink)
-            .child(div().w(px(sw)).flex_shrink_0().h_full().overflow_hidden().child(div().ml(px(sw - SIDEBAR_W)).h_full().child(self.render_sidebar(&pal, cx))))
+            // The sidebar is the translucent tray over the window's blur, like a macOS source list; the
+            // content side stays opaque.
             .child(
                 div()
+                    .w(px(sw))
+                    .flex_shrink_0()
+                    .h_full()
+                    .overflow_hidden()
+                    .bg(if self.solid_sidebar { pal.tray } else { pal.tray.opacity(SIDEBAR_ALPHA) })
+                    .child(div().ml(px(sw - SIDEBAR_W)).h_full().child(self.render_sidebar(&pal, cx))),
+            )
+            .child(
+                div()
+                    .bg(pal.tray)
                     .flex_1()
                     .min_w(px(0.))
                     .h_full()
@@ -777,6 +994,7 @@ impl Render for TraceApp {
             )
             .child(self.render_sidebar_toggle(&pal, cx))
             .when_some(self.error.clone(), |el, e| el.child(toast(&pal, e, card_left, cx)));
+        let root = self.on_actions(root, cx);
         self.bench_step(built, cx);
         root
     }
@@ -829,12 +1047,31 @@ impl TraceApp {
                 div().pt(px(14.)).pb(px(6.)).px(px(10.)).text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(pal.muted).child(g.title()),
             );
             for s in items {
-                list = list.child(self.render_session_row(pal, s, open_id.as_ref() == Some(&s.session_id), today, cx));
+                list = list.child(self.render_session_row(pal, s, g, open_id.as_ref() == Some(&s.session_id), today, cx));
             }
         }
         if self.sessions.is_empty() && !self.session_search_text(cx).is_empty() {
             list = list.child(div().px(px(10.)).pt(px(14.)).text_size(px(12.5)).text_color(pal.muted).child("No matching sessions"));
         }
+        let app = cx.entity().downgrade();
+        let list = list.role(Role::List).aria_label("Sessions").context_menu(move |menu, _, cx| {
+            let Some(id) = app.upgrade().and_then(|a| a.read(cx).menu_session.clone()) else { return menu };
+            let act = |label: &'static str, f: fn(&mut TraceApp, SessionId, &mut Window, &mut Context<TraceApp>)| {
+                let (app, id) = (app.clone(), id.clone());
+                PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                    app.update(cx, |this, cx| {
+                        f(this, id.clone(), window, cx);
+                        cx.notify();
+                    })
+                    .ok();
+                })
+            };
+            menu.item(act("Open", |this, id, _, _| this.open(id, false)))
+                .item(act("Replay", |this, id, _, _| this.open(id, true)))
+                .separator()
+                .item(act("Copy Session ID", |_, id, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(id.0.clone()))))
+                .item(act("Export JSONL…", |this, id, _, cx| this.export_session(id, cx)))
+        });
         div()
             .w(px(SIDEBAR_W))
             .h_full()
@@ -878,7 +1115,7 @@ impl TraceApp {
             )
     }
 
-    fn render_session_row(&self, pal: &Palette, s: &SessionSummary, selected: bool, today: Ns, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_session_row(&self, pal: &Palette, s: &SessionSummary, group: Group, selected: bool, today: Ns, cx: &mut Context<Self>) -> impl IntoElement {
         let name = if !s.project_id.is_empty() {
             s.project_id.clone()
         } else {
@@ -901,26 +1138,24 @@ impl TraceApp {
         };
         let how = join(vec![Some(s.harness.clone()).filter(|h| !h.is_empty()), s.model.as_deref().map(present::pretty_model), turns]);
         let meta = join(vec![when, dur, s.totals.cost_usd_micros().map(|c| format_cost(Some(c)))]);
-        let dot = match s.status {
-            SessionStatus::Live => pal.accent,
-            SessionStatus::Completed => pal.ok.fg,
-            SessionStatus::Failed => pal.error.mark,
-            SessionStatus::Interrupted => pal.slow.fg,
-            SessionStatus::Unknown => pal.faint,
-        };
+        let status = present::session_status(s.status, s.last_event_at_utc_ns, trace_view::wall_ns());
         let id = s.session_id.clone();
-        let live = s.status == SessionStatus::Live;
-        div()
-            .id(SharedString::from(format!("session-{}", s.session_id)))
+        let menu_id = s.session_id.clone();
+        let spoken = [Some(name.clone()), Some(how.clone()).filter(|h| !h.is_empty()), Some(status.label().to_owned()), Some(meta.clone())].into_iter().flatten().collect::<Vec<_>>().join(", ");
+        let ring = if selected { pal.card } else { pal.tray };
+        focusable(div().id(SharedString::from(format!("session-{}", s.session_id))), pal, pal.tray, TAB_SIDEBAR)
             .flex()
             .gap(px(10.))
             .px(px(10.))
             .py(px(7.))
             .rounded(px(9.))
             .cursor_pointer()
+            .role(Role::Button)
+            .aria_label(spoken)
+            .aria_selected(selected)
             .when(selected, |el| el.bg(pal.card).shadow(vec![soft_shadow(pal, 0.06, 1., 3.)]).border_1().border_color(pal.line))
             .when(!selected, |el| el.border_1().border_color(transparent_black()).hover(|st| st.bg(pal.hover.opacity(3.))))
-            .child(session_lead(pal, present::harness_brand(&s.harness, &s.source_adapter), dot, live, selected, ("sdot", s.session_id.0.len() + s.span_count)))
+            .child(session_lead(pal, present::harness_brand(&s.harness, &s.source_adapter), status, present::shows_badge(status, group), ring, ("sdot", s.session_id.0.len() + s.span_count)))
             .child(
                 div()
                     .flex_1()
@@ -932,11 +1167,32 @@ impl TraceApp {
                     .when(!how.is_empty(), |el| el.child(div().truncate().text_size(px(11.5)).text_color(pal.text).child(how)))
                     .child(div().truncate().text_size(px(11.5)).text_color(pal.muted).font_features(tnum()).child(meta)),
             )
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, _| this.menu_session = Some(menu_id.clone())))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open(id.clone(), false);
                 cx.notify();
             }))
     }
+}
+
+/// Tab order groups: sidebar, header, the trace card, then the popover.
+const TAB_SIDEBAR: isize = 0;
+const TAB_HEADER: isize = 1;
+const TAB_CARD: isize = 2;
+const TAB_POPOVER: isize = 3;
+
+/// A keyboard-reachable control: a tab stop in group `order` that draws the focus ring, 2pt of accent at
+/// 50% set 2pt off its edge over `surface`, only when focus arrived from the keyboard.
+fn focusable(el: Stateful<Div>, pal: &Palette, surface: Hsla, order: isize) -> Stateful<Div> {
+    let ring = pal.accent.opacity(0.5);
+    el.tab_index(order).focus_visible(move |s| s.shadow(focus_ring(ring, surface, false)))
+}
+
+/// The focus ring as two spread shadows: the 2pt gap in the surface color, then 2pt of ring beyond it.
+/// `inset` draws it inside the element instead, for a region such as the row list that fills its card.
+fn focus_ring(ring: Hsla, surface: Hsla, inset: bool) -> Vec<BoxShadow> {
+    let spread = |c: Hsla, w: f32| BoxShadow { color: c, offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(w), inset };
+    if inset { vec![spread(ring, 2.)] } else { vec![spread(ring, 4.), spread(surface, 2.)] }
 }
 
 fn soft_shadow(pal: &Palette, alpha: f32, y: f32, blur: f32) -> BoxShadow {
@@ -949,49 +1205,79 @@ fn soft_shadow(pal: &Palette, alpha: f32, y: f32, blur: f32) -> BoxShadow {
     }
 }
 
-/// A session row's leading mark: the harness logo with the status dot as a badge on its corner, ringed
-/// in the row's fill so it reads as cut out of the logo; or the bare dot when the harness has no logo.
-fn session_lead(pal: &Palette, harness: Option<present::Brand>, dot: Hsla, live: bool, selected: bool, id: impl Into<ElementId>) -> AnyElement {
+/// A session row's leading mark: the harness logo on a 16pt tile with the status glyph as a badge on its
+/// corner, ringed 2pt in the row's fill so it reads as cut out of the tile; or the bare glyph when the
+/// harness has no logo. `badge` is false for rows that go without one.
+fn session_lead(pal: &Palette, harness: Option<present::Brand>, status: Status, badge: bool, ring: Hsla, id: impl Into<ElementId>) -> AnyElement {
     let slot = div().w(px(16.)).flex_shrink_0().flex().justify_center();
-    let Some(b) = harness else { return slot.pt(px(5.)).child(status_dot(dot, live, id)).into_any_element() };
-    let ring = if selected { pal.card } else { pal.tray };
+    let Some(b) = harness else { return slot.pt(px(4.)).child(status_mark(pal, status, id)).into_any_element() };
     slot.pt(px(1.))
         .child(
             div()
                 .relative()
                 .size(px(16.))
-                .child(logo(b, 16., pal))
-                .child(div().absolute().right(px(-3.)).bottom(px(-3.)).p(px(1.5)).rounded_full().bg(ring).child(status_dot(dot, live, id))),
+                .child(harness_tile(b, 16., pal))
+                .when(badge, |el| el.child(div().absolute().right(px(-5.)).bottom(px(-5.)).p(px(2.)).rounded_full().bg(ring).child(status_mark(pal, status, id)))),
         )
         .into_any_element()
 }
 
-fn status_dot(color: Hsla, pulse: bool, id: impl Into<ElementId>) -> AnyElement {
-    let dot = div().size(px(7.)).rounded_full().bg(color);
-    if !pulse {
-        return dot.into_any_element();
+/// The harness mark on a tinted tile, at sidebar and header sizes.
+fn harness_tile(b: present::Brand, size: f32, pal: &Palette) -> impl IntoElement {
+    let b = present::Brand { logo: b.logo.small(), ..b };
+    div()
+        .size(px(size))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px((size * 0.28).round()))
+        .bg(if pal.dark { pal.chip } else { pal.card })
+        .border_1()
+        .border_color(pal.line)
+        .child(logo(b, b.logo.size_in(size), pal))
+}
+
+/// A status in its color and its own shape: a filled dot (pulsing while live), a ring, a check, an x, or a pause.
+fn status_mark(pal: &Palette, status: Status, id: impl Into<ElementId>) -> AnyElement {
+    status_mark_pulse(pal, status, status == Status::Live, id)
+}
+
+fn status_mark_pulse(pal: &Palette, status: Status, pulse: bool, id: impl Into<ElementId>) -> AnyElement {
+    let (hue, shape) = status.look();
+    let color = pal.hue(hue);
+    let glyph = |icon: IconName| div().size(px(8.)).flex().items_center().justify_center().child(Icon::new(icon).size(px(10.)).text_color(color)).into_any_element();
+    match shape {
+        Shape::Dot if pulse => div()
+            .size(px(7.))
+            .relative()
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded_full()
+                    .bg(color)
+                    .with_animation(id, Animation::new(Duration::from_millis(1400)).repeat(), move |el, t| {
+                        let r = 3.5 + 4.0 * t;
+                        el.top(px(3.5 - r)).left(px(3.5 - r)).size(px(2. * r)).opacity(0.45 * (1. - t))
+                    }),
+            )
+            .child(div().absolute().inset_0().rounded_full().bg(color))
+            .into_any_element(),
+        Shape::Dot => div().size(px(7.)).rounded_full().bg(color).into_any_element(),
+        Shape::Ring => div().size(px(7.)).rounded_full().border(px(1.5)).border_color(color).into_any_element(),
+        Shape::Check => glyph(IconName::Check),
+        Shape::Cross => glyph(IconName::X),
+        Shape::Pause => glyph(IconName::Pause),
     }
-    div()
-        .size(px(7.))
-        .relative()
-        .child(
-            div()
-                .absolute()
-                .inset_0()
-                .rounded_full()
-                .bg(color)
-                .with_animation(id, Animation::new(Duration::from_millis(1400)).repeat(), move |el, t| {
-                    let r = 3.5 + 4.0 * t;
-                    el.top(px(3.5 - r)).left(px(3.5 - r)).size(px(2. * r)).opacity(0.45 * (1. - t))
-                }),
-        )
-        .child(div().absolute().inset_0().rounded_full().bg(color))
-        .into_any_element()
 }
 
-/// A status capsule: card fill, line ring, soft shadow, with the status color only on the dot and text.
-fn pill(pal: &Palette, color: Hsla, label: String, pulse: bool, id: impl Into<ElementId>, h: f32) -> impl IntoElement {
+/// A status capsule: card fill, line ring, soft shadow, with the status color only on its glyph and text.
+fn pill(pal: &Palette, status: Status, label: String, pulse: bool, id: impl Into<ElementId>, h: f32) -> impl IntoElement {
+    let color = pal.hue(status.look().0);
+    let id = id.into();
     div()
+        .id(SharedString::from(format!("pill-{id:?}")))
         .h(px(h))
         .flex_shrink_0()
         .flex()
@@ -1007,7 +1293,9 @@ fn pill(pal: &Palette, color: Hsla, label: String, pulse: bool, id: impl Into<El
         .text_size(px(12.))
         .font_weight(FontWeight::MEDIUM)
         .font_features(tnum())
-        .child(status_dot(color, pulse, id))
+        .role(Role::Status)
+        .aria_label(format!("Status: {label}"))
+        .child(status_mark_pulse(pal, status, pulse, id))
         .child(label)
 }
 
@@ -1015,8 +1303,10 @@ fn pill(pal: &Palette, color: Hsla, label: String, pulse: bool, id: impl Into<El
 
 impl TraceApp {
     fn render_sidebar_toggle(&self, pal: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("sidebar-toggle")
+        focusable(div().id("sidebar-toggle"), pal, pal.tray, TAB_HEADER)
+            .role(Role::Button)
+            .aria_label("Toggle sidebar")
+            .aria_expanded(self.sidebar_anim.1 > 0.)
             .absolute()
             .left(px(TOGGLE_X))
             .top(px((HEADER_H - 28.) / 2.))
@@ -1028,7 +1318,7 @@ impl TraceApp {
             .cursor_pointer()
             .hover(|s| s.bg(pal.hover.opacity(4.)))
             .child(Icon::new(IconName::PanelLeft).size(px(16.)).text_color(pal.text))
-            .tooltip(|w, cx| Tooltip::new("Toggle sidebar  ⌘⌥S").build(w, cx))
+            .tooltip(|w, cx| Tooltip::new("Toggle sidebar  ⌥⌘S").build(w, cx))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.toggle_sidebar();
                 cx.notify();
@@ -1120,26 +1410,25 @@ impl TraceApp {
                         .child(Input::new(&self.span_search).appearance(false).small().cleanable(true).prefix(Icon::new(IconName::ListFilter).size(px(13.)).text_color(pal.muted))),
                 );
             }
-            let (color, label, pulse) = match &doc.mode {
-                Mode::Live { paused_at: Some(_), .. } => (pal.text, "Paused".to_owned(), false),
+            let (status, label, pulse) = match &doc.mode {
+                Mode::Live { paused_at: Some(_), .. } => (Status::Paused, "Paused".to_owned(), false),
                 Mode::Live { .. } => match idle(doc) {
-                    Some(last) => (pal.slow.fg, format!("Idle · {}", format_duration(doc.now - last)), false),
-                    None => (pal.accent, "Live".to_owned(), true),
+                    Some(last) => (Status::Idle, format!("Idle · {}", format_duration(doc.now - last)), false),
+                    None => (Status::Live, "Live".to_owned(), true),
                 },
-                Mode::Replay { replay, clock } => (pal.accent, format!("Replay · {}", clock_time(clock.position - replay.start().unwrap_or(0))), false),
-                Mode::Static => match s.status {
-                    SessionStatus::Failed => (pal.error.ink, "Failed".to_owned(), false),
-                    SessionStatus::Interrupted => (pal.slow.fg, "Interrupted".to_owned(), false),
-                    SessionStatus::Unknown => (pal.text, "Unknown".to_owned(), false),
-                    _ => (pal.ok.fg, "Done".to_owned(), false),
-                },
+                Mode::Replay { replay, clock } => (Status::Live, format!("Replay · {}", clock_time(clock.position - replay.start().unwrap_or(0))), false),
+                Mode::Static => {
+                    let st = present::session_status(s.status, None, 0);
+                    (st, st.label().to_owned(), false)
+                }
             };
-            right = right.child(pill(pal, color, label, pulse, "hdot", 28.));
+            right = right.child(pill(pal, status, label, pulse, "hdot", 28.));
             if let Mode::Live { following, .. } = &doc.mode {
                 let on = *following && now_visible(doc);
                 right = right.child(
                     tool_button("follow", IconName::Crosshair, Some("Follow"), on, pal)
-                        .tooltip(|w, cx| Tooltip::new("Keep the latest activity in view  F").build(w, cx))
+                        .aria_toggled(if on { Toggled::True } else { Toggled::False })
+                        .tooltip(|w, cx| Tooltip::new("Keep the latest activity in view  F or ⇧⌘F").build(w, cx))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.toggle_follow();
                             cx.notify();
@@ -1149,7 +1438,7 @@ impl TraceApp {
             let replaying = matches!(doc.mode, Mode::Replay { .. });
             right = right.child(
                 tool_button("replay", if replaying { IconName::X } else { IconName::RotateCcw }, Some(if replaying { "Exit replay" } else { "Replay" }), false, pal)
-                    .tooltip(|w, cx| Tooltip::new("Replay from the start  R").build(w, cx))
+                    .tooltip(move |w, cx| Tooltip::new(if replaying { "Leave replay  R or ⌘R" } else { "Replay from the start  R or ⌘R" }).build(w, cx))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_replay();
                         cx.notify();
@@ -1173,7 +1462,7 @@ impl TraceApp {
                     .flex()
                     .items_center()
                     .gap(px(6.))
-                    .children(harness.map(|b| logo(b, 14., pal)))
+                    .children(harness.map(|b| harness_tile(b, 16., pal)))
                     .child(div().min_w(px(0.)).truncate().text_size(px(13.)).text_color(pal.muted).child(subtitle)),
             )
             .child(right)
@@ -1182,8 +1471,7 @@ impl TraceApp {
 
 fn tool_button(id: &'static str, icon: IconName, label: Option<&str>, on: bool, pal: &Palette) -> Stateful<Div> {
     let fg = if on { pal.brand.fg } else { pal.text };
-    div()
-        .id(id)
+    focusable(div().id(id), pal, pal.tray, TAB_HEADER)
         .h(px(28.))
         .flex()
         .items_center()
@@ -1195,6 +1483,8 @@ fn tool_button(id: &'static str, icon: IconName, label: Option<&str>, on: bool, 
         .text_size(px(12.5))
         .font_weight(FontWeight::MEDIUM)
         .text_color(fg)
+        .role(Role::Button)
+        .when_some(label, |el, l| el.aria_label(l.to_owned()))
         .when(on, |el| el.bg(pal.brand.bg).border_color(pal.brand.fg.opacity(0.18)))
         .when(!on, |el| el.bg(pal.card).border_color(pal.line).shadow(vec![soft_shadow(pal, 0.04, 1., 2.)]).hover(|s| s.bg(pal.wash)))
         .child(Icon::new(icon).size(px(13.)).text_color(fg))
@@ -1209,9 +1499,11 @@ impl TraceApp {
         let card_w = vw - card_left - MAIN_PAD - 2.;
         let name_w = (card_w * 0.3).clamp(230., 300.);
         let tl_w = (card_w - name_w - TL_PAD_R).max(40.);
+        let idle_at = idle(doc);
+        // An idle session's overview ends at its last activity; the gap to now is a marker, not hours of empty strip.
         let overview = match &doc.mode {
             Mode::Replay { replay, .. } => (replay.start().unwrap_or(0), replay.end().unwrap_or(0)),
-            _ => (doc.state.axis_start().unwrap_or(doc.now), doc.now),
+            _ => (doc.state.axis_start().unwrap_or(doc.now), idle_at.unwrap_or(doc.now)),
         };
         if doc.viewport.is_none() {
             if let Some((a, b)) = self.initial_window.take() {
@@ -1251,7 +1543,8 @@ impl TraceApp {
         }
         let origin = overview.0;
         let live = matches!(doc.mode, Mode::Live { .. });
-        Some(Geo { left: card_left + 1., name_w, tl_w, vp, now: doc.now, origin, overview, end: shown_end(doc), live })
+        let following = matches!(doc.mode, Mode::Live { following: true, .. }) && now_visible(doc);
+        Some(Geo { left: card_left + 1., name_w, tl_w, vp, now: doc.now, origin, overview, end: shown_end(doc), following, idle: idle_at, live })
     }
 
     fn render_card(&mut self, pal: &Palette, vw: f32, card_left: f32, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1265,6 +1558,8 @@ impl TraceApp {
         let grid = div().absolute().inset_0().children(ticks.iter().map(|(t, _)| {
             div().absolute().top_0().bottom_0().left(px(g.name_w + g.x(*t).round())).w(px(1.)).bg(pal.grid)
         }));
+        let axis_right = g.name_w + g.tl_w + TL_PAD_R;
+        let tick_x: Vec<f32> = ticks.iter().map(|(t, l)| present::tick_label_x(g.name_w + g.x(*t).round(), text_width(window, l, 11.), axis_right)).collect();
         let axis = div()
             .h(px(AXIS_H))
             .flex_shrink_0()
@@ -1272,21 +1567,28 @@ impl TraceApp {
             .border_b_1()
             .border_color(pal.line)
             .child(div().absolute().left(px(16.)).top_0().h_full().flex().items_center().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(pal.muted).child("Span"))
-            .children(ticks.iter().map(|(t, l)| {
+            .children(ticks.iter().zip(tick_x).map(|((_, l), x)| {
                 div()
                     .absolute()
                     .top_0()
                     .h_full()
                     .flex()
                     .items_center()
-                    .left(px(g.name_w + g.x(*t).round() + 5.))
+                    .left(px(x))
                     .text_size(px(11.))
                     .text_color(pal.muted)
                     .font_features(tnum())
                     .child(l.clone())
             }));
+        let ring = pal.accent.opacity(0.5);
         let body = div()
             .id("body")
+            .track_focus(&self.focus)
+            .key_context(ROWS_CONTEXT)
+            .tab_index(TAB_CARD)
+            .focus_visible(move |s| s.shadow(focus_ring(ring, ring, true)))
+            .role(Role::Tree)
+            .aria_label("Spans")
             .flex_1()
             .min_h(px(0.))
             .relative()
@@ -1356,8 +1658,9 @@ impl TraceApp {
                 let left = edge == Edge::Left;
                 let chevron = Icon::new(if left { IconName::ChevronLeft } else { IconName::ChevronRight }).size(px(14.)).text_color(pal.accent);
                 el.child(
-                    div()
-                        .id("jump-now")
+                    focusable(div().id("jump-now"), pal, pal.card, TAB_CARD)
+                        .role(Role::Button)
+                        .aria_label(format!("Jump to now, {text}"))
                         .absolute()
                         .top(px(8.))
                         .when(left, |el| el.left(px(g.name_w + 8.)).pl(px(8.)).pr(px(12.)))
@@ -1378,13 +1681,29 @@ impl TraceApp {
                         .cursor_pointer()
                         .hover(|s| s.bg(pal.wash))
                         .map(|el| if left { el.child(chevron).child(text) } else { el.child(text).child(chevron) })
-                        .tooltip(|w, cx| Tooltip::new("Jump to now and follow  F").build(w, cx))
+                        .tooltip(|w, cx| Tooltip::new("Jump to now and follow  F or ⇧⌘F").build(w, cx))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.jump_to_now();
                             cx.notify();
                         })),
                 )
             });
+        let app = cx.entity().downgrade();
+        let focus = self.focus.clone();
+        let body = body.context_menu(move |menu, _, cx| {
+            let Some(app) = app.upgrade() else { return menu };
+            let (branch, collapsed) = app.read(cx).selected_branch();
+            menu.action_context(focus.clone())
+                .menu("Inspect", Box::new(Inspect))
+                .menu("Zoom to Fit", Box::new(ZoomToSpan))
+                .menu_with_disabled(if collapsed { "Expand Branch" } else { "Collapse Branch" }, Box::new(ToggleBranch), !branch)
+                .separator()
+                .menu("Copy Span Name", Box::new(CopySpanName))
+                .menu("Copy Span JSON", Box::new(CopySpanJson))
+                .menu("Export Span JSON…", Box::new(ExportSpanJson))
+                .separator()
+                .menu("Show in Replay", Box::new(ShowInReplay))
+        });
         let stats = self.render_stats(pal);
         let overview = self.render_overview(pal, g, cx);
         let transport = matches!(doc.mode, Mode::Replay { .. }).then(|| self.render_transport(pal, &g, cx).into_any_element());
@@ -1449,16 +1768,18 @@ impl TraceApp {
         Some(div().size_full().relative().overflow_hidden().children(rows))
     }
 
-    /// The whole session as a density strip, with the visible window as a lens: click jumps, drag moves,
-    /// dragging an edge zooms.
+    /// The whole session as a density sparkline per lane, with the visible window as a lens: click jumps,
+    /// drag moves, dragging an edge zooms.
     fn render_overview(&self, pal: &Palette, g: Geo, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        const LANE: f32 = 3.;
+        const LANE: f32 = 5.;
         const LANE_GAP: f32 = 2.;
+        const RUG: f32 = 3.;
         let doc = self.doc.as_ref().expect("overview needs a document");
         const LANES_H: f32 = present::LANES as f32 * LANE + (present::LANES - 1) as f32 * LANE_GAP;
         let session_end = g.end;
-        let cols = g.tl_w.ceil().max(1.) as usize;
-        // One thin lane per kind (wait in amber, LLM, tool); failures tick across all three in red.
+        let ov_w = g.ov_w();
+        let cols = ov_w.ceil().max(1.) as usize;
+        // One lane per kind (wait in amber, LLM, tool), each column's height its density; failures tick above in red.
         let lane = |k: SpanKind| match k {
             SpanKind::Wait => Some(0),
             SpanKind::Llm => Some(1),
@@ -1472,19 +1793,22 @@ impl TraceApp {
             .iter()
             .enumerate()
             .flat_map(|(i, a)| (0..present::LANES).filter(|&k| a[k] > 0.).map(move |k| (i, k, a[k])))
-            .map(|(i, k, a)| (i as f32, k as f32 * (LANE + LANE_GAP), LANE, colors[k].opacity(a)))
+            .map(|(i, k, a)| {
+                let h = (a * LANE).max(1.);
+                (i as f32, k as f32 * (LANE + LANE_GAP) + LANE - h, h, colors[k])
+            })
             .collect();
         let mut errors: Vec<usize> = doc.state.spans.values().filter(|s| s.status == SpanStatus::Failed).map(|s| (g.ov_x(s.started_at_utc_ns).max(0.) as usize).min(cols - 1)).collect();
         errors.sort_unstable();
         errors.dedup();
         // A rug above the lanes, so even hundreds of failures never hide the density beneath.
-        marks.extend(errors.into_iter().map(|i| (i as f32, -7., 4., pal.error.mark)));
+        marks.extend(errors.into_iter().map(|i| (i as f32, -RUG - 1.5, RUG, pal.error.mark)));
         let (a, b) = g.window();
-        let (lx0, lx1) = present::lens_rect(g.ov_x(a), g.ov_x(b), g.tl_w);
+        let (lx0, lx1) = present::lens_rect(g.ov_x(a), g.ov_x(b), ov_w);
         let thin = g.ov_x(b) - g.ov_x(a) < present::LENS_MIN;
         let this = cx.entity().downgrade();
         let strip = canvas(|_, _, _| {}, move |bounds, _, window, _| {
-            let top = bounds.origin.y + (bounds.size.height - px(LANES_H)) / 2. + px(3.);
+            let top = bounds.origin.y + (bounds.size.height - px(LANES_H)) / 2. + px(RUG / 2. + 1.);
             for (x, y, h, color) in &marks {
                 window.paint_quad(fill(Bounds::new(point(bounds.origin.x + px(*x), top + px(*y)), size(px(1.), px(*h))), *color));
             }
@@ -1517,9 +1841,36 @@ impl TraceApp {
                 }
             });
         });
-        let grip = || div().w(px(2.)).h(px(10.)).rounded_full().bg(pal.faint);
+        let grip = |c: Hsla| div().w(px(2.)).h(px(10.)).rounded_full().bg(c);
         let whole = a <= g.overview.0 && b >= g.overview.1;
         let tl_w = g.tl_w;
+        let idle_mark = g.idle.map(|last| {
+            let gap = present::idle_gap(last, g.now);
+            let tip = format!("Last activity {} ago. The overview ends there; now lies past its right edge.", format_duration(g.now - last));
+            div()
+                .id("idle-gap")
+                .absolute()
+                .right_0()
+                .top_0()
+                .bottom_0()
+                .w(px(IDLE_MARK_W))
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap(px(4.))
+                .pr(px(8.))
+                .border_l_1()
+                .border_color(pal.slow.fg.opacity(0.5))
+                .text_size(px(11.))
+                .font_weight(FontWeight::MEDIUM)
+                .font_features(tnum())
+                .text_color(pal.slow.fg)
+                .role(Role::Status)
+                .aria_label(format!("{gap}, now"))
+                .child(gap)
+                .child(Icon::new(IconName::ArrowRight).size(px(11.)).text_color(pal.slow.fg))
+                .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+        });
         div()
             .h(px(OVERVIEW_H))
             .flex_shrink_0()
@@ -1542,8 +1893,7 @@ impl TraceApp {
                     .child(div().flex_1().min_w(px(0.)).truncate().text_color(pal.text).font_weight(FontWeight::MEDIUM).child(present::overview_label((a, b), g.overview)))
                     .when(!whole, |el| {
                         el.child(
-                            div()
-                                .id("show-all")
+                            focusable(div().id("show-all"), pal, pal.card, 2)
                                 .flex_shrink_0()
                                 .h(px(22.))
                                 .px(px(8.))
@@ -1558,7 +1908,10 @@ impl TraceApp {
                                 .text_color(pal.text)
                                 .cursor_pointer()
                                 .hover(|s| s.bg(pal.wash))
+                                .role(Role::Button)
+                                .aria_label("Show all")
                                 .child("Show all")
+                                .tooltip(|w, cx| Tooltip::new("Fit the whole session  ⌘0").build(w, cx))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let (a, b) = g.overview;
                                     this.set_window(a, b, tl_w);
@@ -1590,11 +1943,12 @@ impl TraceApp {
                             .shadow(vec![soft_shadow(pal, 0.10, 1., 3.)])
                             .flex()
                             .items_center()
-                            .justify_between()
                             .px(px(2.))
-                            .when(!thin, |el| el.child(grip()).child(grip())),
+                            .when(thin, |el| el.justify_center().child(grip(pal.accent)))
+                            .when(!thin, |el| el.justify_between().child(grip(pal.faint)).child(grip(pal.faint))),
                     )
-                    .child(strip.absolute().inset_0()),
+                    .child(strip.absolute().top_0().bottom_0().left_0().w(px(ov_w)))
+                    .children(idle_mark),
             )
     }
 
@@ -1620,6 +1974,9 @@ impl TraceApp {
             let tip = until_now.clone().filter(|_| i == 0);
             div()
                 .id(("stat", i))
+                .role(Role::Label)
+                .aria_label(label)
+                .aria_value(value.clone())
                 .when_some(tip, |el, t| el.tooltip(move |w, cx| Tooltip::new(t.clone()).build(w, cx)))
                 .flex_1()
                 .min_w(px(0.))
@@ -1636,7 +1993,7 @@ impl TraceApp {
 
     /// `ix` is the row's place in the document, for selection and hover; `key` names its elements.
     fn render_row(&mut self, ix: usize, row: &Row, key: usize, g: Geo, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let pal = Palette::new(self.dark(window));
+        let pal = self.palette(window);
         let doc = self.doc.as_ref().expect("rows need a document");
         let RowKind::Span(id) = &row.kind else {
             return div()
@@ -1663,7 +2020,7 @@ impl TraceApp {
         // Two pixels in from each edge, so a span that would draw as a sliver reads as off-screen.
         let edge_ns = (2. * g.vp.ns_per_cell) as Ns;
         let (wa, wb) = g.window();
-        let hint = present::offscreen_hint(s.started_at_utc_ns, end, (wa + edge_ns, wb - edge_ns), g.live);
+        let hint = present::offscreen_hint(s.started_at_utc_ns, end, (wa + edge_ns, wb - edge_ns), g.following.then_some(g.now));
         let full_title = present::title(s);
         // About 7pt per character at 13pt; the title gets at most 80% of what the name column leaves.
         let room = (g.name_w - indent - 14. - 20. - 12. - 10.) * 0.8;
@@ -1764,8 +2121,14 @@ impl TraceApp {
             None => self.render_bar(key, s, &g, kc, &pal, hovered, slowest, &hidden, row_bg, window).into_any_element(),
         };
         let click_id = id.clone();
+        let spoken = present::row_label(s, &doc.state.subtree_totals(id), g.end, g.now);
         let el = div()
             .id(("row", key))
+            .role(Role::TreeItem)
+            .aria_label(spoken)
+            .aria_level(usize::from(row.depth) + 1)
+            .aria_selected(selected)
+            .when(row.has_children, |el| el.aria_expanded(!row.collapsed))
             .h(px(ROW_H))
             .w_full()
             .relative()
@@ -1790,6 +2153,11 @@ impl TraceApp {
                     this.hovered = next;
                     cx.notify();
                 }
+            }))
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, window, cx| {
+                this.select(ix);
+                this.focus.focus(window, cx);
+                cx.notify();
             }))
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                 this.select(ix);
@@ -1976,14 +2344,7 @@ impl TraceApp {
             .join(" · ");
         let open = s.ended_at_utc_ns.is_none() && !matches!(doc.mode, Mode::Static);
         let quiet = open && idle(doc).is_some();
-        let (status, label) = match s.status {
-            SpanStatus::Failed => (pal.error.ink, "Failed"),
-            SpanStatus::Succeeded => (pal.ok.fg, "Done"),
-            SpanStatus::Cancelled => (pal.text, "Cancelled"),
-            SpanStatus::Running if quiet => (pal.slow.fg, "Idle"),
-            SpanStatus::Running if open => (pal.accent, "Running"),
-            _ => (pal.text, "Unknown"),
-        };
+        let (status, label) = present::span_status(s.status, open, quiet);
         let stats = present::popover_stats(&doc.state, s, &doc.state.subtree_totals(&s.span_id), g.end, doc.now);
         let cell = |(k, v): &(&'static str, String)| {
             div()
@@ -2038,8 +2399,10 @@ impl TraceApp {
                     )
                     .child(pill(pal, status, label.to_owned(), open && !quiet, "pdot", 24.))
                     .child(
-                        div()
-                            .id("close")
+                        focusable(div().id("close"), pal, pal.pop, TAB_POPOVER)
+                            .role(Role::Button)
+                            .aria_label("Close")
+                            .tooltip(|w, cx| Tooltip::new("Close  Esc").build(w, cx))
                             .size(px(24.))
                             .flex()
                             .items_center()
@@ -2063,8 +2426,10 @@ impl TraceApp {
                     .p(px(12.))
                     .rounded(px(10.))
                     .bg(pal.wash)
-                    .child(div().flex().gap(px(10.)).children(stats[..3].iter().map(cell)))
-                    .child(div().flex().gap(px(10.)).children(stats[3..].iter().map(cell))),
+                    .children(stats.chunks(3).map(|row| {
+                        // A short last row keeps the column widths of the rows above.
+                        div().flex().gap(px(10.)).children(row.iter().map(cell)).children((row.len()..3).map(|_| div().flex_1()))
+                    })),
             )
             .when_some(s.error.clone().or_else(|| (s.status == SpanStatus::Failed).then(|| "Failed without an error message".into())), |el, e| {
                 el.child(
@@ -2080,8 +2445,14 @@ impl TraceApp {
                         .child(div().flex_1().line_clamp(4).child(e)),
                 )
             })
-            .child(section("Input", s.input_preview.clone()))
-            .child(section("Output", s.output_preview.clone()))
+            .map(|el| {
+                let present = |v: &Option<String>| v.as_ref().is_some_and(|b| !b.trim().is_empty());
+                if present(&s.input_preview) || present(&s.output_preview) {
+                    el.child(section("Input", s.input_preview.clone())).child(section("Output", s.output_preview.clone()))
+                } else {
+                    el.child(div().text_size(px(12.5)).text_color(pal.muted).child("Input and output not captured"))
+                }
+            })
             .when(!s.events.is_empty(), |el| {
                 el.child(list_section(
                     pal,
@@ -2187,9 +2558,10 @@ impl TraceApp {
         let speed_ix = clock.speed_index;
         let playing = clock.playing;
         let _ = g;
-        let icon_btn = |id: &'static str, icon: IconName, tip: &'static str| {
-            div()
-                .id(id)
+        let icon_btn = |id: &'static str, icon: IconName, label: &'static str, tip: &'static str| {
+            focusable(div().id(id), pal, pal.pop, TAB_CARD)
+                .role(Role::Button)
+                .aria_label(label)
                 .size(px(30.))
                 .flex()
                 .items_center()
@@ -2225,15 +2597,16 @@ impl TraceApp {
                 .border_1()
                 .border_color(pal.line)
                 .shadow(vec![soft_shadow(pal, 0.10, 8., 24.), soft_shadow(pal, 0.05, 1., 3.)])
-                .child(icon_btn("back", IconName::SkipBack, "Previous event  [").on_click(cx.listener(|this, _, _, cx| {
+                .child(icon_btn("back", IconName::SkipBack, "Previous event", "Previous event  [ or ⌘[").on_click(cx.listener(|this, _, _, cx| {
                     if let Some(doc) = &mut this.doc {
                         doc.seek(|r, c| r.prev_event_time(c.position));
                     }
                     cx.notify();
                 })))
                 .child(
-                    div()
-                        .id("play")
+                    focusable(div().id("play"), pal, pal.pop, TAB_CARD)
+                        .role(Role::Button)
+                        .aria_label(if playing { "Pause" } else { "Play" })
                         .size(px(34.))
                         .flex()
                         .items_center()
@@ -2251,7 +2624,7 @@ impl TraceApp {
                             cx.notify();
                         })),
                 )
-                .child(icon_btn("fwd", IconName::SkipForward, "Next event  ]").on_click(cx.listener(|this, _, _, cx| {
+                .child(icon_btn("fwd", IconName::SkipForward, "Next event", "Next event  ] or ⌘]").on_click(cx.listener(|this, _, _, cx| {
                     if let Some(doc) = &mut this.doc {
                         doc.seek(|r, c| r.next_event_time(c.position));
                     }
@@ -2260,8 +2633,11 @@ impl TraceApp {
                 .child(div().w(px(1.)).h(px(20.)).mx(px(8.)).bg(pal.line))
                 .child(div().flex().items_center().p(px(2.)).rounded(px(8.)).bg(pal.chip).children(SPEEDS.iter().enumerate().map(|(i, sp)| {
                     let on = i == speed_ix;
-                    div()
-                        .id(("speed", i))
+                    focusable(div().id(("speed", i)), pal, pal.chip, TAB_CARD)
+                        .role(Role::RadioButton)
+                        .aria_label(format!("{sp}× speed"))
+                        .aria_selected(on)
+                        .tooltip(move |w, cx| Tooltip::new(format!("Play at {sp}×  < slower, > faster")).build(w, cx))
                         .h(px(22.))
                         .px(px(7.))
                         .flex()
@@ -2321,14 +2697,15 @@ impl TraceApp {
         let copied = self.copied_at.is_some_and(|t| t.elapsed() < COPIED_FOR);
         // A faint, inert waterfall behind the copy that fades out radially around it, so the empty card
         // already looks like what it will hold. Painted per column: GPUI has no radial gradient.
-        let sample = [(Tone::Agent, 0.06, 0.88), (Tone::Llm, 0.08, 0.22), (Tone::Tool, 0.31, 0.07), (Tone::Llm, 0.39, 0.24), (Tone::Tool, 0.64, 0.07), (Tone::Llm, 0.72, 0.21)];
+        // A waterfall: an agent bar over the whole run, then calls stepping down and to the right.
+        let sample = [(Tone::Agent, 0.08, 0.84), (Tone::Llm, 0.11, 0.2), (Tone::Tool, 0.32, 0.12), (Tone::Llm, 0.45, 0.24), (Tone::Tool, 0.7, 0.18)];
         let colors = sample.map(|(t, x, w)| (pal.kind(t).edge, x, w));
         let ghost = canvas(|_, _, _| {}, move |b, _, window, _| {
             let (w, h) = (b.size.width.to_f64() as f32, b.size.height.to_f64() as f32);
             let (cx, cy) = (w / 2., h / 2.);
             let rows = colors.len() as f32;
             for (i, (color, x0, bw)) in colors.iter().enumerate() {
-                let y = cy + (i as f32 - (rows - 1.) / 2.) * 2. * BAR_H;
+                let y = cy + (i as f32 - (rows - 1.) / 2.) * 4.5 * BAR_H;
                 let (a, z) = ((x0 * w).round() as i32, ((x0 + bw) * w).round() as i32);
                 for x in a..z {
                     let d = (((x as f32 - cx) / 300.).powi(2) + ((y - cy) / 150.).powi(2)).sqrt();
@@ -2358,7 +2735,12 @@ impl TraceApp {
                         .line_height(px(20.))
                         .text_color(pal.text)
                         .text_center()
-                        .child("Start the collector and run an agent, or import a JSONL trace. You can also drop a .jsonl file anywhere in this window."),
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .child("Start the collector and run an agent,")
+                        .child("or import a JSONL trace.")
+                        .child(div().pt(px(6.)).text_color(pal.muted).child("You can also drop a .jsonl file onto this window.")),
                 )
                 .child(
                     div()
@@ -2374,8 +2756,9 @@ impl TraceApp {
                         .border_color(pal.line)
                         .child(div().font_family("Menlo").text_size(px(12.)).text_color(pal.ink).child(COLLECTOR_CMD))
                         .child(
-                            div()
-                                .id("copy-cmd")
+                            focusable(div().id("copy-cmd"), pal, pal.wash, TAB_CARD)
+                                .role(Role::Button)
+                                .aria_label("Copy command")
                                 .h(px(24.))
                                 .flex()
                                 .items_center()
@@ -2424,10 +2807,10 @@ fn list_section(pal: &Palette, title: String, items: Vec<(String, String)>) -> i
 
 /// A span's mark at the size it draws inside a `tile` point tile: its brand logo, else its lucide glyph.
 fn span_mark(s: &Span, session: &trace_core::Session, tile: f32, pal: &Palette) -> AnyElement {
-    let size = (tile * 0.6).round();
     match present::brand_for(s, present::harness_brand(&session.harness, &session.source_adapter)) {
-        Some(b) => logo(b, size, pal),
+        Some(b) => logo(b, b.logo.size_in(tile), pal),
         None => {
+            let size = (tile * 0.6).round();
             let (icon, ink) = present::glyph(s);
             Icon::new(icon).size(px(size)).text_color(pal.ink_of(ink)).into_any_element()
         }
