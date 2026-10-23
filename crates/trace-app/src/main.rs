@@ -53,6 +53,26 @@ fn parse_window(v: &str) -> Result<(f64, f64), String> {
     Ok((n(a)?, n(b)?))
 }
 
+/// Lucide icons plus the brand marks under `brands/`. `brands/x.svg?pt=12` serves the mark sized to
+/// 12pt, so `img()`, which rasterizes an SVG at twice its own size, renders it 1:1 on a 2x display.
+struct Assets;
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        let Some(name) = path.strip_prefix("brands/") else { return gpui_kit::assets::AllAssets.load(path) };
+        let (file, pt) = name.split_once("?pt=").map_or((name, None), |(f, p)| (f, p.parse::<u32>().ok()));
+        let Some(logo) = file.strip_suffix(".svg").and_then(present::Logo::by_file) else { return Ok(None) };
+        Ok(Some(match pt {
+            None => logo.svg().into(),
+            Some(pt) => String::from_utf8_lossy(logo.svg()).replacen("<svg ", &format!("<svg width=\"{pt}\" height=\"{pt}\" "), 1).into_bytes().into(),
+        }))
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        gpui_kit::assets::AllAssets.list(path)
+    }
+}
+
 /// `TW_WINDOW=x,y,w,h` in logical points.
 fn window_bounds() -> Bounds<Pixels> {
     let parsed = std::env::var("TW_WINDOW").ok().and_then(|v| {
@@ -68,7 +88,7 @@ fn main() -> anyhow::Result<()> {
     let db = cli.db.clone().unwrap_or_else(|| cfg.db_path());
     let store = trace_storage::Store::open(&db)?;
     let forced_dark = cli.appearance.as_deref().map(|a| a == "dark");
-    application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
+    application().with_assets(Assets).run(move |cx| {
         gpui_kit::init(cx);
         cx.set_window_appearance(forced_dark.map(|d| if d { WindowAppearance::Dark } else { WindowAppearance::Light }));
         #[cfg(target_os = "macos")]

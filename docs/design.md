@@ -57,6 +57,37 @@ The visual reference is the affectUI Trace Waterfall. The app should feel like a
 
 **Empty state.** A centered card explains `trace-tui collector start`, with a copy button inside the command chip (⌘C also copies; it shows "Copied" for 1.2s), and offers **Import JSONL…**. A faint sample waterfall sits behind it, fading out radially around the copy. Dropping a `.jsonl` file onto the window also imports it.
 
+## Icon system
+
+Every span row and the popover head show one mark in a tile. `present::brand_for` and `present::tool_category` pick it, in this order.
+
+1. **Brand.** The agent row shows the session's harness logo, matched on its harness or source adapter with case, hyphens, and underscores ignored (Claude Code, Codex, Cursor, Gemini CLI, Copilot, Windsurf, Cline, Roo Code, Kilo Code, OpenCode, Amp, Goose, Trae, Kiro, OpenHands, Junie, Devin). An LLM row shows its model vendor by model prefix (Claude, OpenAI, Gemini, Mistral, Meta, DeepSeek, Qwen, Grok, Kimi, Perplexity) or the Ollama provider. A subagent shows its model's vendor when it has one. A tool row shows the service it talks to: the MCP server of `mcp__<server>__tool`, whole or any word of it, or the first word of the tool name (`github_*`, `gh`, `git`, `notion-*`). Generic words (`gh`, `git`, `docs`, `sheets`, `npm`, `python`) count only as a whole name.
+2. **Category.** Any other tool draws its category's lucide glyph in the tool ink. The first row whose words appear in the tool name wins. An MCP tool classifies by its tool part, then its server, then reads as MCP.
+3. **Kind.** Everything else keeps its kind glyph: turn, subagent without a known model, wait, custom.
+
+| Category | Glyph | Words |
+| --- | --- | --- |
+| Ask | message-circle-question-mark | ask, approval |
+| Plan | list-checks | todo, plan, skill |
+| Agent | users | task, agent, subagent |
+| Memory | brain | mem, memory, remember |
+| Browser | app-window | playwright, puppeteer, browser, computer, screenshot, click |
+| Web | globe | web, fetch, http, url, curl, browse |
+| Test | flask-conical | test, tests, pytest, jest, vitest |
+| Build | package | npm, cargo, make, build, yarn, pnpm |
+| Git | git-branch | git, commit, branch, checkout, rebase, merge |
+| Database | database | sql, psql, sqlite, query, database, db |
+| Shell | square-terminal | bash, shell, exec, terminal, command, run |
+| Edit | file-pen | edit, write, patch, multiedit, notebookedit, create, replace |
+| Search | search | grep, glob, search, find, ls |
+| Read | file-text | read, view, cat, open |
+| MCP | plug | any other `mcp__*` |
+| Other | wrench | anything else |
+
+Color is for brands only, so the category glyphs stay calm. Full-color marks (`-color` files) draw as images, rasterized at the size they draw so they stay sharp on a 2x display. Single-color marks draw as masks in their Simple Icons color. In dark mode a brand color darker than 5% luminance (GitHub, Notion, Vercel, Confluence, Sentry) takes the ink color instead. The marks and their licenses are listed in `crates/trace-app/assets/brands/NOTICE.md`; Simple Icons has no Playwright or Slack mark, so those tools use their category.
+
+The sidebar shows the harness logo at 16px in place of the status dot, with the dot as a badge on its lower-right corner, ringed in the row fill. The header subtitle starts with the harness logo at 14px.
+
 ## Color tokens
 
 Values come from the reference. Kinds map as follows: agent, turn, subagent, wait, and custom use **agent**; llm uses **llm**; tool uses **tool**. A failed span uses **error** whatever its kind.

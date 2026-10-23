@@ -3,6 +3,9 @@
 //! simulated-live --jsonl [--spans N] [--seed S]       JSONL on stdout, synthetic timestamps
 //! simulated-live --socket [PATH] [--speed X] [...]    stream to the collector in real time
 //! simulated-live --fixtures ROOT                      regenerate the committed sample and fixtures
+//!
+//! --harness NAME names the session's harness (default `simulated`). --brands mixes real model names and
+//! branded and categorized tools into each turn, for checking the app's icons.
 
 use anyhow::{Context, bail};
 use serde_json::json;
@@ -18,6 +21,23 @@ use ulid::Ulid;
 const SYNTHETIC_T0: Ns = 1_767_225_600_000_000_000;
 const SAMPLE_SEED: u64 = 1;
 const SAMPLE_SPANS: usize = 20;
+
+const BRAND_MODELS: [(&str, &str); 3] = [("claude-opus-5-5", "anthropic"), ("gpt-5", "openai"), ("gemini-3-pro", "google")];
+const BRAND_TOOLS: [&str; 20] = [
+    "mcp__github__create_branch", "mcp__notion__search", "mcp__figma__get_frame", "mcp__stripe__create_price",
+    "mcp__linear__save_issue", "mcp__sentry__get_issue", "mcp__supabase__execute_sql", "Bash", "Read", "Edit", "Grep",
+    "WebFetch", "mcp__playwright__browser_click", "Task", "TodoWrite", "mem_save", "run_sql", "AskUserQuestion",
+    "mcp__acme__thing", "frobnicate",
+];
+
+/// What a session looks like beyond its size and seed.
+#[derive(Clone, Copy)]
+struct Flavor<'a> {
+    harness: &'a str,
+    brands: bool,
+}
+
+const PLAIN: Flavor = Flavor { harness: "simulated", brands: false };
 
 struct Lcg(u64);
 
@@ -38,6 +58,8 @@ struct Sim {
     rng: Lcg,
     speed: f64,
     spans: usize,
+    brands: bool,
+    llms: usize,
 }
 
 impl Sim {
@@ -62,10 +84,9 @@ impl Sim {
 
     /// Starts an LLM call and streams until the first provisional usage delta.
     fn llm_start(&mut self, parent: &SpanId) -> (SpanId, u64, u64) {
-        let llm = self.start(
-            parent,
-            SpanStart { model: Some("sim-model-1".into()), provider: Some("simulated".into()), ..SpanStart::new(SpanKind::Llm, "llm call") },
-        );
+        let (model, provider) = if self.brands { BRAND_MODELS[self.llms % BRAND_MODELS.len()] } else { ("sim-model-1", "simulated") };
+        self.llms += 1;
+        let llm = self.start(parent, SpanStart { model: Some(model.into()), provider: Some(provider.into()), ..SpanStart::new(SpanKind::Llm, "llm call") });
         let (input, output) = (self.rng.range(500, 6000), self.rng.range(60, 900));
         self.pause(200, 900);
         self.rec.span_event(&llm, "first_token", Default::default());
@@ -94,14 +115,26 @@ impl Sim {
         self.pause(10, 100);
         let turn = self.start(root, SpanStart::new(SpanKind::Turn, format!("turn {}", i + 1)));
         let llm = self.llm_start(&turn);
-        if i.is_multiple_of(5) {
+        if i.is_multiple_of(5) && !self.brands {
             // Tool call overlapping the streaming LLM response.
             let t = self.tool(&turn, "read_file");
             self.pause(100, 500);
             self.end(&t);
         }
         self.llm_finish(llm);
+        // The third turn calls every tool at once, so one screen shows every brand and category.
+        let tools: Vec<&str> = match i {
+            _ if !self.brands => Vec::new(),
+            2 => BRAND_TOOLS.to_vec(),
+            _ => (0..2).map(|k| BRAND_TOOLS[(2 * i + k) % BRAND_TOOLS.len()]).collect(),
+        };
+        for name in tools {
+            let t = self.tool(&turn, name);
+            self.pause(50, 400);
+            self.end(&t);
+        }
         match i % 5 {
+            _ if self.brands => {}
             1 => {
                 let t = self.tool(&turn, "edit_file");
                 self.pause(50, 300);
@@ -163,13 +196,13 @@ fn attrs(v: serde_json::Value) -> Attributes {
 }
 
 /// One session with at least `spans` spans. Same arguments give identical events.
-fn generate(seed: u64, spans: usize, t0: Ns, speed: f64) -> Vec<CanonicalEvent> {
+fn generate(seed: u64, spans: usize, t0: Ns, speed: f64, flavor: Flavor) -> Vec<CanonicalEvent> {
     let session_id = Ulid::from_parts((t0 / 1_000_000) as u64, seed as u128).to_string();
     let now = Arc::new(AtomicI64::new(t0));
     let clock = now.clone();
     let rec = Recorder::with_clock(format!("simulated-live-{session_id}").as_str().into(), session_id.as_str().into(), move || clock.load(Ordering::SeqCst));
-    let mut sim = Sim { rec, now, rng: Lcg(seed), speed, spans: 0 };
-    sim.rec.session_started("demo-project", "/work/demo", "simulated");
+    let mut sim = Sim { rec, now, rng: Lcg(seed), speed, spans: 0, brands: flavor.brands, llms: 0 };
+    sim.rec.session_started("demo-project", "/work/demo", flavor.harness);
     sim.spans += 1;
     let root = sim.rec.span_started(SpanStart { agent_name: Some("main".into()), ..SpanStart::new(SpanKind::Agent, "agent") });
     let mut i = 0;
@@ -185,7 +218,7 @@ fn generate(seed: u64, spans: usize, t0: Ns, speed: f64) -> Vec<CanonicalEvent> 
 
 /// `(path relative to the repo root, events)` for the committed sample and test fixtures.
 fn fixtures() -> Vec<(&'static str, Vec<CanonicalEvent>)> {
-    let sample = generate(SAMPLE_SEED, SAMPLE_SPANS, SYNTHETIC_T0, 1.0);
+    let sample = generate(SAMPLE_SEED, SAMPLE_SPANS, SYNTHETIC_T0, 1.0, PLAIN);
 
     let mut shuffled = sample.clone();
     let mut rng = Lcg(7);
@@ -241,6 +274,8 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1).peekable();
     let (mut mode, mut spans, mut seed, mut speed) = (None, SAMPLE_SPANS, SAMPLE_SEED, 1.0);
     let mut path: Option<PathBuf> = None;
+    let mut flavor = PLAIN;
+    let mut harness = String::new();
     while let Some(a) = args.next() {
         let mut value = || args.next().with_context(|| format!("{a} needs a value"));
         match a.as_str() {
@@ -258,16 +293,21 @@ fn main() -> anyhow::Result<()> {
             "--spans" => spans = value()?.parse()?,
             "--seed" => seed = value()?.parse()?,
             "--speed" => speed = value()?.parse()?,
-            _ => bail!("unknown argument {a}\nusage: simulated-live (--jsonl | --socket [PATH] | --fixtures ROOT) [--spans N] [--seed S] [--speed X]"),
+            "--harness" => harness = value()?,
+            "--brands" => flavor.brands = true,
+            _ => bail!("unknown argument {a}\nusage: simulated-live (--jsonl | --socket [PATH] | --fixtures ROOT) [--spans N] [--seed S] [--speed X] [--harness NAME] [--brands]"),
         }
+    }
+    if !harness.is_empty() {
+        flavor.harness = &harness;
     }
     match mode {
         Some("jsonl") => {
-            write_jsonl(std::io::stdout().lock(), &generate(seed, spans, SYNTHETIC_T0, 1.0))?;
+            write_jsonl(std::io::stdout().lock(), &generate(seed, spans, SYNTHETIC_T0, 1.0, flavor))?;
         }
         Some("socket") => {
             anyhow::ensure!(speed > 0.0, "--speed must be positive");
-            stream(&path.unwrap_or_else(default_socket_path), &generate(seed, spans, system_now_ns(), speed))?;
+            stream(&path.unwrap_or_else(default_socket_path), &generate(seed, spans, system_now_ns(), speed, flavor))?;
         }
         Some("fixtures") => {
             let root = path.expect("set with --fixtures");
@@ -294,9 +334,9 @@ mod tests {
 
     #[test]
     fn same_seed_gives_identical_jsonl() {
-        let a = jsonl(&generate(42, 200, SYNTHETIC_T0, 1.0));
-        assert_eq!(a, jsonl(&generate(42, 200, SYNTHETIC_T0, 1.0)));
-        assert_ne!(a, jsonl(&generate(43, 200, SYNTHETIC_T0, 1.0)));
+        let a = jsonl(&generate(42, 200, SYNTHETIC_T0, 1.0, PLAIN));
+        assert_eq!(a, jsonl(&generate(42, 200, SYNTHETIC_T0, 1.0, PLAIN)));
+        assert_ne!(a, jsonl(&generate(43, 200, SYNTHETIC_T0, 1.0, PLAIN)));
     }
 
     #[test]
@@ -341,7 +381,7 @@ mod tests {
 
     #[test]
     fn large_session_for_perf() {
-        let events = generate(SAMPLE_SEED, 10_000, SYNTHETIC_T0, 1.0);
+        let events = generate(SAMPLE_SEED, 10_000, SYNTHETIC_T0, 1.0, PLAIN);
         assert!(state(&events).spans.len() >= 10_000);
     }
 }

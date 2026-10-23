@@ -920,7 +920,7 @@ impl TraceApp {
             .cursor_pointer()
             .when(selected, |el| el.bg(pal.card).shadow(vec![soft_shadow(pal, 0.06, 1., 3.)]).border_1().border_color(pal.line))
             .when(!selected, |el| el.border_1().border_color(transparent_black()).hover(|st| st.bg(pal.hover.opacity(3.))))
-            .child(div().pt(px(5.)).child(status_dot(dot, live, ("sdot", s.session_id.0.len() + s.span_count))))
+            .child(session_lead(pal, present::harness_brand(&s.harness, &s.source_adapter), dot, live, selected, ("sdot", s.session_id.0.len() + s.span_count)))
             .child(
                 div()
                     .flex_1()
@@ -947,6 +947,23 @@ fn soft_shadow(pal: &Palette, alpha: f32, y: f32, blur: f32) -> BoxShadow {
         spread_radius: px(0.),
         inset: false,
     }
+}
+
+/// A session row's leading mark: the harness logo with the status dot as a badge on its corner, ringed
+/// in the row's fill so it reads as cut out of the logo; or the bare dot when the harness has no logo.
+fn session_lead(pal: &Palette, harness: Option<present::Brand>, dot: Hsla, live: bool, selected: bool, id: impl Into<ElementId>) -> AnyElement {
+    let slot = div().w(px(16.)).flex_shrink_0().flex().justify_center();
+    let Some(b) = harness else { return slot.pt(px(5.)).child(status_dot(dot, live, id)).into_any_element() };
+    let ring = if selected { pal.card } else { pal.tray };
+    slot.pt(px(1.))
+        .child(
+            div()
+                .relative()
+                .size(px(16.))
+                .child(logo(b, 16., pal))
+                .child(div().absolute().right(px(-3.)).bottom(px(-3.)).p(px(1.5)).rounded_full().bg(ring).child(status_dot(dot, live, id))),
+        )
+        .into_any_element()
 }
 
 fn status_dot(color: Hsla, pulse: bool, id: impl Into<ElementId>) -> AnyElement {
@@ -1077,8 +1094,10 @@ impl TraceApp {
     fn render_header(&self, pal: &Palette, inset: f32, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut right = div().flex().items_center().gap(px(8.));
         let mut subtitle = String::new();
+        let mut harness = None;
         if let Some(doc) = &self.doc {
             let s = &doc.state.session;
+            harness = present::harness_brand(&s.harness, &s.source_adapter);
             let model = self.sessions.iter().find(|x| &x.session_id == doc.session_id()).and_then(|x| x.model.as_deref()).map(present::pretty_model);
             subtitle = [Some(s.project_id.clone()).filter(|p| !p.is_empty()), Some(s.harness.clone()).filter(|h| !h.is_empty()), model]
                 .into_iter()
@@ -1147,7 +1166,16 @@ impl TraceApp {
             .pr(px(6.))
             .child(Icon::new(IconName::Sparkle).size(px(16.)).text_color(pal.accent))
             .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).text_color(pal.ink).child("Trace"))
-            .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(13.)).text_color(pal.muted).child(subtitle))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .children(harness.map(|b| logo(b, 14., pal)))
+                    .child(div().min_w(px(0.)).truncate().text_size(px(13.)).text_color(pal.muted).child(subtitle)),
+            )
             .child(right)
     }
 }
@@ -1628,7 +1656,7 @@ impl TraceApp {
         let running = live && s.ended_at_utc_ns.is_none() && s.status == SpanStatus::Running && idle(doc).is_none();
         let tone = present::tone(s);
         let kc = pal.kind(tone);
-        let (icon, ink) = present::glyph(s);
+        let mark = span_mark(s, &doc.state.session, 20., &pal);
         let detail = present::detail(s, &doc.state.session.harness);
         let indent = 12. + f32::from(row.depth) * INDENT;
         let end = s.effective_end(g.end, g.now);
@@ -1688,7 +1716,7 @@ impl TraceApp {
                 }),
         );
         name = name
-            .child(icon_tile(icon, pal.ink_of(ink), 20., &pal))
+            .child(icon_tile(mark, 20., &pal))
             .child(
                 div()
                     .flex_1()
@@ -1940,7 +1968,7 @@ impl TraceApp {
         }
         let natural = if full_h > 0. { full_h + 2. } else { 0. };
         let place = present::place_popover((bx(s.started_at_utc_ns), bx(end)), bar_y, (card.1.width, card.1.height), body_top, (POPOVER_W, natural));
-        let (icon, ink) = present::glyph(s);
+        let mark = span_mark(s, &doc.state.session, 28., pal);
         let sub = [Some(present::kind_label(s.kind).to_owned()), s.model.as_deref().map(present::pretty_model).or_else(|| present::detail(s, &doc.state.session.harness))]
             .into_iter()
             .flatten()
@@ -1998,7 +2026,7 @@ impl TraceApp {
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .child(icon_tile(icon, pal.ink_of(ink), 28., pal))
+                    .child(icon_tile(mark, 28., pal))
                     .child(
                         div()
                             .flex_1()
@@ -2322,7 +2350,7 @@ impl TraceApp {
                 .flex_col()
                 .items_center()
                 .gap(px(14.))
-                .child(icon_tile(IconName::Activity, pal.accent, 44., pal))
+                .child(icon_tile(Icon::new(IconName::Activity).size(px(26.)).text_color(pal.accent).into_any_element(), 44., pal))
                 .child(div().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).text_color(pal.ink).child("No traces yet"))
                 .child(
                     div()
@@ -2394,7 +2422,29 @@ fn list_section(pal: &Palette, title: String, items: Vec<(String, String)>) -> i
         }))
 }
 
-fn icon_tile(icon: IconName, color: Hsla, size: f32, pal: &Palette) -> impl IntoElement {
+/// A span's mark at the size it draws inside a `tile` point tile: its brand logo, else its lucide glyph.
+fn span_mark(s: &Span, session: &trace_core::Session, tile: f32, pal: &Palette) -> AnyElement {
+    let size = (tile * 0.6).round();
+    match present::brand_for(s, present::harness_brand(&session.harness, &session.source_adapter)) {
+        Some(b) => logo(b, size, pal),
+        None => {
+            let (icon, ink) = present::glyph(s);
+            Icon::new(icon).size(px(size)).text_color(pal.ink_of(ink)).into_any_element()
+        }
+    }
+}
+
+/// A brand mark `size` points square. Full-color marks draw as images, sized at the source so they
+/// rasterize 1:1 (see `Assets`); single-color marks draw as masks in the brand tint.
+fn logo(b: present::Brand, size: f32, pal: &Palette) -> AnyElement {
+    if b.logo.is_color() {
+        img(SharedString::from(format!("{}?pt={size}", b.logo.asset()))).size(px(size)).flex_shrink_0().into_any_element()
+    } else {
+        svg().path(b.logo.asset()).size(px(size)).flex_shrink_0().text_color(pal.brand_tint(b.tint)).into_any_element()
+    }
+}
+
+fn icon_tile(mark: AnyElement, size: f32, pal: &Palette) -> impl IntoElement {
     div()
         .size(px(size))
         .flex_shrink_0()
@@ -2406,7 +2456,7 @@ fn icon_tile(icon: IconName, color: Hsla, size: f32, pal: &Palette) -> impl Into
         .border_1()
         .border_color(pal.line)
         .shadow(vec![soft_shadow(pal, 0.04, 1., 1.)])
-        .child(Icon::new(icon).size(px((size * 0.6).round())).text_color(color))
+        .child(mark)
 }
 
 /// When a live session went quiet, for the Idle pill and stopped spinners.

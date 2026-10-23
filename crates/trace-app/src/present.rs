@@ -1,6 +1,7 @@
 //! Pure presentation rules: what each span looks like and says. No GPUI types except icon names.
 
 use gpui_kit::assets::IconName;
+use gpui_kit::{Hsla, rgb};
 use trace_core::{Ns, Span, SpanKind, SpanStatus, Totals, TraceState};
 use trace_view::{Row, format_cost, format_duration, format_tokens};
 
@@ -22,11 +23,10 @@ pub fn tone(s: &Span) -> Tone {
     }
 }
 
-/// Glyph color: the kind's ink, Claude's orange, or the wait amber.
+/// Glyph color: the kind's ink or the wait amber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ink {
     Kind(Tone),
-    Claude,
     Amber,
 }
 
@@ -37,9 +37,8 @@ pub fn glyph(s: &Span) -> (IconName, Ink) {
         _ => Tone::Agent,
     });
     match s.kind {
-        SpanKind::Llm if is_claude(s) => (IconName::Asterisk, Ink::Claude),
         SpanKind::Llm => (IconName::Sparkles, ink),
-        SpanKind::Tool => (tool_icon(s.tool_name.as_deref().unwrap_or(&s.name)), ink),
+        SpanKind::Tool => (tool_category(s.tool_name.as_deref().unwrap_or(&s.name)).icon(), ink),
         SpanKind::Agent => (IconName::Bot, ink),
         SpanKind::Turn => (IconName::MessageSquare, ink),
         SpanKind::Subagent => (IconName::Users, ink),
@@ -48,31 +47,274 @@ pub fn glyph(s: &Span) -> (IconName, Ink) {
     }
 }
 
-fn is_claude(s: &Span) -> bool {
-    s.model.as_deref().is_some_and(|m| m.to_lowercase().contains("claude"))
-        || s.provider.as_deref().is_some_and(|p| p.eq_ignore_ascii_case("anthropic"))
+macro_rules! logos {
+    ($($id:ident = $file:literal),* $(,)?) => {
+        /// A brand mark embedded from `assets/brands/`; see its NOTICE.md.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Logo { $($id),* }
+
+        impl Logo {
+            pub const ALL: &[Logo] = &[$(Logo::$id),*];
+
+            pub fn file(self) -> &'static str {
+                match self { $(Logo::$id => $file),* }
+            }
+
+            pub fn svg(self) -> &'static [u8] {
+                match self { $(Logo::$id => include_bytes!(concat!("../assets/brands/", $file, ".svg"))),* }
+            }
+        }
+    };
 }
 
-pub fn tool_icon(tool: &str) -> IconName {
-    if tool.starts_with("mcp__") {
-        return IconName::Plug;
+logos! {
+    Amp = "amp-color", Claude = "claude-color", ClaudeCode = "claudecode-color", Cline = "cline", Codex = "codex-color",
+    Cursor = "cursor", DeepSeek = "deepseek-color", Devin = "devin-color", Docker = "docker", Figma = "figma",
+    Gemini = "gemini-color", GeminiCli = "geminicli-color", Git = "git", GitHub = "github", Copilot = "githubcopilot",
+    GoogleDrive = "googledrive", Goose = "goose", Grok = "grok", Junie = "junie-color", KiloCode = "kilocode",
+    Kimi = "kimi-color", Kiro = "kiro-color", Linear = "linear", Meta = "meta-color", Mistral = "mistral-color",
+    Notion = "notion", Ollama = "ollama", OpenAi = "openai", OpenCode = "opencode", OpenHands = "openhands-color",
+    Perplexity = "perplexity-color", Postgres = "postgresql", Qwen = "qwen-color", RooCode = "roocode", Stripe = "stripe",
+    Trae = "trae-color", Vercel = "vercel", Windsurf = "windsurf", Jira = "jira", Confluence = "confluence",
+    Sentry = "sentry", Supabase = "supabase", Asana = "asana", Gmail = "gmail", GoogleCalendar = "googlecalendar",
+    GoogleDocs = "googledocs", GoogleSheets = "googlesheets", Cloudflare = "cloudflare", Npm = "npm", Pnpm = "pnpm",
+    Rust = "rust", Python = "python", Datadog = "datadog", Grafana = "grafana", MongoDb = "mongodb", Redis = "redis",
+    Airtable = "airtable", Trello = "trello", Discord = "discord", Telegram = "telegram", GitLab = "gitlab",
+    Bitbucket = "bitbucket",
+}
+
+impl Logo {
+    /// The asset path the app's source serves, `brands/claude-color.svg`.
+    pub fn asset(self) -> String {
+        format!("brands/{}.svg", self.file())
     }
-    let words = words(tool);
-    let has = |set: &[&str]| words.iter().any(|w| set.contains(&w.as_str()));
-    if has(&["web", "fetch", "http", "url", "browse"]) {
-        IconName::Globe
-    } else if has(&["bash", "shell", "exec", "terminal", "command", "run"]) {
-        IconName::SquareTerminal
-    } else if has(&["edit", "write", "patch", "multiedit", "notebookedit", "create"]) {
-        IconName::Pencil
-    } else if has(&["grep", "glob", "search", "find", "ls"]) {
-        IconName::Search
-    } else if has(&["read", "view", "cat", "open"]) {
-        IconName::FileText
-    } else if has(&["task", "agent", "subagent"]) {
-        IconName::Users
+
+    pub fn by_file(file: &str) -> Option<Logo> {
+        Logo::ALL.iter().copied().find(|l| l.file() == file)
+    }
+
+    /// Full-color marks draw as images; the rest are masks tinted like text.
+    pub fn is_color(self) -> bool {
+        self.file().ends_with("-color")
+    }
+}
+
+/// A span's brand mark. `tint` colors a single-color mark; `None` tints it with the ink color.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Brand {
+    pub logo: Logo,
+    pub tint: Option<Hsla>,
+}
+
+impl Brand {
+    fn plain(logo: Logo) -> Self {
+        Self { logo, tint: None }
+    }
+}
+
+/// The harness logo for a session, from its harness or else its source adapter: `Claude-Code` and
+/// `claudecode` both read as Claude Code.
+pub fn harness_brand(harness: &str, source_adapter: &str) -> Option<Brand> {
+    let one = |h: &str| {
+        let key: String = h.chars().filter(|c| !matches!(c, '-' | '_' | ' ')).flat_map(char::to_lowercase).collect();
+        Some(match key.as_str() {
+            "claudecode" => Logo::ClaudeCode,
+            "codex" => Logo::Codex,
+            "cursor" => Logo::Cursor,
+            "geminicli" => Logo::GeminiCli,
+            "copilot" | "githubcopilot" => Logo::Copilot,
+            "windsurf" => Logo::Windsurf,
+            "cline" => Logo::Cline,
+            "roo" | "roocode" => Logo::RooCode,
+            "kilo" | "kilocode" => Logo::KiloCode,
+            "opencode" => Logo::OpenCode,
+            "amp" => Logo::Amp,
+            "goose" => Logo::Goose,
+            "trae" => Logo::Trae,
+            "kiro" => Logo::Kiro,
+            "openhands" => Logo::OpenHands,
+            "junie" => Logo::Junie,
+            "devin" => Logo::Devin,
+            _ => return None,
+        })
+    };
+    one(harness).or_else(|| one(source_adapter)).map(Brand::plain)
+}
+
+/// The model vendor's logo, by model prefix, else by provider.
+pub fn vendor_brand(model: Option<&str>, provider: Option<&str>) -> Option<Brand> {
+    let model = model.unwrap_or("").to_lowercase();
+    let model = model.rsplit('/').next().unwrap_or("");
+    let provider = provider.unwrap_or("").to_lowercase();
+    let pre = |ps: &[&str]| ps.iter().any(|p| model.starts_with(p));
+    let logo = if pre(&["claude"]) || provider == "anthropic" {
+        Logo::Claude
+    } else if pre(&["gpt", "o1", "o3", "o4", "codex"]) {
+        Logo::OpenAi
+    } else if pre(&["gemini"]) {
+        Logo::Gemini
+    } else if pre(&["mistral", "codestral"]) {
+        Logo::Mistral
+    } else if pre(&["llama"]) {
+        Logo::Meta
+    } else if pre(&["deepseek"]) {
+        Logo::DeepSeek
+    } else if pre(&["qwen"]) {
+        Logo::Qwen
+    } else if pre(&["grok"]) {
+        Logo::Grok
+    } else if pre(&["kimi", "moonshot"]) {
+        Logo::Kimi
+    } else if pre(&["perplexity", "sonar"]) {
+        Logo::Perplexity
+    } else if provider == "ollama" {
+        Logo::Ollama
     } else {
-        IconName::Wrench
+        return None;
+    };
+    Some(Brand::plain(logo))
+}
+
+/// Services by the word that names them, with their Simple Icons color. Short or generic words
+/// (`gh`, `git`, `docs`, `sheets`) count only as a whole name, so `mcp__context7_docs__…` stays unbranded.
+const SERVICES: &[(&[&str], Logo, u32, bool)] = &[
+    (&["github"], Logo::GitHub, 0x181717, false),
+    (&["gh"], Logo::GitHub, 0x181717, true),
+    (&["git"], Logo::Git, 0xF03C2E, true),
+    (&["gitlab"], Logo::GitLab, 0xFC6D26, false),
+    (&["bitbucket"], Logo::Bitbucket, 0x0052CC, false),
+    (&["linear"], Logo::Linear, 0x5E6AD2, false),
+    (&["jira", "atlassian"], Logo::Jira, 0x0052CC, false),
+    (&["confluence"], Logo::Confluence, 0x172B4D, false),
+    (&["notion"], Logo::Notion, 0x000000, false),
+    (&["figma"], Logo::Figma, 0xF24E1E, false),
+    (&["stripe"], Logo::Stripe, 0x635BFF, false),
+    (&["sentry"], Logo::Sentry, 0x362D59, false),
+    (&["supabase"], Logo::Supabase, 0x3FCF8E, false),
+    (&["vercel"], Logo::Vercel, 0x000000, false),
+    (&["cloudflare"], Logo::Cloudflare, 0xF38020, false),
+    (&["googledrive", "gdrive"], Logo::GoogleDrive, 0x4285F4, false),
+    (&["gmail"], Logo::Gmail, 0xEA4335, false),
+    (&["googlecalendar", "gcal"], Logo::GoogleCalendar, 0x4285F4, false),
+    (&["googledocs", "gdocs"], Logo::GoogleDocs, 0x4285F4, false),
+    (&["docs"], Logo::GoogleDocs, 0x4285F4, true),
+    (&["googlesheets", "gsheets"], Logo::GoogleSheets, 0x34A853, false),
+    (&["sheets"], Logo::GoogleSheets, 0x34A853, true),
+    (&["postgres", "postgresql", "psql"], Logo::Postgres, 0x4169E1, false),
+    (&["mongodb", "mongo"], Logo::MongoDb, 0x47A248, false),
+    (&["redis"], Logo::Redis, 0xFF4438, false),
+    (&["docker"], Logo::Docker, 0x2496ED, false),
+    (&["datadog"], Logo::Datadog, 0x632CA6, false),
+    (&["grafana"], Logo::Grafana, 0xF46800, false),
+    (&["airtable"], Logo::Airtable, 0x18BFFF, false),
+    (&["trello"], Logo::Trello, 0x0052CC, false),
+    (&["asana"], Logo::Asana, 0xF06A6A, false),
+    (&["discord"], Logo::Discord, 0x5865F2, false),
+    (&["telegram"], Logo::Telegram, 0x26A5E4, false),
+    (&["npm"], Logo::Npm, 0xCB3837, true),
+    (&["pnpm"], Logo::Pnpm, 0xF69220, true),
+    (&["python", "python3"], Logo::Python, 0x3776AB, true),
+    (&["rustc", "rustup"], Logo::Rust, 0x000000, true),
+];
+
+/// The service a tool talks to: the MCP server of `mcp__<server>__tool` (whole, or any word of it, so
+/// `claude_ai_Linear` reads as Linear), else the tool name's first word: `github_*`, `gh`, `git`, `notion-*`.
+pub fn tool_brand(tool: &str) -> Option<Brand> {
+    let service = |w: &str, whole: bool| SERVICES.iter().find(|(names, _, _, only_whole)| names.contains(&w) && (whole || !only_whole));
+    let found = match mcp_parts(tool) {
+        Some((_, server)) => {
+            let ws = words(server);
+            service(&ws.concat(), true).or_else(|| ws.iter().find_map(|w| service(w, false)))
+        }
+        None => words(tool).first().and_then(|w| service(w, true)),
+    };
+    found.map(|&(_, logo, hex, _)| Brand { logo, tint: Some(rgb(hex).into()) })
+}
+
+/// The brand mark a span's icon tile shows, or `None` to keep its lucide glyph. The agent shows the
+/// harness, an LLM call its vendor, a tool its service, and a subagent its model's vendor.
+pub fn brand_for(s: &Span, harness: Option<Brand>) -> Option<Brand> {
+    match s.kind {
+        SpanKind::Agent => harness,
+        SpanKind::Llm | SpanKind::Subagent => vendor_brand(s.model.as_deref(), s.provider.as_deref()),
+        SpanKind::Tool => tool_brand(s.tool_name.as_deref().unwrap_or(&s.name)).or_else(|| tool_brand(&s.name)),
+        _ => None,
+    }
+}
+
+/// What a tool does, for tools without a brand. Each category draws one lucide glyph in the tool ink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCategory {
+    Shell,
+    Read,
+    Edit,
+    Search,
+    Web,
+    Browser,
+    Agent,
+    Plan,
+    Memory,
+    Database,
+    Git,
+    Build,
+    Test,
+    Ask,
+    Mcp,
+    Other,
+}
+
+impl ToolCategory {
+    pub fn icon(self) -> IconName {
+        match self {
+            Self::Shell => IconName::SquareTerminal,
+            Self::Read => IconName::FileText,
+            Self::Edit => IconName::FilePen,
+            Self::Search => IconName::Search,
+            Self::Web => IconName::Globe,
+            Self::Browser => IconName::AppWindow,
+            Self::Agent => IconName::Users,
+            Self::Plan => IconName::ListChecks,
+            Self::Memory => IconName::Brain,
+            Self::Database => IconName::Database,
+            Self::Git => IconName::GitBranch,
+            Self::Build => IconName::Package,
+            Self::Test => IconName::FlaskConical,
+            Self::Ask => IconName::MessageCircleQuestionMark,
+            Self::Mcp => IconName::Plug,
+            Self::Other => IconName::Wrench,
+        }
+    }
+}
+
+/// Rules in priority order: the first category with a word of the tool name wins, so `WebSearch`
+/// is Web before Search and `TodoWrite` is Plan before Edit.
+const CATEGORY_WORDS: &[(ToolCategory, &[&str])] = &[
+    (ToolCategory::Ask, &["ask", "approval"]),
+    (ToolCategory::Plan, &["todo", "plan", "skill"]),
+    (ToolCategory::Agent, &["task", "agent", "subagent"]),
+    (ToolCategory::Memory, &["mem", "memory", "remember"]),
+    (ToolCategory::Browser, &["playwright", "puppeteer", "browser", "computer", "screenshot", "click"]),
+    (ToolCategory::Web, &["web", "fetch", "http", "url", "curl", "browse"]),
+    (ToolCategory::Test, &["test", "tests", "pytest", "jest", "vitest"]),
+    (ToolCategory::Build, &["npm", "cargo", "make", "build", "yarn", "pnpm"]),
+    (ToolCategory::Git, &["git", "commit", "branch", "checkout", "rebase", "merge"]),
+    (ToolCategory::Database, &["sql", "psql", "sqlite", "query", "database", "db"]),
+    (ToolCategory::Shell, &["bash", "shell", "exec", "terminal", "command", "run"]),
+    (ToolCategory::Edit, &["edit", "write", "patch", "multiedit", "notebookedit", "create", "replace"]),
+    (ToolCategory::Search, &["grep", "glob", "search", "find", "ls"]),
+    (ToolCategory::Read, &["read", "view", "cat", "open"]),
+];
+
+/// The category of a tool name. An MCP tool classifies by its tool part, then its server, then reads as Mcp.
+pub fn tool_category(tool: &str) -> ToolCategory {
+    let classify = |name: &str| {
+        let words = words(name);
+        CATEGORY_WORDS.iter().find(|(_, set)| words.iter().any(|w| set.contains(&w.as_str()))).map(|(c, _)| *c)
+    };
+    match mcp_parts(tool) {
+        Some((t, server)) => classify(t).or_else(|| classify(server)).unwrap_or(ToolCategory::Mcp),
+        None if tool.starts_with("mcp__") => ToolCategory::Mcp,
+        None => classify(tool).unwrap_or(ToolCategory::Other),
     }
 }
 
@@ -564,6 +806,73 @@ mod tests {
     }
 
     #[test]
+    fn brands_follow_harness_vendor_and_service() {
+        let logo = |b: Option<Brand>| b.map(|b| b.logo);
+        assert_eq!(logo(harness_brand("claude-code", "")), Some(Logo::ClaudeCode));
+        assert_eq!(logo(harness_brand("Gemini-CLI", "")), Some(Logo::GeminiCli));
+        assert_eq!(logo(harness_brand("simulated", "roo")), Some(Logo::RooCode), "falls back to the source adapter");
+        assert_eq!(logo(harness_brand("copilot", "")), Some(Logo::Copilot));
+        assert_eq!(logo(harness_brand("simulated", "simulated-live")), None);
+
+        let vendor = |m: &str| logo(vendor_brand(Some(m), None));
+        assert_eq!(vendor("claude-opus-5-5"), Some(Logo::Claude));
+        assert_eq!(vendor("gpt-5"), Some(Logo::OpenAi));
+        assert_eq!(vendor("o3-mini"), Some(Logo::OpenAi));
+        assert_eq!(vendor("openai/gpt-5-codex"), Some(Logo::OpenAi));
+        assert_eq!(vendor("gemini-3-pro"), Some(Logo::Gemini));
+        assert_eq!(vendor("codestral-latest"), Some(Logo::Mistral));
+        assert_eq!(vendor("llama-4-scout"), Some(Logo::Meta));
+        assert_eq!(vendor("DeepSeek-V3"), Some(Logo::DeepSeek));
+        assert_eq!(vendor("kimi-k2"), Some(Logo::Kimi));
+        assert_eq!(vendor("sonar-pro"), Some(Logo::Perplexity));
+        assert_eq!(vendor("sim-model-1"), None);
+        assert_eq!(logo(vendor_brand(Some("mystery"), Some("Anthropic"))), Some(Logo::Claude));
+        assert_eq!(logo(vendor_brand(Some("phi4"), Some("ollama"))), Some(Logo::Ollama));
+
+        let tool = |t: &str| tool_brand(t).map(|b| (b.logo, b.tint));
+        let hex = |h: u32| Some(Hsla::from(rgb(h)));
+        assert_eq!(tool("mcp__github__create_branch"), Some((Logo::GitHub, hex(0x181717))));
+        assert_eq!(tool("mcp__claude_ai_Linear__list_issues"), Some((Logo::Linear, hex(0x5E6AD2))));
+        assert_eq!(tool("mcp__google_drive__search"), Some((Logo::GoogleDrive, hex(0x4285F4))));
+        assert_eq!(tool("mcp__postgres__query"), Some((Logo::Postgres, hex(0x4169E1))));
+        assert_eq!(tool("github_create_pr"), Some((Logo::GitHub, hex(0x181717))));
+        assert_eq!(tool("gh"), Some((Logo::GitHub, hex(0x181717))));
+        assert_eq!(tool("git"), Some((Logo::Git, hex(0xF03C2E))));
+        assert_eq!(tool("notion-search"), Some((Logo::Notion, hex(0x000000))));
+        assert_eq!(tool("Bash"), None);
+        assert_eq!(tool("mcp__context7__resolve"), None);
+        assert_eq!(tool("digit"), None, "a service name must be a whole word");
+        assert_eq!(tool("mcp__sentry__get_issue"), Some((Logo::Sentry, hex(0x362D59))));
+        assert_eq!(tool("mcp__supabase__execute_sql"), Some((Logo::Supabase, hex(0x3FCF8E))));
+        assert_eq!(tool("mcp__atlassian__get_issue"), Some((Logo::Jira, hex(0x0052CC))));
+        assert_eq!(tool("mcp__google_docs__read"), Some((Logo::GoogleDocs, hex(0x4285F4))));
+        assert_eq!(tool("mcp__context7_docs__resolve"), None, "generic words count only as a whole server name");
+        assert_eq!(tool("mcp__playwright__browser_click"), None, "Simple Icons has no Playwright mark");
+    }
+
+    #[test]
+    fn brand_for_picks_by_kind_and_keeps_lucide_otherwise() {
+        let s = state();
+        let cc = harness_brand(&s.session.harness, &s.session.source_adapter);
+        let span = |id: &str| &s.spans[&id.into()];
+        assert_eq!(brand_for(span("root"), cc).map(|b| b.logo), Some(Logo::ClaudeCode));
+        assert_eq!(brand_for(span("llm"), cc).map(|b| b.logo), Some(Logo::Claude));
+        assert_eq!(brand_for(span("sub"), cc).map(|b| b.logo), Some(Logo::Claude), "a subagent shows its model's vendor");
+        assert_eq!(brand_for(span("Bash"), cc), None);
+        let mut plain_sub = span("sub").clone();
+        plain_sub.model = None;
+        assert_eq!(brand_for(&plain_sub, cc), None, "a subagent without a known model keeps its glyph");
+    }
+
+    #[test]
+    fn every_logo_embeds_an_svg() {
+        for l in Logo::ALL {
+            assert!(l.svg().starts_with(b"<svg"), "{l:?}");
+            assert_eq!(Logo::by_file(l.file()), Some(*l));
+        }
+    }
+
+    #[test]
     fn prettifies_claude_model_names() {
         assert_eq!(pretty_model("claude-opus-5-5"), "Opus 5.5");
         assert_eq!(pretty_model("claude-sonnet-4-5-20250929"), "Sonnet 4.5");
@@ -575,26 +884,53 @@ mod tests {
     }
 
     #[test]
-    fn maps_tools_to_icons() {
+    fn classifies_tools_into_categories() {
+        use ToolCategory::*;
         let cases = [
-            ("Bash", IconName::SquareTerminal),
-            ("Read", IconName::FileText),
-            ("read_file", IconName::FileText),
-            ("Edit", IconName::Pencil),
-            ("MultiEdit", IconName::Pencil),
-            ("write_file", IconName::Pencil),
-            ("Grep", IconName::Search),
-            ("Glob", IconName::Search),
-            ("WebFetch", IconName::Globe),
-            ("WebSearch", IconName::Globe),
-            ("Task", IconName::Users),
-            ("mcp__github__create_issue", IconName::Plug),
-            ("TodoWrite", IconName::Pencil),
-            ("frobnicate", IconName::Wrench),
+            ("Bash", Shell),
+            ("local_shell", Shell),
+            ("Read", Read),
+            ("NotebookRead", Read),
+            ("read_file", Read),
+            ("Edit", Edit),
+            ("MultiEdit", Edit),
+            ("apply_patch", Edit),
+            ("str_replace", Edit),
+            ("create_file", Edit),
+            ("Grep", Search),
+            ("Glob", Search),
+            ("codebase_search", Search),
+            ("ToolSearch", Search),
+            ("WebFetch", Web),
+            ("WebSearch", Web),
+            ("curl", Web),
+            ("mcp__playwright__browser_click", Browser),
+            ("computer", Browser),
+            ("Task", Agent),
+            ("spawn_agent", Agent),
+            ("TodoWrite", Plan),
+            ("update_plan", Plan),
+            ("Skill", Plan),
+            ("mcp__engram__mem_save", Memory),
+            ("remember", Memory),
+            ("run_sql", Database),
+            ("sqlite_query", Database),
+            ("git_commit", Git),
+            ("cargo_build", Build),
+            ("make", Build),
+            ("run_tests", Test),
+            ("pytest", Test),
+            ("AskUserQuestion", Ask),
+            ("request_approval", Ask),
+            ("mcp__acme__thing", Mcp),
+            ("mcp__slack__post_message", Mcp),
+            ("frobnicate", Other),
         ];
-        for (tool, icon) in cases {
-            assert_eq!(tool_icon(tool), icon, "{tool}");
+        for (tool, cat) in cases {
+            assert_eq!(tool_category(tool), cat, "{tool}");
         }
+        assert_eq!(Shell.icon(), IconName::SquareTerminal);
+        assert_eq!(Other.icon(), IconName::Wrench);
     }
 
     #[test]
@@ -603,7 +939,7 @@ mod tests {
         let sub = &s.spans[&"sub".into()];
         let llm = &s.spans[&"llm".into()];
         let bash = &s.spans[&"Bash".into()];
-        assert_eq!(glyph(llm), (IconName::Asterisk, Ink::Claude));
+        assert_eq!(glyph(llm), (IconName::Sparkles, Ink::Kind(Tone::Llm)));
         assert_eq!(glyph(sub), (IconName::Users, Ink::Kind(Tone::Agent)));
         assert_eq!(glyph(bash), (IconName::SquareTerminal, Ink::Kind(Tone::Tool)));
         assert_eq!(tone(bash), Tone::Error, "a failed span paints with the error palette");

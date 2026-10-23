@@ -46,7 +46,6 @@ pub struct Palette {
     pub ok: Pill,
     pub slow: Pill,
     pub amber: Hsla,
-    pub claude: Hsla,
 }
 
 fn c(hex: u32) -> Hsla {
@@ -55,6 +54,13 @@ fn c(hex: u32) -> Hsla {
 
 fn ca(hex: u32) -> Hsla {
     rgba(hex).into()
+}
+
+/// WCAG relative luminance.
+fn luminance(c: Hsla) -> f32 {
+    let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    let c = c.to_rgb();
+    0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
 }
 
 fn kind(bg: u32, edge: u32, ink: u32, mark: u32) -> KindColors {
@@ -94,7 +100,6 @@ impl Palette {
             ok: Pill { bg: c(0xe6f6ec), fg: c(0x1a7f45) },
             slow: Pill { bg: c(0xfff3e0), fg: c(0xb85c00) },
             amber: c(0xd99a2b),
-            claude: c(0xd97757),
         }
     }
 
@@ -126,7 +131,6 @@ impl Palette {
             ok: Pill { bg: c(0x12301f), fg: c(0x3dd68c) },
             slow: Pill { bg: c(0x3a2410), fg: c(0xffa057) },
             amber: c(0xd99a2b),
-            claude: c(0xd97757),
         }
     }
 
@@ -139,10 +143,18 @@ impl Palette {
         }
     }
 
+    /// A brand mark's color. In dark mode a near-black brand color (GitHub, Notion, Confluence) would
+    /// vanish on the card, so it takes the ink instead; an untinted mark always does.
+    pub fn brand_tint(&self, tint: Option<Hsla>) -> Hsla {
+        match tint {
+            Some(t) if !(self.dark && luminance(t) < 0.05) => t,
+            _ => self.ink,
+        }
+    }
+
     pub fn ink_of(&self, i: Ink) -> Hsla {
         match i {
             Ink::Kind(t) => self.kind(t).ink,
-            Ink::Claude => self.claude,
             Ink::Amber => self.amber,
         }
     }
