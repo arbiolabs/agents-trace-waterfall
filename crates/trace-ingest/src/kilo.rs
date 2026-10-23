@@ -1,32 +1,26 @@
-//! Kilo Code: not implemented yet. A harness adapter exposes three things, all used by `lib.rs`:
-//! - [`adapter`]: a line-by-line [`TraceAdapter`] for transcripts appended as JSONL;
-//! - [`SNAPSHOT`]: true when the source is instead read whole (a database, a JSON file rewritten in place);
-//! - [`read`]: for snapshot sources, every session changed since `since` (an adapter-defined cursor, e.g.
-//!   epoch milliseconds) as canonical events, and the new cursor.
-//! `harness` names who recorded the session, so one parser can serve a fork under its own name.
+//! Kilo Code CLI (`@kilocode/cli`, an OpenCode fork) sessions, from `~/.local/share/kilo/kilo.db`
+//! (`$XDG_DATA_HOME/kilo/kilo.db`; `$KILO_DB` overrides it, and dev channels use `kilo-<channel>.db`).
+//! Kilo keeps OpenCode's earlier SQLite tables, `session`, `message` and `part`, and writes each reply as
+//! a 1.x-style message whose parts are its steps and tool calls, so [`crate::opencode`] reads it as is:
+//! the spans, sub-agents (child sessions named by the task tool's `metadata.sessionId`), failed shell
+//! commands (`metadata.exit`) and blind spots are OpenCode's.
+//!
+//! Kilo also has OpenCode 2.x's `session_message` table, but keyed to `session` (no `session_v2`): its
+//! event projector writes only some events there, such as the user's own shell commands, which the
+//! `message` and `part` rows hold too. Those rows are not read.
 
 use std::path::Path;
-use trace_adapter_sdk::{RawEvent, SourceInfo, TraceAdapter};
+use trace_adapter_sdk::TraceAdapter;
 use trace_core::CanonicalEvent;
 
-pub const SNAPSHOT: bool = false;
+use crate::opencode::{OpenCode, read_db_as};
+
+pub const SNAPSHOT: bool = true;
 
 pub fn adapter(harness: &'static str) -> Box<dyn TraceAdapter> {
-    Box::new(Stub(harness))
+    Box::new(OpenCode::recorded_by(harness))
 }
 
-pub fn read(_path: &Path, since: i64, _harness: &'static str) -> anyhow::Result<(Vec<CanonicalEvent>, i64)> {
-    Ok((Vec::new(), since))
-}
-
-struct Stub(&'static str);
-
-impl TraceAdapter for Stub {
-    fn source_info(&self) -> SourceInfo {
-        SourceInfo { source_id: self.0.into(), name: self.0.into(), harness: self.0.into(), unobservable: vec!["everything (adapter not implemented yet)".into()] }
-    }
-
-    fn normalize(&self, _raw: RawEvent) -> anyhow::Result<Vec<CanonicalEvent>> {
-        Ok(Vec::new())
-    }
+pub fn read(path: &Path, since: i64, harness: &'static str) -> anyhow::Result<(Vec<CanonicalEvent>, i64)> {
+    read_db_as(path, since, harness)
 }

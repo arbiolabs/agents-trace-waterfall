@@ -28,9 +28,23 @@ use trace_core::*;
 
 use crate::emit::{Emit, span};
 
-#[derive(Default)]
+/// Also reads Kilo Code (a fork that keeps OpenCode's tables in `~/.local/share/kilo/kilo.db`);
+/// `harness` names which one recorded the session.
 pub struct OpenCode {
     state: RefCell<State>,
+    harness: &'static str,
+}
+
+impl Default for OpenCode {
+    fn default() -> Self {
+        Self::recorded_by("opencode")
+    }
+}
+
+impl OpenCode {
+    pub fn recorded_by(harness: &'static str) -> Self {
+        Self { state: RefCell::default(), harness }
+    }
 }
 
 #[derive(Default)]
@@ -49,9 +63,9 @@ struct State {
 impl TraceAdapter for OpenCode {
     fn source_info(&self) -> SourceInfo {
         SourceInfo {
-            source_id: "opencode".into(),
-            name: "opencode".into(),
-            harness: "opencode".into(),
+            source_id: self.harness.into(),
+            name: self.harness.into(),
+            harness: self.harness.into(),
             unobservable: [
                 "LLM call end in 2.x when a step runs tools (taken from when its stream finished)",
                 "cost provenance (OpenCode's own estimate from model prices)",
@@ -82,7 +96,7 @@ impl TraceAdapter for OpenCode {
         // OpenCode stamps everything in epoch milliseconds.
         let d = &v["data"];
         let Some(ts) = ms(&v["time_created"]).or_else(|| ms(&d["time"]["created"])) else { return Ok(Vec::new()) };
-        let mut e = Emit { source: SourceId(format!("opencode:{own}")), session: SessionId(root_session.clone()), observed: raw.observed_at_utc_ns, seq: st.seq, out: Vec::new() };
+        let mut e = Emit { source: SourceId(format!("{}:{own}", self.harness)), session: SessionId(root_session.clone()), observed: raw.observed_at_utc_ns, seq: st.seq, out: Vec::new() };
         let parent = st.turn.as_deref().map_or_else(|| top.clone(), |t| span("turn", t));
         let id = v["id"].as_str().unwrap_or_default();
 
@@ -103,19 +117,19 @@ impl TraceAdapter for OpenCode {
                 let project = Path::new(cwd).file_name().and_then(|n| n.to_str()).unwrap_or(cwd);
                 let mut labels = Attributes::new();
                 if let Some(ver) = v["version"].as_str() {
-                    labels.insert("opencode_version".into(), json!(ver));
+                    labels.insert(format!("{}_version", self.harness), json!(ver));
                 }
                 let body = EventBody::SessionStarted {
                     project_id: project.to_owned(),
                     working_directory: cwd.to_owned(),
-                    source_adapter: "opencode".into(),
-                    harness: "opencode".into(),
+                    source_adapter: self.harness.into(),
+                    harness: self.harness.into(),
                     host: String::new(),
                     labels,
                 };
                 e.push(format!("session:{own}"), ts, None, body);
                 let agent = v["agent"].as_str().unwrap_or("main").to_owned();
-                e.start(&top, ts, None, SpanKind::Agent, "opencode", |s| s.agent_name = Some(agent));
+                e.start(&top, ts, None, SpanKind::Agent, self.harness, |s| s.agent_name = Some(agent));
             }
             (Some("message"), Some("user")) => start_turn(&mut st, &mut e, &top, id, ts),
             (Some("message"), Some("assistant")) => {
@@ -282,9 +296,14 @@ fn tool(e: &mut Emit, parent: &SpanId, call: Option<&str>, name: Option<&str>, a
 // ponytail: a write landing in the same millisecond as the previous poll's newest is picked up with the
 // session's next change; poll with `>=` if that delay ever shows.
 pub fn read_db(path: &Path, since_ms: i64) -> anyhow::Result<(Vec<CanonicalEvent>, i64)> {
+    read_db_as(path, since_ms, "opencode")
+}
+
+/// [`read_db`] for a fork that keeps OpenCode's tables, its sessions recorded by `harness`.
+pub fn read_db_as(path: &Path, since_ms: i64, harness: &'static str) -> anyhow::Result<(Vec<CanonicalEvent>, i64)> {
     anyhow::ensure!(path.exists(), "{} does not exist; point it at opencode.db, or the storage folder of OpenCode 1.x", path.display());
     if path.is_dir() {
-        return read_storage(path, since_ms);
+        return read_storage(path, since_ms, harness);
     }
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .with_context(|| format!("opening {}", path.display()))?;
@@ -323,7 +342,7 @@ pub fn read_db(path: &Path, since_ms: i64) -> anyhow::Result<(Vec<CanonicalEvent
             line["root"] = json!(root_of(&conn, &parent, v2, v1)?);
             line["parent_tool"] = json!(spawning_call(&conn, &parent, &id, v2, v1)?);
         }
-        let adapter = OpenCode::default();
+        let adapter = OpenCode::recorded_by(harness);
         let mut feed = |line: Value| -> anyhow::Result<()> {
             events.extend(adapter.normalize(RawEvent { line: line.to_string(), observed_at_utc_ns: system_now_ns() })?);
             Ok(())
@@ -443,7 +462,7 @@ fn names_session(state: &Value, child: &str) -> bool {
 /// `part/<message>/<part>.json`, the same messages and parts its later SQLite tables hold. A session
 /// changed when any of its files did.
 // ponytail: every poll stats each session's files; index by mtime if a large 1.x history makes polls slow.
-fn read_storage(dir: &Path, since_ms: i64) -> anyhow::Result<(Vec<CanonicalEvent>, i64)> {
+fn read_storage(dir: &Path, since_ms: i64, harness: &'static str) -> anyhow::Result<(Vec<CanonicalEvent>, i64)> {
     anyhow::ensure!(dir.join("session").is_dir(), "{} is not an OpenCode storage folder (no session/)", dir.display());
     let mut sessions: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
     for project in json_files_or_dirs(&dir.join("session"), true) {
@@ -492,7 +511,7 @@ fn read_storage(dir: &Path, since_ms: i64) -> anyhow::Result<(Vec<CanonicalEvent
             line["root"] = json!(root);
             line["parent_tool"] = json!(call);
         }
-        let adapter = OpenCode::default();
+        let adapter = OpenCode::recorded_by(harness);
         let mut feed = |line: Value| -> anyhow::Result<()> {
             events.extend(adapter.normalize(RawEvent { line: line.to_string(), observed_at_utc_ns: system_now_ns() })?);
             Ok(())

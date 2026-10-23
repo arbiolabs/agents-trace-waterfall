@@ -32,6 +32,8 @@ use crate::emit::{Emit, parse_utc, span};
 pub struct Pi {
     state: RefCell<State>,
     harness: &'static str,
+    /// The root session and tool call a sub-agent session joins, when its harness records them.
+    spawner: Option<(String, String)>,
 }
 
 impl Default for Pi {
@@ -42,7 +44,12 @@ impl Default for Pi {
 
 impl Pi {
     pub fn recorded_by(harness: &'static str) -> Self {
-        Self { state: RefCell::default(), harness }
+        Self { state: RefCell::default(), harness, spawner: None }
+    }
+
+    /// A sub-agent session that tool call `call` started, joining the root session `root`.
+    pub(crate) fn spawned_under(harness: &'static str, root: String, call: String) -> Self {
+        Self { spawner: Some((root, call)), ..Self::recorded_by(harness) }
     }
 }
 
@@ -99,14 +106,15 @@ impl TraceAdapter for Pi {
             st.session = Some(own.to_owned());
             st.root_session = Some(own.to_owned());
             st.top = Some(span("agent", own));
-            if let Some(parent) = v["parentSession"].as_str() {
+            let parent = v["parentSession"].as_str();
+            if parent.is_some() {
                 st.copied_before = Some(ts);
-                if let Some((root, call)) = spawned_by(parent, ts, 0) {
-                    st.subagent = true;
-                    st.root_session = Some(root);
-                    st.top = Some(span("subagent", own));
-                    spawned_from = Some(call);
-                }
+            }
+            if let Some((root, call)) = self.spawner.clone().or_else(|| spawned_by(parent?, ts, 0)) {
+                st.subagent = true;
+                st.root_session = Some(root);
+                st.top = Some(span("subagent", own));
+                spawned_from = Some(call);
             }
         }
         let (Some(sid), Some(root_session), Some(root)) = (st.session.clone(), st.root_session.clone(), st.top.clone()) else { return Ok(Vec::new()) };
