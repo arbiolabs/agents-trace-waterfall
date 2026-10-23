@@ -1,6 +1,6 @@
 use crate::Cli;
-use crate::present::{self, Change, Group, LabelAt, Tone, ease};
-use crate::theme::{KindColors, Palette, Pill};
+use crate::present::{self, Change, Edge, Grab, Group, LabelAt, Tone, ease};
+use crate::theme::{KindColors, Palette};
 use chrono::{Local, TimeZone};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -43,6 +43,8 @@ const POP_OUT: Duration = Duration::from_millis(160);
 /// Left edge of the sidebar toggle, just right of the traffic lights.
 const TOGGLE_X: f32 = 84.;
 const BENCH_FRAMES: usize = 300;
+const COLLECTOR_CMD: &str = "trace-tui collector start";
+const COPIED_FOR: Duration = Duration::from_millis(1200);
 
 fn tnum() -> FontFeatures {
     FontFeatures(Arc::new(vec![("tnum".into(), 1)]))
@@ -157,6 +159,8 @@ pub struct TraceApp {
     /// `--viewport` seconds, applied on first layout.
     initial_window: Option<(f64, f64)>,
     bench: Option<Bench>,
+    /// When the empty state's command was last copied, for the brief check mark.
+    copied_at: Option<Instant>,
     _subs: Vec<Subscription>,
 }
 
@@ -224,6 +228,7 @@ impl TraceApp {
             lens_drag: None,
             initial_window: cli.viewport,
             bench: (cli.bench_scroll || cli.bench_fold).then(|| Bench { last: Instant::now(), intervals: Vec::new(), builds: Vec::new(), rows: Vec::new(), fold: cli.bench_fold.then_some(None) }),
+            copied_at: None,
             _subs: subs,
         };
         let w = this.sidebar_target(window.viewport_size().width.to_f64() as f32);
@@ -243,10 +248,19 @@ impl TraceApp {
         }
         if let (Some(needle), Some(doc)) = (&cli.select, &mut this.doc) {
             let needle = needle.to_lowercase();
-            let hit = doc.rows.iter().position(|r| matches!(&r.kind, RowKind::Span(id) if doc.state.spans[id].name.to_lowercase().contains(&needle)));
-            if let Some(i) = hit {
-                doc.select(i);
-                this.list.scroll_to_item(i, ScrollStrategy::Center);
+            let mut hits: Vec<&Span> = doc.state.spans.values().filter(|s| s.name.to_lowercase().contains(&needle)).collect();
+            hits.sort_by(|a, b| (a.started_at_utc_ns, &a.span_id).cmp(&(b.started_at_utc_ns, &b.span_id)));
+            if let Some(id) = hits.first().map(|s| s.span_id.clone()) {
+                let mut up = doc.state.spans[&id].parent_span_id.clone();
+                while let Some(p) = up {
+                    doc.collapsed.remove(&p);
+                    up = doc.state.spans.get(&p).and_then(|s| s.parent_span_id.clone());
+                }
+                doc.refresh();
+                if let Some(i) = doc.rows.iter().position(|r| r.kind == RowKind::Span(id.clone())) {
+                    doc.select(i);
+                    this.list.scroll_to_item(i, ScrollStrategy::Center);
+                }
             }
         }
         if cli.popover && this.doc.as_ref().is_some_and(|d| d.selected.is_some()) {
@@ -297,7 +311,9 @@ impl TraceApp {
     fn open(&mut self, id: SessionId, replay: bool) {
         let doc = if replay { TraceDoc::open_replay(&self.store, id, 1.0, false) } else { TraceDoc::open(&self.store, id) };
         match doc {
-            Ok(doc) => {
+            Ok(mut doc) => {
+                doc.collapsed.extend(present::default_folds(&doc.state));
+                doc.refresh();
                 let now = Instant::now();
                 self.seen = doc.state.spans.keys().map(|k| (k.clone(), now)).collect();
                 self.reveal_until = now + REVEAL;
@@ -443,17 +459,12 @@ impl TraceApp {
     fn lens_down(&mut self, x: f32, g: Geo) {
         let Some(vp) = self.doc.as_ref().and_then(|d| d.viewport) else { return };
         let (a, b) = (vp.start_ns, vp.end_ns(g.tl_w as u16));
-        let (xa, xb) = (g.ov_x(a), g.ov_x(b));
-        let tol = ((xb - xa) / 4.).clamp(1., 5.);
         let t = g.ov_t(x);
-        self.lens_drag = Some(if (x - xa).abs() <= tol {
-            LensDrag::Start
-        } else if (x - xb).abs() <= tol {
-            LensDrag::End
-        } else if (xa..xb).contains(&x) {
-            LensDrag::Move { grab_ns: t - a }
-        } else {
-            LensDrag::Move { grab_ns: (b - a) / 2 }
+        self.lens_drag = Some(match present::lens_grab(x, present::lens_rect(g.ov_x(a), g.ov_x(b), g.tl_w)) {
+            Grab::Start => LensDrag::Start,
+            Grab::End => LensDrag::End,
+            Grab::Inside => LensDrag::Move { grab_ns: t - a },
+            Grab::Outside => LensDrag::Move { grab_ns: (b - a) / 2 },
         });
         self.lens_move(x, g);
     }
@@ -507,6 +518,39 @@ impl TraceApp {
         let id = doc.session_id().clone();
         let replaying = matches!(doc.mode, Mode::Replay { .. });
         self.open(id, !replaying);
+    }
+
+    /// Back to following now at the fitted scale.
+    fn jump_to_now(&mut self) {
+        if let Some(TraceDoc { mode: Mode::Live { following, .. }, .. }) = &mut self.doc {
+            *following = true;
+            self.zoomed = false;
+        }
+    }
+
+    /// Brings an off-screen span into view at the current scale, or fits it when it is longer than the view.
+    fn pan_to_span(&mut self, id: &SpanId, tl_w: f32) {
+        let Some(doc) = &self.doc else { return };
+        let (Some(s), Some(vp)) = (doc.state.spans.get(id), doc.viewport) else { return };
+        let end = s.effective_end(doc.state.session.ended_at_utc_ns, doc.now);
+        let len = vp.end_ns(tl_w as u16) - vp.start_ns;
+        if (end - s.started_at_utc_ns) as f64 > len as f64 * 0.8 {
+            self.zoom_to_span(id);
+            return;
+        }
+        let a = s.started_at_utc_ns - (len - (end - s.started_at_utc_ns)) / 2;
+        self.set_window(a, a + len, tl_w);
+    }
+
+    fn copy_command(&mut self, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(COLLECTOR_CMD.into()));
+        self.copied_at = Some(Instant::now());
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(COPIED_FOR).await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     fn toggle_follow(&mut self) {
@@ -579,6 +623,10 @@ impl TraceApp {
             cx.notify();
             return;
         }
+        if ks.modifiers.platform && ks.key == "c" && self.doc.is_none() {
+            self.copy_command(cx);
+            return;
+        }
         if ks.modifiers.platform || ks.modifiers.control {
             return;
         }
@@ -604,6 +652,9 @@ impl TraceApp {
             "e" => self.error = doc.toggle_descendants(),
             "+" | "=" | "-" => {
                 doc.zoom(if key == "-" { 2.0 } else { 0.5 });
+                if let Mode::Live { following, .. } = &mut doc.mode {
+                    *following = false;
+                }
                 self.zoomed = true;
             }
             "H" if matches!(doc.mode, Mode::Replay { .. }) => doc.seek_by(-1),
@@ -826,7 +877,15 @@ impl TraceApp {
             (Some(a), Some(b)) => Some(format_duration(b - a)),
             _ => None,
         };
-        let meta = [when, dur, s.totals.cost_usd_micros().map(|c| format_cost(Some(c)))].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+        let join = |parts: Vec<Option<String>>| parts.into_iter().flatten().collect::<Vec<_>>().join(" · ");
+        // We never store prompts, so what tells sessions apart is how they ran.
+        let turns = match s.turn_count {
+            0 => None,
+            1 => Some("1 turn".to_owned()),
+            n => Some(format!("{n} turns")),
+        };
+        let how = join(vec![Some(s.harness.clone()).filter(|h| !h.is_empty()), s.model.as_deref().map(present::pretty_model), turns]);
+        let meta = join(vec![when, dur, s.totals.cost_usd_micros().map(|c| format_cost(Some(c)))]);
         let dot = match s.status {
             SessionStatus::Live => pal.accent,
             SessionStatus::Completed => pal.ok.fg,
@@ -855,6 +914,7 @@ impl TraceApp {
                     .flex_col()
                     .gap(px(1.))
                     .child(div().truncate().text_size(px(13.)).font_weight(FontWeight::MEDIUM).text_color(pal.ink).child(name))
+                    .when(!how.is_empty(), |el| el.child(div().truncate().text_size(px(11.5)).text_color(pal.text).child(how)))
                     .child(div().truncate().text_size(px(11.5)).text_color(pal.muted).font_features(tnum()).child(meta)),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -897,20 +957,26 @@ fn status_dot(color: Hsla, pulse: bool, id: impl Into<ElementId>) -> AnyElement 
         .into_any_element()
 }
 
-fn pill(p: Pill, label: &str, dot: Option<(bool, ElementId)>) -> impl IntoElement {
+/// A status capsule: card fill, line ring, soft shadow, with the status color only on the dot and text.
+fn pill(pal: &Palette, color: Hsla, label: String, pulse: bool, id: impl Into<ElementId>, h: f32) -> impl IntoElement {
     div()
-        .h(px(24.))
+        .h(px(h))
+        .flex_shrink_0()
         .flex()
         .items_center()
         .gap(px(6.))
         .px(px(10.))
         .rounded_full()
-        .bg(p.bg)
-        .text_color(p.fg)
+        .bg(pal.card)
+        .border_1()
+        .border_color(pal.line)
+        .shadow(vec![soft_shadow(pal, 0.05, 1., 2.)])
+        .text_color(color)
         .text_size(px(12.))
         .font_weight(FontWeight::MEDIUM)
-        .when_some(dot, |el, (pulse, id)| el.child(status_dot(p.fg, pulse, id)))
-        .child(label.to_owned())
+        .font_features(tnum())
+        .child(status_dot(color, pulse, id))
+        .child(label)
 }
 
 // ── Header ─────────────────────────────────────────────────────────────────
@@ -1017,18 +1083,18 @@ impl TraceApp {
                         .child(Input::new(&self.span_search).appearance(false).small().cleanable(true).prefix(Icon::new(IconName::ListFilter).size(px(13.)).text_color(pal.muted))),
                 );
             }
-            let (p, label, dot) = match &doc.mode {
-                Mode::Live { paused_at: Some(_), .. } => (Pill { bg: pal.chip, fg: pal.text }, "Paused", Some(false)),
-                Mode::Live { .. } => (pal.brand, "Live", Some(true)),
-                Mode::Replay { .. } => (pal.brand, "Replay", None),
+            let (color, label, pulse) = match &doc.mode {
+                Mode::Live { paused_at: Some(_), .. } => (pal.text, "Paused".to_owned(), false),
+                Mode::Live { .. } => (pal.accent, "Live".to_owned(), true),
+                Mode::Replay { replay, clock } => (pal.accent, format!("Replay · {}", clock_time(clock.position - replay.start().unwrap_or(0))), false),
                 Mode::Static => match s.status {
-                    SessionStatus::Failed => (Pill { bg: pal.error.bg, fg: pal.error.ink }, "Failed", Some(false)),
-                    SessionStatus::Interrupted => (pal.slow, "Interrupted", Some(false)),
-                    SessionStatus::Unknown => (Pill { bg: pal.chip, fg: pal.text }, "Unknown", Some(false)),
-                    _ => (pal.ok, "Done", Some(false)),
+                    SessionStatus::Failed => (pal.error.ink, "Failed".to_owned(), false),
+                    SessionStatus::Interrupted => (pal.slow.fg, "Interrupted".to_owned(), false),
+                    SessionStatus::Unknown => (pal.text, "Unknown".to_owned(), false),
+                    _ => (pal.ok.fg, "Done".to_owned(), false),
                 },
             };
-            right = right.child(pill(p, label, dot.map(|pulse| (pulse, ElementId::from("hdot")))));
+            right = right.child(pill(pal, color, label, pulse, "hdot", 28.));
             if let Mode::Live { following, .. } = &doc.mode {
                 let on = *following;
                 right = right.child(
@@ -1228,11 +1294,45 @@ impl TraceApp {
                 .pb(px(if matches!(doc.mode, Mode::Replay { .. }) { 72. } else { 8. }))
                 .into_any_element(),
             })
-            .child(gpui_kit::component::scroll::Scrollbar::vertical(&self.list));
+            .child(gpui_kit::component::scroll::Scrollbar::vertical(&self.list))
+            .when(matches!(doc.mode, Mode::Live { .. }) && !(0.0..=g.tl_w).contains(&now_x), |el| {
+                el.child(
+                    div()
+                        .id("jump-now")
+                        .absolute()
+                        .top(px(8.))
+                        .right(px(14.))
+                        .h(px(28.))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .pl(px(12.))
+                        .pr(px(8.))
+                        .rounded_full()
+                        .bg(pal.card)
+                        .border_1()
+                        .border_color(pal.line)
+                        .shadow(vec![soft_shadow(pal, 0.10, 4., 12.), soft_shadow(pal, 0.05, 1., 2.)])
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(pal.accent)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(pal.wash))
+                        .child("Jump to now")
+                        .child(Icon::new(IconName::ChevronRight).size(px(14.)).text_color(pal.accent))
+                        .tooltip(|w, cx| Tooltip::new("Follow now again  F").build(w, cx))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.jump_to_now();
+                            cx.notify();
+                        })),
+                )
+            });
         let stats = self.render_stats(pal);
         let overview = self.render_overview(pal, g, cx);
-        let transport = matches!(doc.mode, Mode::Replay { .. }).then(|| self.render_transport(pal, &g, cx));
-        let _ = window;
+        let transport = matches!(doc.mode, Mode::Replay { .. }).then(|| self.render_transport(pal, &g, cx).into_any_element());
+        let vh = window.viewport_size().height.to_f64() as f32;
+        let card = (point(card_left, HEADER_H), size(vw - card_left - MAIN_PAD, vh - HEADER_H - MAIN_PAD));
+        let popover = self.render_popover(pal, g, card, window, cx);
         div()
             .flex_1()
             .min_h(px(0.))
@@ -1256,6 +1356,7 @@ impl TraceApp {
                     .child(div().absolute().top(px(top - 10.)).bottom(px(0.)).left(px(x)).w(px(1.)).bg(pal.now).h(px(10.)))
             })
             .children(transport)
+            .children(popover)
     }
 
     /// While a fold animates, the visible rows as a stack whose hidden or shown rows grow or shrink
@@ -1293,42 +1394,30 @@ impl TraceApp {
     /// The whole session as a density strip, with the visible window as a lens: click jumps, drag moves,
     /// dragging an edge zooms.
     fn render_overview(&self, pal: &Palette, g: Geo, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        const BUCKET: f32 = 2.;
         const LANE: f32 = 3.;
         const LANE_GAP: f32 = 2.;
         let doc = self.doc.as_ref().expect("overview needs a document");
         let session_end = doc.state.session.ended_at_utc_ns;
-        let n = (g.tl_w / BUCKET).ceil().max(1.) as usize;
-        let mut counts = vec![[0u32; 4]; n];
-        for s in doc.state.spans.values().filter(|s| matches!(s.kind, SpanKind::Llm | SpanKind::Tool | SpanKind::Wait) || s.status == SpanStatus::Failed) {
-            let col = |t: Ns| ((g.ov_x(t) / BUCKET).floor().max(0.) as usize).min(n - 1);
-            let (a, b) = (col(s.started_at_utc_ns), col(s.effective_end(session_end, g.now)));
-            let tone = present::tone(s) as usize;
-            counts[a..=b.max(a)].iter_mut().for_each(|c| c[tone] += 1);
-        }
-        // One thin lane per tone (wait in amber, LLM, tool, error), stronger where spans overlap.
-        let peak = counts.iter().flatten().copied().max().unwrap_or(0).max(1) as f32;
+        let cols = g.tl_w.ceil().max(1.) as usize;
+        // One thin lane per tone (wait in amber, LLM, tool, error).
+        let spans = doc.state.spans.values().filter(|s| matches!(s.kind, SpanKind::Llm | SpanKind::Tool | SpanKind::Wait) || s.status == SpanStatus::Failed);
+        let alpha = present::density(spans.map(|s| (g.ov_x(s.started_at_utc_ns), g.ov_x(s.effective_end(session_end, g.now)), present::tone(s) as usize)), cols);
         let tones = [Tone::Agent, Tone::Llm, Tone::Tool, Tone::Error];
-        let marks: Vec<(f32, f32, Hsla)> = counts
+        let colors = tones.map(|t| if t == Tone::Agent { pal.amber } else { pal.kind(t).mark });
+        let marks: Vec<(f32, f32, Hsla)> = alpha
             .iter()
             .enumerate()
-            .flat_map(|(i, c)| (0..4).filter(|&k| c[k] > 0).map(move |k| (i, k, c[k])))
-            .map(|(i, k, n)| {
-                let density = (1. + n as f32).ln() / (1. + peak).ln();
-                {
-                let color = if k == 0 { pal.amber } else { pal.kind(tones[k]).mark };
-                (i as f32 * BUCKET, k as f32 * (LANE + LANE_GAP), color.opacity(0.45 + 0.55 * density))
-            }
-            })
+            .flat_map(|(i, a)| (0..4).filter(|&k| a[k] > 0.).map(move |k| (i, k, a[k])))
+            .map(|(i, k, a)| (i as f32, k as f32 * (LANE + LANE_GAP), colors[k].opacity(a)))
             .collect();
         let (a, b) = g.window();
-        let lx0 = g.ov_x(a).clamp(0., g.tl_w - 10.);
-        let lx1 = g.ov_x(b).clamp(lx0 + 10., g.tl_w);
+        let (lx0, lx1) = present::lens_rect(g.ov_x(a), g.ov_x(b), g.tl_w);
+        let thin = g.ov_x(b) - g.ov_x(a) < present::LENS_MIN;
         let this = cx.entity().downgrade();
         let strip = canvas(|_, _, _| {}, move |bounds, _, window, _| {
             let top = bounds.origin.y + (bounds.size.height - px(4. * LANE + 3. * LANE_GAP)) / 2.;
             for (x, y, color) in &marks {
-                window.paint_quad(fill(Bounds::new(point(bounds.origin.x + px(*x), top + px(*y)), size(px(BUCKET), px(LANE))), *color));
+                window.paint_quad(fill(Bounds::new(point(bounds.origin.x + px(*x), top + px(*y)), size(px(1.), px(LANE))), *color));
             }
             let local = move |p: Point<Pixels>| (p.x - bounds.origin.x).to_f64() as f32;
             let down = this.clone();
@@ -1361,11 +1450,7 @@ impl TraceApp {
         });
         let grip = || div().w(px(2.)).h(px(10.)).rounded_full().bg(pal.faint);
         let whole = a <= g.overview.0 && b >= g.overview.1;
-        let span_label = if whole {
-            "Whole trace".to_owned()
-        } else {
-            format!("{} at {}", format_duration(b - a), format_duration((a - g.origin).max(0)))
-        };
+        let tl_w = g.tl_w;
         div()
             .h(px(OVERVIEW_H))
             .flex_shrink_0()
@@ -1380,14 +1465,38 @@ impl TraceApp {
                     .pl(px(16.))
                     .pr(px(12.))
                     .flex()
-                    .items_baseline()
-                    .gap(px(6.))
+                    .items_center()
+                    .gap(px(8.))
                     .whitespace_nowrap()
-                    .overflow_hidden()
                     .text_size(px(12.))
                     .font_features(tnum())
-                    .child(div().text_color(pal.text).font_weight(FontWeight::MEDIUM).child(span_label))
-                    .child(div().text_color(pal.muted).child(format!("{}{}", if whole { "" } else { "of " }, format_duration(g.overview.1 - g.overview.0)))),
+                    .child(div().flex_1().min_w(px(0.)).truncate().text_color(pal.text).font_weight(FontWeight::MEDIUM).child(present::overview_label((a, b), g.overview)))
+                    .when(!whole, |el| {
+                        el.child(
+                            div()
+                                .id("show-all")
+                                .flex_shrink_0()
+                                .h(px(22.))
+                                .px(px(8.))
+                                .flex()
+                                .items_center()
+                                .rounded(px(6.))
+                                .border_1()
+                                .border_color(pal.line)
+                                .bg(pal.card)
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(pal.text)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(pal.wash))
+                                .child("Show all")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let (a, b) = g.overview;
+                                    this.set_window(a, b, tl_w);
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -1407,14 +1516,14 @@ impl TraceApp {
                             .w(px(lx1 - lx0))
                             .rounded(px(6.))
                             .bg(pal.card)
-                            .border_1()
-                            .border_color(if lx1 - lx0 < 24. { pal.accent.opacity(0.7) } else { pal.faint.opacity(if pal.dark { 1. } else { 0.7 }) })
+                            .when(thin, |el| el.border_2().border_color(pal.accent))
+                            .when(!thin, |el| el.border_1().border_color(pal.faint.opacity(if pal.dark { 1. } else { 0.7 })))
                             .shadow(vec![soft_shadow(pal, 0.10, 1., 3.)])
                             .flex()
                             .items_center()
                             .justify_between()
                             .px(px(2.))
-                            .when(lx1 - lx0 >= 24., |el| el.child(grip()).child(grip())),
+                            .when(!thin, |el| el.child(grip()).child(grip())),
                     )
                     .child(strip.absolute().inset_0()),
             )
@@ -1476,6 +1585,24 @@ impl TraceApp {
         let (icon, ink) = present::glyph(s);
         let detail = present::detail(s, &doc.state.session.harness);
         let indent = 12. + f32::from(row.depth) * INDENT;
+        let end = s.effective_end(doc.state.session.ended_at_utc_ns, g.now);
+        // Two pixels in from each edge, so a span that would draw as a sliver reads as off-screen.
+        let edge_ns = (2. * g.vp.ns_per_cell) as Ns;
+        let (wa, wb) = g.window();
+        let hint = present::offscreen_hint(s.started_at_utc_ns, end, (wa + edge_ns, wb - edge_ns));
+        let full_title = present::title(s);
+        // About 7pt per character at 13pt; the title gets at most 80% of what the name column leaves.
+        let room = (g.name_w - indent - 14. - 20. - 12. - 10.) * 0.8;
+        let shown_title = present::middle_truncate(&full_title, (room / 7.) as usize);
+        let truncated = shown_title != full_title || present::mcp_parts(&s.name).is_some();
+        let tip = if present::mcp_parts(&s.name).is_some() { s.name.clone() } else { full_title.clone() };
+        let row_bg = if selected {
+            pal.card.blend(pal.selected)
+        } else if hovered {
+            pal.card.blend(pal.hover)
+        } else {
+            pal.card
+        };
         let hidden = if row.collapsed { present::descendants(&doc.state, id, 100_000) } else { Vec::new() };
         let slowest = doc.state.slowest(SLOWEST_DEFAULT_KINDS).map(|x| &x.span_id) == Some(id);
 
@@ -1526,24 +1653,25 @@ impl TraceApp {
                     .overflow_hidden()
                     .child(
                         div()
+                            .id(("title", key))
                             .flex_shrink_0()
                             .max_w(relative(0.8))
                             .truncate()
                             .text_size(px(13.))
                             .when(row.has_children, |el| el.font_weight(FontWeight::MEDIUM))
-                            .text_color(pal.ink)
-                            .child(present::title(s)),
+                            .text_color(if hint.is_some() { pal.text } else { pal.ink })
+                            .child(shown_title)
+                            .when(truncated, |el| el.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))),
                     )
-                    .when_some(detail, |el, d| el.child(div().flex_shrink(8.).min_w(px(0.)).max_w(px(160.)).truncate().text_size(px(12.5)).text_color(pal.muted).child(d)))
                     .when(row.collapsed, |el| {
                         el.child(
                             div()
                                 .flex_shrink_0()
                                 .h(px(18.))
-                                .px(px(6.))
+                                .px(px(7.))
                                 .flex()
                                 .items_center()
-                                .rounded(px(6.))
+                                .rounded_full()
                                 .bg(pal.chip)
                                 .text_size(px(11.))
                                 .font_weight(FontWeight::MEDIUM)
@@ -1552,13 +1680,17 @@ impl TraceApp {
                                 .child(format!("+{}", hidden.len())),
                         )
                     })
+                    .when_some(detail, |el, d| el.child(div().flex_shrink(8.).min_w(px(0.)).max_w(px(160.)).truncate().text_size(px(12.5)).text_color(pal.muted).child(d)))
                     .when(running, |el| el.child(Spinner::new().color(pal.accent).with_size(px(12.))))
                     .when(s.status == SpanStatus::Failed, |el| el.child(Icon::new(IconName::TriangleAlert).size(px(13.)).text_color(pal.error.ink))),
             );
 
-        let timeline = self.render_bar(key, s, &g, kc, &pal, hovered, slowest, &hidden, window);
+        let timeline = match hint {
+            Some((edge, text)) => self.render_edge_hint(key, id.clone(), edge, text, pal.kind(tone).mark, &pal, g, cx).into_any_element(),
+            None => self.render_bar(key, s, &g, kc, &pal, hovered, slowest, &hidden, row_bg, window).into_any_element(),
+        };
         let click_id = id.clone();
-        let mut el = div()
+        let el = div()
             .id(("row", key))
             .h(px(ROW_H))
             .w_full()
@@ -1595,25 +1727,42 @@ impl TraceApp {
                 this.focus.focus(window, cx);
                 cx.notify();
             }));
-        if selected && !matches!(self.popover, Pop::Closed) {
-            let end = s.effective_end(doc.state.session.ended_at_utc_ns, g.now);
-            let x = g.name_w + g.x(s.started_at_utc_ns).max(0.) + 0. * g.x(end);
-            el = el.child(
-                deferred(
-                    anchored()
-                        .position_mode(AnchoredPositionMode::Local)
-                        .position(point(px(x), px(ROW_H + 4.)))
-                        .snap_to_window_with_margin(px(12.))
-                        .child(self.render_popover(s, &pal, cx)),
-                )
-                .with_priority(1),
-            );
-        }
         el.into_any_element()
     }
 
+    /// A span outside the visible window: a chevron at the edge it lies past and how far away it is. Clicking pans to it.
     #[allow(clippy::too_many_arguments)]
-    fn render_bar(&self, ix: usize, s: &Span, g: &Geo, kc: KindColors, pal: &Palette, hovered: bool, slowest: bool, hidden: &[&Span], window: &mut Window) -> impl IntoElement + use<> {
+    fn render_edge_hint(&self, key: usize, id: SpanId, edge: Edge, text: String, mark: Hsla, pal: &Palette, g: Geo, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let left = edge == Edge::Left;
+        let chevron = Icon::new(if left { IconName::ChevronLeft } else { IconName::ChevronRight }).size(px(12.)).text_color(mark);
+        let label = div().text_size(px(11.)).text_color(pal.muted).font_features(tnum()).whitespace_nowrap().child(text);
+        div().w(px(g.tl_w)).h_full().relative().child(
+            div()
+                .id(("edge", key))
+                .absolute()
+                .top(px(7.))
+                .h(px(18.))
+                .when(left, |el| el.left(px(2.)))
+                .when(!left, |el| el.right(px(2.)))
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .px(px(4.))
+                .rounded(px(6.))
+                .cursor_pointer()
+                .hover(|s| s.bg(pal.hover.opacity(3.)))
+                .map(|el| if left { el.child(chevron).child(label) } else { el.child(label).child(chevron) })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.pan_to_span(&id, g.tl_w);
+                    cx.notify();
+                })),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_bar(&self, ix: usize, s: &Span, g: &Geo, kc: KindColors, pal: &Palette, hovered: bool, slowest: bool, hidden: &[&Span], row_bg: Hsla, window: &mut Window) -> impl IntoElement + use<> {
+        const FADE: f32 = 12.;
         let doc = self.doc.as_ref().expect("bars need a document");
         let session_end = doc.state.session.ended_at_utc_ns;
         let end = s.effective_end(session_end, g.now);
@@ -1623,12 +1772,16 @@ impl TraceApp {
         let reveal = self.seen.get(&s.span_id).map_or(1., |t| ease(t.elapsed().as_secs_f32() / REVEAL.as_secs_f32()));
         let x1 = x0 + (x1 - x0) * reveal;
         let mut cell = div().w(px(g.tl_w)).h_full().relative().overflow_hidden();
-        if x1 < -2. || x0 > g.tl_w + 2. {
-            return cell;
-        }
-        let bx = x0.max(-6.).round();
-        let bw = (x1.min(g.tl_w + 6.) - bx).max(3.).round();
+        // A bar cut by an edge squares off there and fades in from the row, so a clipped span never reads as its own end.
+        let (clip_l, clip_r) = (x0 < 0., x1 > g.tl_w);
+        let bx = x0.max(0.).round();
+        let bw = (x1.min(g.tl_w) - bx).max(3.).round();
         let top = (ROW_H - BAR_H) / 2.;
+        let fade = |left: bool| {
+            let w = FADE.min(bw / 2.);
+            let (from, to) = if left { (row_bg, row_bg.opacity(0.)) } else { (row_bg.opacity(0.), row_bg) };
+            div().absolute().top(px(-1.)).bottom(px(-1.)).w(px(w)).when(left, |el| el.left(px(-1.))).when(!left, |el| el.right(px(-1.))).bg(linear_gradient(90., linear_color_stop(from, 0.), linear_color_stop(to, 1.)))
+        };
         let mut bar = div()
             .absolute()
             .left(px(bx))
@@ -1636,6 +1789,8 @@ impl TraceApp {
             .w(px(bw))
             .h(px(BAR_H))
             .rounded(px(5.))
+            .when(clip_l, |el| el.rounded_l(px(0.)))
+            .when(clip_r, |el| el.rounded_r(px(0.)))
             .border_1()
             .overflow_hidden()
             .border_color(if hovered { kc.mark } else { kc.edge });
@@ -1659,6 +1814,7 @@ impl TraceApp {
             let mark = pal.kind(present::tone(k)).mark;
             bar = bar.child(div().absolute().top(px((BAR_H - 2. - 6.) / 2.)).left(px(kx0.max(1.))).w(px((kx1 - kx0.max(1.)).max(2.))).h(px(6.)).rounded(px(2.)).bg(mark.opacity(0.6)));
         }
+        bar = bar.when(clip_l, |el| el.child(fade(true))).when(clip_r && !open, |el| el.child(fade(false)));
         cell = cell.child(bar);
         let label = present::bar_label(s, &doc.state.subtree_totals(&s.span_id), session_end, g.now);
         let lw = text_width(window, &label, LABEL_SIZE);
@@ -1669,11 +1825,15 @@ impl TraceApp {
             LabelAt::Inside => bx + bw - 8. - lw,
             LabelAt::Before => bx - present::LABEL_GAP - lw - tag_w,
         };
-        let color = if at == LabelAt::Inside { kc.ink } else { pal.muted };
+        let inside = at == LabelAt::Inside;
+        let color = if inside { kc.ink } else { pal.muted };
+        // Outside the bar the label sits on a knockout in the row's color, so grid and now lines pass beneath it.
         cell = cell.child(
             div()
                 .absolute()
-                .left(px(lx))
+                .left(px(if inside { lx } else { lx - 2. }))
+                .when(!inside, |el| el.child(div().absolute().left_0().right_0().top(px(8.)).bottom(px(8.)).rounded(px(3.)).bg(row_bg)))
+                .px(px(if inside { 0. } else { 2. }))
                 .top_0()
                 .h_full()
                 .flex()
@@ -1703,8 +1863,26 @@ impl TraceApp {
         cell
     }
 
-    fn render_popover(&self, s: &Span, pal: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let doc = self.doc.as_ref().expect("popover needs a document");
+    /// The selected span's popover, anchored under its bar in window coordinates. `card` is the card's
+    /// window origin and size.
+    fn render_popover(&self, pal: &Palette, g: Geo, card: (Point<f32>, Size<f32>), window: &mut Window, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        if matches!(self.popover, Pop::Closed) {
+            return None;
+        }
+        let doc = self.doc.as_ref()?;
+        let s = doc.selected_span()?;
+        let end = s.effective_end(doc.state.session.ended_at_utc_ns, g.now);
+        let body_top = 1. + STATS_H + OVERVIEW_H + AXIS_H;
+        let scroll = self.list.0.borrow().base_handle.offset().y.to_f64() as f32;
+        let row_y = (body_top + doc.selected_row as f32 * ROW_H + scroll).clamp(body_top - ROW_H, card.1.height);
+        let bar_y = (row_y + (ROW_H - BAR_H) / 2., row_y + (ROW_H + BAR_H) / 2.);
+        let bx = |t: Ns| 1. + g.name_w + g.x(t).clamp(0., g.tl_w);
+        let full_h = self.pop_h.get();
+        if full_h == 0. {
+            window.request_animation_frame();
+        }
+        let natural = if full_h > 0. { full_h + 2. } else { 0. };
+        let place = present::place_popover((bx(s.started_at_utc_ns), bx(end)), bar_y, (card.1.width, card.1.height), (POPOVER_W, natural));
         let (icon, ink) = present::glyph(s);
         let sub = [Some(present::kind_label(s.kind).to_owned()), s.model.as_deref().map(present::pretty_model).or_else(|| present::detail(s, &doc.state.session.harness))]
             .into_iter()
@@ -1713,11 +1891,11 @@ impl TraceApp {
             .join(" · ");
         let open = s.ended_at_utc_ns.is_none() && !matches!(doc.mode, Mode::Static);
         let (status, label) = match s.status {
-            SpanStatus::Failed => (Pill { bg: pal.error.bg, fg: pal.error.ink }, "Failed"),
-            SpanStatus::Succeeded => (pal.ok, "Done"),
-            SpanStatus::Cancelled => (Pill { bg: pal.chip, fg: pal.text }, "Cancelled"),
-            SpanStatus::Running if open => (pal.brand, "Running"),
-            _ => (Pill { bg: pal.chip, fg: pal.text }, "Unknown"),
+            SpanStatus::Failed => (pal.error.ink, "Failed"),
+            SpanStatus::Succeeded => (pal.ok.fg, "Done"),
+            SpanStatus::Cancelled => (pal.text, "Cancelled"),
+            SpanStatus::Running if open => (pal.accent, "Running"),
+            _ => (pal.text, "Unknown"),
         };
         let stats = present::popover_stats(&doc.state, s, &doc.state.subtree_totals(&s.span_id), doc.now);
         let cell = |(k, v): &(&'static str, String)| {
@@ -1738,7 +1916,7 @@ impl TraceApp {
                 .child(div().text_size(px(11.5)).font_weight(FontWeight::MEDIUM).text_color(pal.muted).child(title))
                 .child(match body.filter(|b| !b.trim().is_empty()) {
                     Some(b) => div().text_size(px(12.5)).line_height(px(18.)).text_color(pal.text).line_clamp(4).child(b.chars().take(600).collect::<String>()),
-                    None => div().text_size(px(12.5)).text_color(pal.faint).child("Not captured"),
+                    None => div().text_size(px(12.5)).text_color(pal.muted).child("Not captured"),
                 })
         };
         let start = s.started_at_utc_ns;
@@ -1771,7 +1949,7 @@ impl TraceApp {
                             .child(div().truncate().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).text_color(pal.ink).child(present::title(s)))
                             .child(div().truncate().text_size(px(12.)).text_color(pal.muted).child(sub)),
                     )
-                    .child(pill(status, label, None))
+                    .child(pill(pal, status, label.to_owned(), open, "pdot", 24.))
                     .child(
                         div()
                             .id("close")
@@ -1831,29 +2009,68 @@ impl TraceApp {
                     s.artifacts.iter().take(4).map(|a| (a.path.clone(), a.change_summary.clone().unwrap_or_default())).collect(),
                 ))
             });
-        // GPUI has no element scale, so the card's bounds shrink toward its top edge, by the row,
-        // while the content holds still underneath, clipped.
-        div().w(px(POPOVER_W)).child(
-            div()
-                .id("popover")
-                .occlude()
-                .ml(px(inset))
-                .w(px(POPOVER_W * scale))
-                .when(shown < 1. && full_h > 0., |el| el.h(px((full_h + 2.) * scale)))
-                .overflow_hidden()
-                .opacity(shown)
-                .rounded(px(16.))
-                .bg(pal.pop)
-                .border_1()
-                .border_color(pal.line)
-                .shadow(vec![soft_shadow(pal, 0.12, 16., 40.), soft_shadow(pal, 0.06, 2., 6.)])
-                .cursor_default()
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.close_popover();
-                    cx.notify();
-                }))
-                .on_click(|_, _, cx| cx.stop_propagation())
-                .child(content),
+        // GPUI has no element scale, so the card's bounds shrink toward the bar while the content holds
+        // still underneath, clipped.
+        let final_h = natural.min(place.max_h);
+        let h = final_h * scale;
+        let y = if place.above { place.y + final_h - h } else { place.y };
+        let arrow_x = place.arrow_x - place.x - present::POP_ARROW;
+        let above = place.above;
+        let (fill_c, ring) = (pal.pop, pal.line);
+        let arrow = canvas(|_, _, _| {}, move |b, _, window, _| {
+            let (o, w, hgt) = (b.origin, px(2. * present::POP_ARROW), px(present::POP_ARROW));
+            let (tip_y, base_y) = if above { (o.y + hgt, o.y) } else { (o.y, o.y + hgt) };
+            let tip = point(o.x + w / 2., tip_y);
+            let mut edge = PathBuilder::stroke(px(1.));
+            edge.move_to(point(o.x, base_y));
+            edge.line_to(tip);
+            edge.line_to(point(o.x + w, base_y));
+            let mut body = PathBuilder::fill();
+            let inset = if above { px(-1.) } else { px(1.) };
+            body.move_to(point(o.x, base_y + inset));
+            body.line_to(tip);
+            body.line_to(point(o.x + w, base_y + inset));
+            body.close();
+            if let Ok(p) = edge.build() {
+                window.paint_path(p, ring);
+            }
+            if let Ok(p) = body.build() {
+                window.paint_path(p, fill_c);
+            }
+        })
+        .absolute()
+        .left(px(arrow_x))
+        .w(px(2. * present::POP_ARROW))
+        .h(px(present::POP_ARROW))
+        .when(above, |el| el.bottom(px(-present::POP_ARROW + 1.)))
+        .when(!above, |el| el.top(px(-present::POP_ARROW + 1.)));
+        let card_el = div()
+            .id("popover")
+            .occlude()
+            .ml(px(inset))
+            .w(px(POPOVER_W * scale))
+            .map(|el| if full_h > 0. { el.h(px(h)) } else { el.max_h(px(place.max_h)) })
+            .overflow_hidden()
+            .rounded(px(16.))
+            .bg(pal.pop)
+            .border_1()
+            .border_color(pal.line)
+            .shadow(vec![soft_shadow(pal, 0.12, 16., 40.), soft_shadow(pal, 0.06, 2., 6.)])
+            .cursor_default()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.close_popover();
+                cx.notify();
+            }))
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(div().id("pop-scroll").size_full().overflow_y_scroll().child(content));
+        Some(
+            deferred(
+                anchored()
+                    .position_mode(AnchoredPositionMode::Window)
+                    .position(point(px(card.0.x + place.x), px(card.0.y + y)))
+                    .child(div().relative().w(px(POPOVER_W)).opacity(shown).child(card_el).child(arrow)),
+            )
+            .with_priority(1),
         )
     }
 
@@ -1996,9 +2213,19 @@ impl TraceApp {
     }
 
     fn render_empty(&self, pal: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        div().flex_1().flex().items_center().justify_center().rounded(px(16.)).bg(pal.card).border_1().border_color(pal.line).child(
+        let copied = self.copied_at.is_some_and(|t| t.elapsed() < COPIED_FOR);
+        // A faint, inert waterfall behind the copy, so the empty card already looks like what it will hold.
+        let sample = [(Tone::Agent, 0.10, 0.62), (Tone::Llm, 0.16, 0.18), (Tone::Tool, 0.36, 0.12), (Tone::Llm, 0.50, 0.22)];
+        let ghost = div().absolute().inset_0().flex().flex_col().justify_center().gap(px(16.)).opacity(0.3).children(sample.map(|(t, x, w)| {
+            let k = pal.kind(t);
+            div().h(px(BAR_H)).relative().child(div().absolute().left(relative(x)).w(relative(w)).h_full().rounded(px(5.)).bg(k.bg).border_1().border_color(k.edge))
+        }));
+        div().flex_1().relative().overflow_hidden().flex().items_center().justify_center().rounded(px(16.)).bg(pal.card).border_1().border_color(pal.line).child(ghost).child(
             div()
                 .w(px(400.))
+                .p(px(24.))
+                .rounded(px(16.))
+                .bg(pal.card.opacity(0.9))
                 .flex()
                 .flex_col()
                 .items_center()
@@ -2015,16 +2242,36 @@ impl TraceApp {
                 )
                 .child(
                     div()
-                        .px(px(10.))
-                        .py(px(6.))
+                        .h(px(32.))
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .pl(px(12.))
+                        .pr(px(4.))
                         .rounded(px(8.))
                         .bg(pal.wash)
                         .border_1()
                         .border_color(pal.line)
-                        .font_family("Menlo")
-                        .text_size(px(12.))
-                        .text_color(pal.ink)
-                        .child("trace-tui collector start"),
+                        .child(div().font_family("Menlo").text_size(px(12.)).text_color(pal.ink).child(COLLECTOR_CMD))
+                        .child(
+                            div()
+                                .id("copy-cmd")
+                                .h(px(24.))
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .px(px(8.))
+                                .rounded(px(6.))
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(if copied { pal.ok.fg } else { pal.text })
+                                .cursor_pointer()
+                                .hover(|s| s.bg(pal.card))
+                                .child(Icon::new(if copied { IconName::Check } else { IconName::Copy }).size(px(13.)))
+                                .child(if copied { "Copied" } else { "Copy" })
+                                .tooltip(|w, cx| Tooltip::new("Copy  ⌘C").build(w, cx))
+                                .on_click(cx.listener(|this, _, _, cx| this.copy_command(cx))),
+                        ),
                 )
                 .child(
                     Button::new("import-empty")
