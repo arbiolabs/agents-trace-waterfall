@@ -1032,6 +1032,9 @@ impl TraceApp {
         let frame = b.intervals.len();
         if frame > BENCH_FRAMES {
             let stats = |v: &mut Vec<f32>| {
+                if v.is_empty() {
+                    return "n/a".to_owned();
+                }
                 v.sort_by(f32::total_cmp);
                 let at = |q: f32| v[((v.len() - 1) as f32 * q) as usize];
                 format!("p50 {:.2}ms p95 {:.2}ms max {:.2}ms", at(0.5), at(0.95), at(1.))
@@ -1099,7 +1102,7 @@ impl TraceApp {
                 let on = *following;
                 right = right.child(
                     tool_button("follow", IconName::Crosshair, Some("Follow"), on, pal)
-                        .tooltip(|w, cx| Tooltip::new("Keep now in view  F").build(w, cx))
+                        .tooltip(|w, cx| Tooltip::new("Keep the latest activity in view  F").build(w, cx))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.toggle_follow();
                             cx.notify();
@@ -1295,7 +1298,7 @@ impl TraceApp {
                 .into_any_element(),
             })
             .child(gpui_kit::component::scroll::Scrollbar::vertical(&self.list))
-            .when(matches!(doc.mode, Mode::Live { .. }) && !(0.0..=g.tl_w).contains(&now_x), |el| {
+            .when(matches!(doc.mode, Mode::Live { following: false, .. }) && !(0.0..=g.tl_w).contains(&now_x), |el| {
                 el.child(
                     div()
                         .id("jump-now")
@@ -1882,7 +1885,7 @@ impl TraceApp {
             window.request_animation_frame();
         }
         let natural = if full_h > 0. { full_h + 2. } else { 0. };
-        let place = present::place_popover((bx(s.started_at_utc_ns), bx(end)), bar_y, (card.1.width, card.1.height), (POPOVER_W, natural));
+        let place = present::place_popover((bx(s.started_at_utc_ns), bx(end)), bar_y, (card.1.width, card.1.height), body_top, (POPOVER_W, natural));
         let (icon, ink) = present::glyph(s);
         let sub = [Some(present::kind_label(s.kind).to_owned()), s.model.as_deref().map(present::pretty_model).or_else(|| present::detail(s, &doc.state.session.harness))]
             .into_iter()

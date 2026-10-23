@@ -191,7 +191,7 @@ pub fn default_folds(state: &TraceState) -> Vec<trace_core::SpanId> {
     out
 }
 
-/// The overview's caption: `All · 16.2s` for the whole trace, else `7h18m – 7h31m · 13m of 8h12m`.
+/// The overview's caption: `All · 16.2s` for the whole trace, else `7h18m – 7h31m of 8h12m`.
 pub fn overview_label(window: (Ns, Ns), whole: (Ns, Ns)) -> String {
     let total = whole.1 - whole.0;
     if window.0 <= whole.0 && window.1 >= whole.1 {
@@ -199,7 +199,7 @@ pub fn overview_label(window: (Ns, Ns), whole: (Ns, Ns)) -> String {
     }
     let a = (window.0 - whole.0).clamp(0, total);
     let b = (window.1 - whole.0).clamp(a, total);
-    format!("{} – {} · {} of {}", format_duration(a), format_duration(b), format_duration(window.1 - window.0), format_duration(total))
+    format!("{} – {} of {}", format_duration(a), format_duration(b), format_duration(total))
 }
 
 /// Overview density: each span counts once in every column it touches, per lane, and a column's alpha
@@ -333,16 +333,17 @@ pub struct Placement {
 }
 
 /// Below the bar, aligned to its start and kept 12pt inside the card. It flips above only when it would
-/// overflow below and there is more room above; either way it never grows past the card, and scrolls instead.
+/// overflow below and there is more room above; either way it stays between `top` (the rows' top edge, so it
+/// never covers the stats or axis) and the card bottom, and scrolls instead of growing past them.
 /// `bar` is the bar's drawn x extent, `bar_y` its top and bottom, `pop` the popover's width and natural height.
-pub fn place_popover(bar: (f32, f32), bar_y: (f32, f32), card: (f32, f32), pop: (f32, f32)) -> Placement {
+pub fn place_popover(bar: (f32, f32), bar_y: (f32, f32), card: (f32, f32), top: f32, pop: (f32, f32)) -> Placement {
     let (cw, ch) = card;
     let (pw, ph) = pop;
     let x = bar.0.min(cw - POP_MARGIN - pw).max(POP_MARGIN);
     let below = bar_y.1 + POP_GAP + POP_ARROW;
     let room_below = ch - POP_MARGIN - below;
     let above_bottom = bar_y.0 - POP_GAP - POP_ARROW;
-    let room_above = above_bottom - POP_MARGIN;
+    let room_above = above_bottom - top - POP_GAP;
     let above = ph > room_below && room_above > room_below;
     let (y, max_h) = if above { (above_bottom - ph.min(room_above), room_above) } else { (below, room_below) };
     let arrow_x = (bar.0 + ((bar.1 - bar.0) / 2.).min(14.)).clamp(x + 18., x + pw - 18.);
@@ -616,15 +617,17 @@ mod tests {
 
     #[test]
     fn popover_anchors_below_the_bar_and_flips_only_on_overflow() {
-        let p = place_popover((400., 600.), (100., 116.), (1200., 800.), (330., 300.));
+        let p = place_popover((400., 600.), (100., 116.), (1200., 800.), 0., (330., 300.));
         assert_eq!(p, Placement { x: 400., y: 130., max_h: 658., above: false, arrow_x: 418. });
-        let p = place_popover((1000., 1010.), (100., 116.), (1200., 800.), (330., 300.));
+        let p = place_popover((1000., 1010.), (100., 116.), (1200., 800.), 0., (330., 300.));
         assert_eq!((p.x, p.arrow_x), (858., 1005.), "clamped inside the card; the arrow still points at the bar");
-        let p = place_popover((400., 600.), (700., 716.), (1200., 800.), (330., 300.));
-        assert_eq!(p, Placement { x: 400., y: 386., max_h: 674., above: true, arrow_x: 418. });
-        let p = place_popover((400., 600.), (60., 76.), (1200., 400.), (330., 900.));
+        let p = place_popover((400., 600.), (700., 716.), (1200., 800.), 0., (330., 300.));
+        assert_eq!(p, Placement { x: 400., y: 386., max_h: 680., above: true, arrow_x: 418. });
+        let p = place_popover((400., 600.), (400., 416.), (1200., 450.), 200., (330., 300.));
+        assert_eq!((p.y, p.max_h, p.above), (206., 180., true), "a flipped popover stops 6pt under the rows' top, never over the stats");
+        let p = place_popover((400., 600.), (60., 76.), (1200., 400.), 0., (330., 900.));
         assert_eq!((p.y, p.max_h, p.above), (90., 298., false), "tall content scrolls below rather than flipping into less room");
-        assert_eq!(place_popover((0., 4.), (0., 16.), (1200., 800.), (330., 100.)).x, 12.);
+        assert_eq!(place_popover((0., 4.), (0., 16.), (1200., 800.), 0., (330., 100.)).x, 12.);
     }
 
     #[test]
@@ -678,11 +681,11 @@ mod tests {
     }
 
     #[test]
-    fn overview_label_reads_range_length_and_total() {
+    fn overview_label_reads_range_and_total() {
         let h = 3_600_000 * MS;
         let m = 60_000 * MS;
         assert_eq!(overview_label((0, 16_200 * MS), (0, 16_200 * MS)), "All · 16.2s");
-        assert_eq!(overview_label((7 * h + 18 * m, 7 * h + 31 * m), (0, 8 * h + 12 * m)), "7h18m – 7h31m · 13m of 8h12m");
+        assert_eq!(overview_label((7 * h + 18 * m, 7 * h + 31 * m), (0, 8 * h + 12 * m)), "7h18m – 7h31m of 8h12m");
     }
 
     #[test]
