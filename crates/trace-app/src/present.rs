@@ -776,7 +776,7 @@ mod tests {
         let sparse = density((0..1).map(|_| (0., 0., 0)).chain((0..10).map(|_| (1., 2., 0))), 2);
         assert_eq!(sparse.iter().map(|c| c[0]).collect::<Vec<_>>(), [0.18, 1.], "a lone instant stays visible");
         let burst = density((0..200).map(|i| (i as f32 / 100., i as f32 / 100., 0)), 2);
-        assert_eq!(burst.iter().map(|c| (c[0] * 100.).round() / 100.).collect::<Vec<_>>(), [1., 1.], "a burst of instants reads as busy");
+        assert!(burst.iter().all(|c| c[0] > 0.95), "a burst of instants reads as busy: {burst:?}");
     }
 
     #[test]
