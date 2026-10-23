@@ -6753,7 +6753,7 @@ dependencies = [
 
 [[package]]
 name = "simulated-live"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -7583,7 +7583,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "trace-adapter-sdk"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -7593,7 +7593,7 @@ dependencies = [
 
 [[package]]
 name = "trace-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7614,7 +7614,7 @@ dependencies = [
 
 [[package]]
 name = "trace-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7622,7 +7622,7 @@ dependencies = [
 
 [[package]]
 name = "trace-ingest"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -7635,7 +7635,7 @@ dependencies = [
 
 [[package]]
 name = "trace-render"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ratatui",
  "serde_json",
@@ -7645,7 +7645,7 @@ dependencies = [
 
 [[package]]
 name = "trace-storage"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -7656,7 +7656,7 @@ dependencies = [
 
 [[package]]
 name = "trace-tui"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -7675,7 +7675,7 @@ dependencies = [
 
 [[package]]
 name = "trace-view"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "serde_json",
