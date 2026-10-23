@@ -28,8 +28,9 @@ trace-tui collector start --tail claude-code=$HOME/.claude/projects
 `trace-waterfall` is a native macOS app built with GPUI and gpui-kit. It reads the same database as the TUI and follows the system light or dark appearance. See [docs/design.md](docs/design.md) for its design.
 
 ```sh
-cargo build --release -p trace-app
-./target/release/trace-waterfall                 # sessions sidebar plus the waterfall
+scripts/bundle.sh                                # builds target/release/Trace Waterfall.app with its icon
+open "target/release/Trace Waterfall.app"
+./target/release/trace-waterfall                 # or run the binary directly
 ./target/release/trace-waterfall --open 7ad34f22 # open a session by id prefix
 ```
 
