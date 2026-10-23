@@ -1,4 +1,4 @@
-# Trace Waterfall TUI — Specification v0.1
+# Agents Trace Waterfall TUI — Specification v0.1
 
 **Status:** Proposed  
 **Stack:** Rust, Ratatui, Crossterm, Tokio, SQLite  

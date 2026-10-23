@@ -57,7 +57,7 @@ gpui_kit::actions!(
     agents_trace_waterfall,
     [
         Quit, About, Import, ExportSession, ToggleSidebar, ZoomIn, ZoomOut, ZoomToFit, Follow, Replay, NextEvent, PrevEvent,
-        Inspect, AddNote, ZoomToSpan, ToggleBranch, CopySpanName, CopySpanJson, ExportSpanJson, ShowInReplay
+        Inspect, AddNote, ZoomToSpan, ToggleBranch, CollapseAll, ExpandAll, NextActivity, PrevActivity, CopySpanName, CopySpanJson, ExportSpanJson, ShowInReplay
     ]
 );
 
@@ -85,6 +85,8 @@ struct Geo {
     /// The last event of an idle live session; the overview ends there and marks the gap to now.
     idle: Option<Ns>,
     live: bool,
+    /// The overview's scale, idle stretches squeezed.
+    squeeze: present::Squeeze,
 }
 
 impl Geo {
@@ -107,13 +109,11 @@ impl Geo {
 
     /// Overview strip x of `t`.
     fn ov_x(&self, t: Ns) -> f32 {
-        let (a, b) = self.overview;
-        ((t - a) as f64 / (b - a).max(1) as f64 * f64::from(self.ov_w())) as f32
+        self.squeeze.x(t)
     }
 
     fn ov_t(&self, x: f32) -> Ns {
-        let (a, b) = self.overview;
-        a + (f64::from(x / self.ov_w()) * (b - a) as f64) as Ns
+        self.squeeze.t(x)
     }
 }
 
@@ -217,6 +217,8 @@ pub struct TraceApp {
     note: Entity<TextareaState>,
     /// The span whose note the editor holds.
     note_span: Option<SpanId>,
+    /// Idle stretches of the open trace, keyed by span count and overview span so they recompute only on change.
+    idle_gaps: ((usize, Ns, Ns), Vec<(Ns, Ns)>),
     forced_dark: Option<bool>,
     last_frame: Instant,
     last_poll: Instant,
@@ -311,6 +313,7 @@ impl TraceApp {
             notes: BTreeMap::new(),
             note,
             note_span: None,
+            idle_gaps: ((0, 0, 0), Vec::new()),
             forced_dark,
             last_frame: Instant::now(),
             last_poll: Instant::now(),
@@ -649,7 +652,12 @@ impl TraceApp {
         let Some(vp) = self.doc.as_ref().and_then(|d| d.viewport) else { return };
         let (a, b) = (vp.start_ns, vp.end_ns(g.tl_w as u16));
         let t = g.ov_t(x);
-        self.lens_drag = Some(match present::lens_grab(x, present::lens_rect(g.ov_x(a), g.ov_x(b), g.ov_w())) {
+        let grab = present::lens_grab(x, present::lens_rect(g.ov_x(a), g.ov_x(b), g.ov_w()));
+        if let (Grab::Outside, Some((_, end))) = (grab, g.squeeze.band_at(x)) {
+            self.skip_to(end, b - a, g.tl_w);
+            return;
+        }
+        self.lens_drag = Some(match grab {
             Grab::Start => LensDrag::Start,
             Grab::End => LensDrag::End,
             Grab::Inside => LensDrag::Move { grab_ns: t - a },
@@ -960,7 +968,7 @@ impl TraceApp {
         }
         root.on_action(cx.listener(|_, _: &About, window, cx| {
             let detail = format!("Version {}\nA waterfall of what your coding agents did, as it happens.", env!("CARGO_PKG_VERSION"));
-            drop(window.prompt(PromptLevel::Info, "Trace Waterfall", Some(&detail), &["OK"], cx));
+            drop(window.prompt(PromptLevel::Info, "Agents Trace Waterfall", Some(&detail), &["OK"], cx));
         }))
         .on_action(cx.listener(|this, _: &Import, _, cx| this.prompt_import(cx)))
         .on_action(cx.listener(|this, _: &ExportSession, _, cx| {
@@ -1011,6 +1019,22 @@ impl TraceApp {
             }
         }))
         .on_action(cx.listener(|this, _: &AddNote, window, cx| this.edit_note(window, cx)))
+        .on_action(cx.listener(|this, _: &NextActivity, _, cx| {
+            this.skip_idle(true);
+            cx.notify();
+        }))
+        .on_action(cx.listener(|this, _: &PrevActivity, _, cx| {
+            this.skip_idle(false);
+            cx.notify();
+        }))
+        .on_action(cx.listener(|this, _: &CollapseAll, _, cx| {
+            this.fold_all_spans(true);
+            cx.notify();
+        }))
+        .on_action(cx.listener(|this, _: &ExpandAll, _, cx| {
+            this.fold_all_spans(false);
+            cx.notify();
+        }))
         .on_action(cx.listener(|this, _: &ZoomToSpan, _, cx| {
             if let Some(s) = span(this) {
                 this.zoom_to_span(&s.span_id);
@@ -1249,7 +1273,10 @@ impl TraceApp {
                 }
                 MenuTarget::Folder { key, path } => {
                     let (reveal, copy) = (path.clone(), path.clone());
-                    let menu = menu.item(act("Collapse All Others", Box::new(move |this, _, _| this.collapse_others(&key))));
+                    let menu = menu
+                        .item(act("Collapse All Others", Box::new(move |this, _, _| this.collapse_others(&key))))
+                        .item(act("Collapse All", Box::new(|this, _, _| this.fold_all_folders(true))))
+                        .item(act("Expand All", Box::new(|this, _, _| this.fold_all_folders(false))));
                     if path.is_empty() {
                         return menu;
                     }
@@ -1280,7 +1307,26 @@ impl TraceApp {
                         .child(Input::new(&self.session_search).tab_index(TAB_SIDEBAR).appearance(false).small().prefix(Icon::new(IconName::Search).size(px(13.)).text_color(pal.muted))),
                 ),
             )
-            .child(div().px(px(14.)).pt(px(6.)).pb(px(2.)).child(self.render_mode_switch(pal, cx)))
+            .child(
+                div()
+                    .px(px(14.))
+                    .pt(px(6.))
+                    .pb(px(2.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().flex_1().child(self.render_mode_switch(pal, cx)))
+                    .when(self.sidebar.mode == SidebarMode::Workspaces, |el| {
+                        let folded = self.folders_all_folded();
+                        el.child(
+                            fold_all_button("fold-folders", folded, if folded { "Expand all workspaces" } else { "Collapse all workspaces" }, pal, pal.tray, TAB_SIDEBAR)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.fold_all_folders(!folded);
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
             .child(list)
             .child(
                 div().px(px(14.)).pb(px(14.)).pt(px(6.)).child(
@@ -1394,6 +1440,41 @@ impl TraceApp {
     }
 
     /// Collapses every other header at the same level as `key`, and opens `key`.
+    /// Moves a window of `len` so the activity after `end`, the end of an idle stretch, starts near its left edge.
+    fn skip_to(&mut self, end: Ns, len: Ns, tl_w: f32) {
+        let a = end - len / 20;
+        self.set_window(a, a + len, tl_w);
+    }
+
+    /// Next or Previous Activity: jumps the timeline across the nearest idle stretch at the same zoom.
+    fn skip_idle(&mut self, forward: bool) {
+        let Some(doc) = &self.doc else { return };
+        let (Some(vp), tl_w) = (doc.viewport, doc.timeline_width) else { return };
+        let len = vp.end_ns(tl_w) - vp.start_ns;
+        if let Some(a) = present::skip_idle(&self.idle_gaps.1, vp.start_ns, len, forward) {
+            self.set_window(a, a + len, f32::from(tl_w));
+        }
+    }
+
+    /// Folds or unfolds every span in the open trace, without the per-branch animation.
+    fn fold_all_spans(&mut self, fold: bool) {
+        let Some(doc) = &mut self.doc else { return };
+        self.fold_anim = None;
+        doc.fold_all(fold);
+        self.list.scroll_to_item(doc.selected_row, ScrollStrategy::Nearest);
+    }
+
+    fn folders_all_folded(&self) -> bool {
+        folder_keys(&self.sessions, |_| true).iter().all(|k| self.sidebar.collapsed.contains(k))
+    }
+
+    /// Collapses or expands every workspace and project in the sidebar.
+    fn fold_all_folders(&mut self, fold: bool) {
+        self.sidebar.collapsed = if fold { folder_keys(&self.sessions, |_| true).into_iter().collect() } else { HashSet::new() };
+        self.sidebar.turned = None;
+        self.sidebar.save();
+    }
+
     fn collapse_others(&mut self, key: &str) {
         let level = &key[..2];
         let all = folder_keys(&self.sessions, |_| true);
@@ -1788,7 +1869,7 @@ impl TraceApp {
             .pl(px(6. + inset))
             .pr(px(6.))
             .child(Icon::new(IconName::Sparkle).size(px(16.)).text_color(pal.accent))
-            .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).text_color(pal.ink).child("Trace"))
+            .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).text_color(pal.ink).child("Agents Trace Waterfall"))
             .child(
                 div()
                     .flex_1()
@@ -1801,6 +1882,22 @@ impl TraceApp {
             )
             .child(right)
     }
+}
+
+/// A 24pt icon button that collapses everything, or expands everything once it is all collapsed.
+fn fold_all_button(id: &'static str, folded: bool, tip: &'static str, pal: &Palette, surface: Hsla, order: isize) -> Stateful<Div> {
+    focusable(div().id(id), pal, surface, order)
+        .role(Role::Button)
+        .aria_label(tip.split("  ").next().unwrap_or(tip).to_owned())
+        .tooltip(move |w, cx| Tooltip::new(tip).build(w, cx))
+        .size(px(24.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(7.))
+        .cursor_pointer()
+        .hover(|st| st.bg(pal.hover.opacity(4.)))
+        .child(Icon::new(if folded { IconName::ChevronsUpDown } else { IconName::ChevronsDownUp }).size(px(14.)).text_color(pal.muted))
 }
 
 fn tool_button(id: &'static str, icon: IconName, label: Option<&str>, on: bool, pal: &Palette) -> Stateful<Div> {
@@ -1878,7 +1975,16 @@ impl TraceApp {
         let origin = overview.0;
         let live = matches!(doc.mode, Mode::Live { .. });
         let following = matches!(doc.mode, Mode::Live { following: true, .. }) && now_visible(doc);
-        Some(Geo { left: card_left + 1., name_w, tl_w, vp, now: doc.now, origin, overview, end: shown_end(doc), following, idle: idle_at, live })
+        // Replay projects only the past, so everything after the clock would read as idle.
+        let key = (doc.state.spans.len(), overview.0, overview.1 / 1_000_000_000);
+        if matches!(doc.mode, Mode::Replay { .. }) {
+            self.idle_gaps = (key, Vec::new());
+        } else if self.idle_gaps.0 != key {
+            self.idle_gaps = (key, present::idle_gaps(&doc.state, overview, shown_end(doc), doc.now));
+        }
+        let ov_w = if idle_at.is_some() { tl_w - IDLE_MARK_W } else { tl_w };
+        let squeeze = present::Squeeze::new(overview, ov_w, &self.idle_gaps.1);
+        Some(Geo { left: card_left + 1., name_w, tl_w, vp, now: doc.now, origin, overview, end: shown_end(doc), following, idle: idle_at, live, squeeze })
     }
 
     fn render_card(&mut self, pal: &Palette, vw: f32, card_left: f32, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1889,9 +1995,13 @@ impl TraceApp {
         let show_now = !matches!(doc.mode, Mode::Static);
         let now_x = g.x(g.now);
         let count = doc.rows.len();
-        let grid = div().absolute().inset_0().children(ticks.iter().map(|(t, _)| {
-            div().absolute().top_0().bottom_0().left(px(g.name_w + g.x(*t).round())).w(px(1.)).bg(pal.grid)
-        }));
+        let grid = div()
+            .absolute()
+            .inset_0()
+            .children(self.idle_in_view(&g).into_iter().map(|(_, _, x0, x1)| {
+                div().absolute().top_0().bottom_0().left(px(g.name_w + x0)).w(px(x1 - x0)).bg(pal.wash).border_l_1().border_r_1().border_color(pal.line)
+            }))
+            .children(ticks.iter().map(|(t, _)| div().absolute().top_0().bottom_0().left(px(g.name_w + g.x(*t).round())).w(px(1.)).bg(pal.grid)));
         let axis_right = g.name_w + g.tl_w + TL_PAD_R;
         let tick_x: Vec<f32> = ticks.iter().map(|(t, l)| present::tick_label_x(g.name_w + g.x(*t).round(), text_width(window, l, 11.), axis_right)).collect();
         let axis = div()
@@ -1901,6 +2011,16 @@ impl TraceApp {
             .border_b_1()
             .border_color(pal.line)
             .child(div().absolute().left(px(16.)).top_0().h_full().flex().items_center().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(pal.muted).child("Span"))
+            .child({
+                let folded = doc.all_folded();
+                let tip = if folded { "Expand all  ⌥⌘→" } else { "Collapse all  ⌥⌘←" };
+                div().absolute().left(px(g.name_w - 34.)).top(px((AXIS_H - 24.) / 2.)).child(
+                    fold_all_button("fold-spans", folded, tip, pal, pal.card, TAB_CARD).on_click(cx.listener(move |this, _, _, cx| {
+                        this.fold_all_spans(!folded);
+                        cx.notify();
+                    })),
+                )
+            })
             .children(ticks.iter().zip(tick_x).map(|((_, l), x)| {
                 div()
                     .absolute()
@@ -2033,6 +2153,8 @@ impl TraceApp {
                 .menu(if noted { "Edit Note" } else { "Add Note" }, Box::new(AddNote))
                 .menu("Zoom to Fit", Box::new(ZoomToSpan))
                 .menu_with_disabled(if collapsed { "Expand Branch" } else { "Collapse Branch" }, Box::new(ToggleBranch), !branch)
+                .menu("Collapse All", Box::new(CollapseAll))
+                .menu("Expand All", Box::new(ExpandAll))
                 .separator()
                 .menu("Copy Span Name", Box::new(CopySpanName))
                 .menu("Copy Span JSON", Box::new(CopySpanJson))
@@ -2068,8 +2190,74 @@ impl TraceApp {
                 el.child(div().absolute().top(px(top - 3.)).left(px(x - 3. + 0.5)).size(px(6.)).rounded_full().bg(pal.accent))
                     .child(div().absolute().top(px(top - 10.)).bottom(px(0.)).left(px(x)).w(px(1.)).bg(pal.now).h(px(10.)))
             })
+            .children(self.render_idle_bands(pal, &g, cx))
             .children(transport)
             .children(popover)
+    }
+
+    /// Idle stretches wide enough in view to mark: index, the stretch, and its x range on the timeline.
+    fn idle_in_view(&self, g: &Geo) -> Vec<(usize, (Ns, Ns), f32, f32)> {
+        let (a, b) = g.window();
+        self.idle_gaps
+            .1
+            .iter()
+            .enumerate()
+            .filter(|(_, (g0, g1))| *g1 > a && *g0 < b)
+            .map(|(i, &(g0, g1))| (i, (g0, g1), g.x(g0).max(0.), g.x(g1).min(g.tl_w)))
+            .filter(|(.., x0, x1)| x1 - x0 >= 120.)
+            .collect()
+    }
+
+    /// Over each idle band, which the grid draws beneath the rows: how long nothing ran and a button that
+    /// skips past it.
+    fn render_idle_bands(&self, pal: &Palette, g: &Geo, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let (a, b) = g.window();
+        let (len, tl_w) = (b - a, g.tl_w);
+        let top = STATS_H + OVERVIEW_H + AXIS_H;
+        self.idle_in_view(g)
+            .into_iter()
+            .map(|(i, (g0, g1), x0, x1)| {
+                let idle = format_duration(g1 - g0);
+                div()
+                    .absolute()
+                    .top(px(top + 10.))
+                    .left(px(1. + g.name_w + x0))
+                    .w(px(x1 - x0))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id(("skip-idle", i))
+                            .occlude()
+                            .h(px(26.))
+                            .px(px(10.))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .rounded_full()
+                            .bg(pal.card)
+                            .border_1()
+                            .border_color(pal.line)
+                            .shadow(vec![soft_shadow(pal, 0.06, 1., 3.)])
+                            .text_size(px(12.))
+                            .font_features(tnum())
+                            .cursor_pointer()
+                            .hover(|st| st.bg(pal.wash))
+                            .role(Role::Button)
+                            .aria_label(format!("{idle} idle, skip"))
+                            .child(div().text_color(pal.muted).child(format!("{idle} idle")))
+                            .child(div().font_weight(FontWeight::MEDIUM).text_color(pal.text).child("Skip"))
+                            .child(Icon::new(IconName::ChevronsRight).size(px(13.)).text_color(pal.text))
+                            .tooltip(|w, cx| Tooltip::new("Jump to the next activity  ⌥⌘]").build(w, cx))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.skip_to(g1, len, tl_w);
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect()
     }
 
     /// While a fold animates, the visible rows as a stack whose hidden or shown rows grow or shrink
@@ -2143,7 +2331,12 @@ impl TraceApp {
         let (lx0, lx1) = present::lens_rect(g.ov_x(a), g.ov_x(b), ov_w);
         let thin = g.ov_x(b) - g.ov_x(a) < present::LENS_MIN;
         let this = cx.entity().downgrade();
+        let sq = g.squeeze;
+        let band_fill = pal.line.opacity(if pal.dark { 0.5 } else { 0.35 });
         let strip = canvas(|_, _, _| {}, move |bounds, _, window, _| {
+            for &(g0, _) in sq.gaps() {
+                window.paint_quad(fill(Bounds::new(point(bounds.origin.x + px(sq.x(g0)), bounds.origin.y + px(3.)), size(px(sq.gap_w), bounds.size.height - px(6.))), band_fill));
+            }
             let top = bounds.origin.y + (bounds.size.height - px(LANES_H)) / 2. + px(RUG / 2. + 1.);
             for (x, y, h, color) in &marks {
                 window.paint_quad(fill(Bounds::new(point(bounds.origin.x + px(*x), top + px(*y)), size(px(1.), px(*h))), *color));
@@ -2284,6 +2477,24 @@ impl TraceApp {
                             .when(!thin, |el| el.justify_between().child(grip(pal.faint)).child(grip(pal.faint))),
                     )
                     .child(strip.absolute().top_0().bottom_0().left_0().w(px(ov_w)))
+                    .children(g.squeeze.gaps().iter().enumerate().map(|(i, &(g0, g1))| {
+                        let tip = format!("{} idle. Click to skip it.", format_duration(g1 - g0));
+                        div()
+                            .id(("ov-gap", i))
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(px(g.squeeze.x(g0)))
+                            .w(px(g.squeeze.gap_w))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(9.5))
+                            .font_features(tnum())
+                            .text_color(pal.muted)
+                            .when(g.squeeze.gap_w >= 20., |el| el.child(present::compact_duration(g1 - g0)))
+                            .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                    }))
                     .children(idle_mark),
             )
     }

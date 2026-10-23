@@ -223,6 +223,27 @@ impl TraceDoc {
     }
 
     /// Expands every descendant if any is collapsed, else collapses them all. Stops after EXPAND_ALL_LIMIT spans.
+    /// Whether every branch is folded.
+    pub fn all_folded(&self) -> bool {
+        self.state.spans.keys().all(|id| self.state.children(id).is_empty() || self.collapsed.contains(id))
+    }
+
+    /// Folds or unfolds every branch. Folding moves the selection up to its top-level span, which stays in view.
+    pub fn fold_all(&mut self, fold: bool) {
+        if !fold {
+            self.collapsed.clear();
+        } else {
+            self.collapsed = self.state.spans.keys().filter(|id| !self.state.children(id).is_empty()).cloned().collect();
+            if let Some(mut id) = self.selected.clone() {
+                while let Some(p) = self.state.spans.get(&id).and_then(|s| s.parent_span_id.clone()).filter(|p| self.state.spans.contains_key(p)) {
+                    id = p;
+                }
+                self.selected = Some(id);
+            }
+        }
+        self.refresh();
+    }
+
     pub fn toggle_descendants(&mut self) -> Option<String> {
         let id = self.selected.clone()?;
         let mut subtree = vec![id];

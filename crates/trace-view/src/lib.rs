@@ -3,7 +3,11 @@
 //! a viewport "cell" is whatever unit the frontend draws in (terminal columns, pixels).
 
 mod doc;
+mod idle;
+mod names;
 
+pub use idle::{IDLE_GAP_MIN, MAX_GAPS, idle_gaps, skip_idle};
+pub use names::{detail, harness_label, harness_name, kind_label, mcp_parts, pretty_model, title, top_model};
 pub use doc::{EXPAND_ALL_LIMIT, Mode, TraceDoc, export_span, matcher, resolve_session, wall_ns, write_private};
 use std::collections::HashSet;
 use trace_core::{Ns, Span, SpanId, TraceState};

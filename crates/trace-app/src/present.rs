@@ -2,9 +2,9 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::{Hsla, rgb};
-use std::collections::HashMap;
-use trace_core::{Ns, Session, SessionStatus, Span, SpanKind, SpanStatus, Totals, TraceState};
+use trace_core::{Ns, SessionStatus, Span, SpanKind, SpanStatus, Totals, TraceState};
 use trace_storage::SessionSummary;
+pub use trace_view::{MAX_GAPS, detail, harness_label, harness_name, idle_gaps, kind_label, mcp_parts, pretty_model, skip_idle, title, top_model};
 use trace_view::{Row, format_cost, format_duration, format_tokens};
 
 /// Which palette column a span paints with.
@@ -140,60 +140,35 @@ impl Brand {
     }
 }
 
-/// A known harness's logo and name: `Claude-Code` and `claudecode` both read as Claude Code.
-fn known_harness(h: &str) -> Option<(Logo, &'static str)> {
-    let key: String = h.chars().filter(|c| !matches!(c, '-' | '_' | ' ')).flat_map(char::to_lowercase).collect();
-    Some(match key.as_str() {
-        "claudecode" => (Logo::ClaudeCode, "Claude Code"),
-        "codex" => (Logo::Codex, "Codex"),
-        "cursor" => (Logo::Cursor, "Cursor"),
-        "geminicli" => (Logo::GeminiCli, "Gemini CLI"),
-        "copilot" | "githubcopilot" => (Logo::Copilot, "GitHub Copilot"),
-        "windsurf" => (Logo::Windsurf, "Windsurf"),
-        "cline" => (Logo::Cline, "Cline"),
-        "roo" | "roocode" => (Logo::RooCode, "Roo Code"),
-        "kilo" | "kilocode" => (Logo::KiloCode, "Kilo Code"),
-        "opencode" => (Logo::OpenCode, "OpenCode"),
-        "amp" => (Logo::Amp, "Amp"),
-        "goose" => (Logo::Goose, "Goose"),
-        "trae" => (Logo::Trae, "Trae"),
-        "kiro" => (Logo::Kiro, "Kiro"),
-        "openhands" => (Logo::OpenHands, "OpenHands"),
-        "junie" => (Logo::Junie, "Junie"),
-        "devin" => (Logo::Devin, "Devin"),
-        _ => return None,
-    })
-}
 
 /// The harness logo for a session, from its harness or else its source adapter.
 pub fn harness_brand(harness: &str, source_adapter: &str) -> Option<Brand> {
-    known_harness(harness).or_else(|| known_harness(source_adapter)).map(|(logo, _)| Brand::plain(logo))
+    let logo = match harness_name(harness, source_adapter)? {
+        "Claude Code" => Logo::ClaudeCode,
+        "Codex" => Logo::Codex,
+        "Cursor" => Logo::Cursor,
+        "Gemini CLI" => Logo::GeminiCli,
+        "GitHub Copilot" => Logo::Copilot,
+        "Windsurf" => Logo::Windsurf,
+        "Cline" => Logo::Cline,
+        "Roo Code" => Logo::RooCode,
+        "Kilo Code" => Logo::KiloCode,
+        "OpenCode" => Logo::OpenCode,
+        "Amp" => Logo::Amp,
+        "Goose" => Logo::Goose,
+        "Trae" => Logo::Trae,
+        "Kiro" => Logo::Kiro,
+        "OpenHands" => Logo::OpenHands,
+        "Junie" => Logo::Junie,
+        "Devin" => Logo::Devin,
+        _ => return None,
+    };
+    Some(Brand::plain(logo))
 }
 
-/// A known harness's proper name, from the session's harness or else its source adapter.
-pub fn harness_name(harness: &str, source_adapter: &str) -> Option<&'static str> {
-    known_harness(harness).or_else(|| known_harness(source_adapter)).map(|(_, name)| name)
-}
 
-/// How a session's harness reads: its proper name when known, `Claude Code`, else as recorded.
-pub fn harness_label(harness: &str, source_adapter: &str) -> Option<String> {
-    harness_name(harness, source_adapter).map(str::to_owned).or_else(|| Some(capitalize(harness)).filter(|h| !h.is_empty()))
-}
 
-/// `turn 1` → `Turn 1`.
-fn capitalize(s: &str) -> String {
-    let mut c = s.chars();
-    c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
-}
 
-/// The trace's most used LLM model, prettified; ties go to the alphabetically first.
-pub fn top_model(state: &TraceState) -> Option<String> {
-    let mut models: HashMap<&str, usize> = HashMap::new();
-    for m in state.spans.values().filter(|x| x.kind == SpanKind::Llm).filter_map(|x| x.model.as_deref()) {
-        *models.entry(m).or_default() += 1;
-    }
-    models.into_iter().max_by_key(|&(m, n)| (n, std::cmp::Reverse(m))).map(|(m, _)| pretty_model(m))
-}
 
 /// The model vendor's logo, by model prefix, else by provider.
 pub fn vendor_brand(model: Option<&str>, provider: Option<&str>) -> Option<Brand> {
@@ -395,68 +370,10 @@ fn words(s: &str) -> Vec<String> {
     out
 }
 
-/// `claude-opus-5-5` → `Opus 5.5`, `claude-3-5-sonnet-20241022` → `Sonnet 3.5`. Other models pass through.
-pub fn pretty_model(model: &str) -> String {
-    let base = model.split('[').next().unwrap_or(model);
-    let base = base.rsplit('/').next().unwrap_or(base);
-    if let Some(v) = base.strip_prefix("gpt-") {
-        return format!("GPT-{v}");
-    }
-    if let Some(rest) = base.strip_prefix("gemini-") {
-        let words: Vec<String> = rest.split('-').map(|w| w[..1].to_uppercase() + &w[1..]).collect();
-        return format!("Gemini {}", words.join(" "));
-    }
-    let Some(rest) = base.strip_prefix("claude-") else { return model.to_owned() };
-    let parts: Vec<&str> = rest.split('-').collect();
-    let Some(family) = parts.iter().find(|p| matches!(**p, "opus" | "sonnet" | "haiku")) else { return model.to_owned() };
-    let version: Vec<&str> = parts.iter().copied().filter(|p| p.len() <= 2 && p.chars().all(|c| c.is_ascii_digit())).collect();
-    let mut name = family[..1].to_uppercase() + &family[1..];
-    if !version.is_empty() {
-        name = format!("{name} {}", version.join("."));
-    }
-    name
-}
 
-/// The muted text after a span's title. The agent's is the model it ran on.
-pub fn detail(s: &Span, state: &TraceState) -> Option<String> {
-    let nonempty = |v: Option<&str>| v.filter(|v| !v.is_empty()).map(str::to_owned);
-    match s.kind {
-        SpanKind::Llm => s.model.as_deref().map(pretty_model).or_else(|| nonempty(s.provider.as_deref())),
-        SpanKind::Tool if mcp_parts(&s.name).is_some() => mcp_parts(&s.name).map(|(_, server)| server.to_owned()),
-        SpanKind::Tool => nonempty(s.tool_name.as_deref())
-            .filter(|t| !t.eq_ignore_ascii_case(&s.name))
-            .or_else(|| nonempty(s.provider.as_deref())),
-        SpanKind::Agent => top_model(state),
-        SpanKind::Subagent => s.model.as_deref().map(pretty_model).or_else(|| nonempty(s.agent_name.as_deref()).map(short_id)),
-        _ => None,
-    }
-}
 
-/// Opaque hex ids (harness agent ids) shorten to 7 characters, like git hashes; names are capitalized.
-fn short_id(v: String) -> String {
-    if v.len() > 12 && v.chars().all(|c| c.is_ascii_hexdigit()) { v[..7].to_owned() } else { capitalize(&v) }
-}
 
-/// The row title. An LLM span named after its model reads `LLM call`, since the detail already names the model.
-/// An MCP tool name, `mcp__server__tool`, reads as the tool with the server as its detail. The agent reads
-/// as its harness, `Claude Code`, else its own name.
-pub fn title(s: &Span, session: &Session) -> String {
-    let generic = matches!(s.name.to_lowercase().replace(['_', '-'], " ").as_str(), "llm" | "llm call");
-    match s.kind {
-        SpanKind::Llm if generic || s.model.as_deref() == Some(&s.name) => kind_label(SpanKind::Llm).to_owned(),
-        SpanKind::Agent => harness_name(&session.harness, &session.source_adapter)
-            .map(str::to_owned)
-            .unwrap_or_else(|| capitalize(s.agent_name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&s.name))),
-        SpanKind::Turn => capitalize(&s.name),
-        _ => mcp_parts(&s.name).map_or_else(|| s.name.clone(), |(tool, _)| tool.to_owned()),
-    }
-}
 
-/// `mcp__github__create_issue` → `(create_issue, github)`.
-pub fn mcp_parts(name: &str) -> Option<(&str, &str)> {
-    let (server, tool) = name.strip_prefix("mcp__")?.split_once("__")?;
-    (!server.is_empty() && !tool.is_empty()).then_some((tool, server))
-}
 
 /// Keeps both ends of a long name, which is where paths and tool names differ: `read_project_fi…_config.json`.
 pub fn middle_truncate(s: &str, max: usize) -> String {
@@ -534,7 +451,89 @@ pub fn session_duration(started: Option<Ns>, ended: Option<Ns>, last_event: Opti
     Some((end - start).max(0))
 }
 
-/// The overview's right-edge marker while a live session is idle: the gap from its last activity to now.
+
+
+/// The overview's time scale with each idle stretch squeezed to a narrow band, so a two-week session's
+/// bursts of work get the width instead of the nights between them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Squeeze {
+    a: Ns,
+    b: Ns,
+    pub gap_w: f32,
+    /// Strip pixels per nanosecond of activity.
+    k: f64,
+    gaps: [(Ns, Ns); MAX_GAPS],
+    n: usize,
+}
+
+impl Squeeze {
+    pub const GAP_W: f32 = 28.;
+
+    pub fn new((a, b): (Ns, Ns), w: f32, gaps: &[(Ns, Ns)]) -> Self {
+        let n = gaps.len().min(MAX_GAPS);
+        let mut arr = [(0, 0); MAX_GAPS];
+        arr[..n].copy_from_slice(&gaps[..n]);
+        // Bands take at most 40% of the strip.
+        let gap_w = if n == 0 { 0. } else { Self::GAP_W.min(w * 0.4 / n as f32) };
+        let active = ((b - a) - arr[..n].iter().map(|(x, y)| y - x).sum::<Ns>()).max(1);
+        Self { a, b, gap_w, k: f64::from(w - n as f32 * gap_w) / active as f64, gaps: arr, n }
+    }
+
+    pub fn gaps(&self) -> &[(Ns, Ns)] {
+        &self.gaps[..self.n]
+    }
+
+    /// Strip x of `t`, pinned to the strip: a window running past the session's ends stops at its edges.
+    pub fn x(&self, t: Ns) -> f32 {
+        let t = t.clamp(self.a, self.b);
+        let (mut x, mut from) = (0f64, self.a);
+        for &(g0, g1) in self.gaps() {
+            if t < g0 {
+                break;
+            }
+            x += (g0 - from) as f64 * self.k;
+            if t < g1 {
+                return (x + (t - g0) as f64 / (g1 - g0) as f64 * f64::from(self.gap_w)) as f32;
+            }
+            x += f64::from(self.gap_w);
+            from = g1;
+        }
+        (x + (t - from) as f64 * self.k) as f32
+    }
+
+    pub fn t(&self, x: f32) -> Ns {
+        let (x, mut x0, mut from) = (f64::from(x), 0f64, self.a);
+        for &(g0, g1) in self.gaps() {
+            let band = x0 + (g0 - from) as f64 * self.k;
+            if x < band {
+                break;
+            }
+            if x < band + f64::from(self.gap_w) {
+                return g0 + ((x - band) / f64::from(self.gap_w) * (g1 - g0) as f64) as Ns;
+            }
+            x0 = band + f64::from(self.gap_w);
+            from = g1;
+        }
+        from + ((x - x0) / self.k) as Ns
+    }
+
+    /// The idle stretch whose band holds strip x.
+    pub fn band_at(&self, x: f32) -> Option<(Ns, Ns)> {
+        self.gaps().iter().copied().find(|&(g0, _)| (0. ..self.gap_w).contains(&(x - self.x(g0))))
+    }
+}
+
+
+/// `47h`, `3d`, `35m`: an idle band's label in the few points it has.
+pub fn compact_duration(ns: Ns) -> String {
+    let m = ns / 60_000_000_000;
+    match m {
+        m if m >= 48 * 60 => format!("{}d", m / (24 * 60)),
+        m if m >= 60 => format!("{}h", m / 60),
+        m => format!("{m}m"),
+    }
+}
+
 pub fn idle_gap(last: Ns, now: Ns) -> String {
     format!("+{} idle", format_duration(now - last))
 }
@@ -726,17 +725,6 @@ pub fn lens_grab(x: f32, lens: (f32, f32)) -> Grab {
     }
 }
 
-pub fn kind_label(k: SpanKind) -> &'static str {
-    match k {
-        SpanKind::Agent => "Agent",
-        SpanKind::Turn => "Turn",
-        SpanKind::Llm => "LLM call",
-        SpanKind::Tool => "Tool call",
-        SpanKind::Subagent => "Sub-agent",
-        SpanKind::Wait => "Wait",
-        SpanKind::Custom => "Span",
-    }
-}
 
 /// `6.9s · $0.12`. `rollup` is the span's subtree totals, so a parent reads what its whole branch billed;
 /// the cost part shows only when some of it is known.
@@ -805,7 +793,9 @@ pub fn focus_turn(state: &TraceState, ns_per_px: f64) -> Option<&Span> {
     if median as f64 / ns_per_px >= 2.0 {
         return None;
     }
-    state.spans.values().filter(|s| s.kind == SpanKind::Turn).max_by(|a, b| (a.started_at_utc_ns, &a.span_id).cmp(&(b.started_at_utc_ns, &b.span_id)))
+    // A turn that ended the instant it began, as a session's last one often does, would focus a 1ns window.
+    let end = state.session.ended_at_utc_ns;
+    state.spans.values().filter(|s| s.kind == SpanKind::Turn && s.effective_end(end, Ns::MAX) > s.started_at_utc_ns).max_by(|a, b| (a.started_at_utc_ns, &a.span_id).cmp(&(b.started_at_utc_ns, &b.span_id)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1167,11 +1157,6 @@ mod tests {
         );
         assert_eq!([Change::Stay, Change::Enter, Change::Leave].map(|c| c.scale(0.25)), [1.0, 0.25, 0.75]);
     }
-    #[test]
-    fn opaque_agent_ids_shorten_but_names_do_not() {
-        assert_eq!(super::short_id("a000974c519f6187a".into()), "a000974");
-        assert_eq!(super::short_id("explorer".into()), "Explorer");
-    }
 
     use super::*;
     use serde_json::json;
@@ -1402,6 +1387,37 @@ mod tests {
     }
 
     #[test]
+    fn idle_stretches_squeeze_and_skip() {
+        const H: Ns = 3_600_000 * MS;
+        let mut events = vec![ev(1, 0, None, json!({"event_type": "session.started", "body": {"project_id": "p"}})), start(2, 0, "root", None, json!({"kind": "agent"}))];
+        // Two bursts of work ten hours apart; the agent span stays open across the night.
+        for (i, t) in [0, 10 * H].into_iter().enumerate() {
+            let id = format!("tool{i}");
+            events.push(start(10 + 2 * i as u64, t, &id, Some("root"), json!({"kind": "tool"})));
+            events.push(ev(11 + 2 * i as u64, t + H / 2, Some(&id), json!({"event_type": "span.ended", "body": {"status": "succeeded"}})));
+        }
+        let s = TraceState::from_events("s1".into(), &events);
+        let span = (0, 10 * H + H / 2);
+        let gaps = idle_gaps(&s, span, Some(span.1), span.1);
+        assert_eq!(gaps, [(H / 2, 10 * H)], "the open agent span does not hide the idle night");
+        let sq = Squeeze::new(span, 400., &gaps);
+        assert_eq!((sq.x(0), sq.x(span.1)), (0., 400.));
+        assert!((sq.x(H / 2) - 186.).abs() < 0.01, "each half hour of work gets half the room the band leaves: {}", sq.x(H / 2));
+        assert_eq!(sq.band_at(sq.x(H / 2) + 5.), Some(gaps[0]));
+        assert_eq!(sq.band_at(10.), None);
+        for t in [H / 4, 3 * H, 10 * H + H / 4] {
+            assert!((sq.t(sq.x(t)) - t).abs() < 1_000 * MS, "t(x(t)) round-trips within f32 pixels");
+        }
+        assert_eq!(Squeeze::new(span, 400., &[]).x(span.1 / 2), 200., "no idle stretches: linear");
+        assert_eq!((sq.x(-H), sq.x(50 * H)), (0., 400.), "times past the ends pin to the strip's edges");
+        let len = H;
+        assert_eq!(skip_idle(&gaps, 0, len, true), Some(10 * H - len / 20), "forward lands just before the next burst");
+        assert_eq!(skip_idle(&gaps, 10 * H - len / 20, len, true), None, "nothing idle after the last burst");
+        assert_eq!(skip_idle(&gaps, 10 * H - len / 20, len, false), Some(H / 2 + len / 20 - len), "back puts the previous burst's end near the right edge");
+        assert_eq!((compact_duration(9 * H + 30 * 60_000 * MS), compact_duration(72 * H), compact_duration(35 * 60_000 * MS)), ("9h".into(), "3d".into(), "35m".into()));
+    }
+
+    #[test]
     fn opens_on_the_latest_turn_only_when_bars_would_be_slivers() {
         let mut events = vec![
             ev(1, 0, None, json!({"event_type": "session.started", "body": {"project_id": "p"}})),
@@ -1417,6 +1433,15 @@ mod tests {
         let hour_over_1000px = 3_605_000.0 * MS as f64 / 1000.0;
         assert_eq!(focus_turn(&s, hour_over_1000px).map(|t| t.name.as_str()), Some("turn1"), "5s turns are 1.4px wide in an hour");
         assert!(focus_turn(&s, 10.0 * MS as f64).is_none(), "at 10ms/px a 5s turn is 500px: the fit is readable");
+        let t = 3_700_000 * MS;
+        events.push(start(40, t, "empty", Some("root"), json!({"kind": "turn"})));
+        events.push(ev(41, t, Some("empty"), json!({"event_type": "span.ended", "body": {"status": "succeeded"}})));
+        let s = TraceState::from_events("s1".into(), &events);
+        assert_eq!(focus_turn(&s, hour_over_1000px).map(|t| t.name.as_str()), Some("turn1"), "a zero-length last turn is skipped");
+        events.pop();
+        events.push(ev(41, t, None, json!({"event_type": "session.ended", "body": {"status": "interrupted"}})));
+        let s = TraceState::from_events("s1".into(), &events);
+        assert_eq!(focus_turn(&s, hour_over_1000px).map(|t| t.name.as_str()), Some("turn1"), "so is one left open when the session ended as it began");
     }
 
     #[test]

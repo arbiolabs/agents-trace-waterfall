@@ -117,22 +117,26 @@ fn main() -> anyhow::Result<()> {
             KeyBinding::new("cmd-+", ZoomIn, None),
             KeyBinding::new("cmd--", ZoomOut, None),
             KeyBinding::new("cmd-0", ZoomToFit, None),
+            KeyBinding::new("cmd-alt-left", CollapseAll, None),
+            KeyBinding::new("cmd-alt-right", ExpandAll, None),
             KeyBinding::new("cmd-shift-f", Follow, None),
             KeyBinding::new("cmd-r", Replay, None),
             KeyBinding::new("cmd-]", NextEvent, None),
             KeyBinding::new("cmd-[", PrevEvent, None),
+            KeyBinding::new("cmd-alt-]", NextActivity, None),
+            KeyBinding::new("cmd-alt-[", PrevActivity, None),
             KeyBinding::new("enter", Inspect, Some(ROWS_CONTEXT)),
             KeyBinding::new("n", AddNote, Some(ROWS_CONTEXT)),
             KeyBinding::new("cmd-c", CopySpanName, Some(ROWS_CONTEXT)),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.set_menus([
-            Menu::new("Trace Waterfall").items([
-                MenuItem::action("About Trace Waterfall", About),
+            Menu::new("Agents Trace Waterfall").items([
+                MenuItem::action("About Agents Trace Waterfall", About),
                 MenuItem::separator(),
                 MenuItem::os_submenu("Services", SystemMenuType::Services),
                 MenuItem::separator(),
-                MenuItem::action("Quit Trace Waterfall", Quit),
+                MenuItem::action("Quit Agents Trace Waterfall", Quit),
             ]),
             Menu::new("File").items([MenuItem::action("Import JSONL…", Import), MenuItem::action("Export Session…", ExportSession)]),
             Menu::new("View").items([
@@ -142,6 +146,9 @@ fn main() -> anyhow::Result<()> {
                 MenuItem::action("Zoom Out", ZoomOut),
                 MenuItem::action("Zoom to Fit", ZoomToFit),
                 MenuItem::separator(),
+                MenuItem::action("Collapse All Spans", CollapseAll),
+                MenuItem::action("Expand All Spans", ExpandAll),
+                MenuItem::separator(),
                 MenuItem::action("Follow", Follow),
             ]),
             Menu::new("Go").items([
@@ -149,13 +156,16 @@ fn main() -> anyhow::Result<()> {
                 MenuItem::separator(),
                 MenuItem::action("Next Event", NextEvent),
                 MenuItem::action("Previous Event", PrevEvent),
+                MenuItem::separator(),
+                MenuItem::action("Next Activity", NextActivity),
+                MenuItem::action("Previous Activity", PrevActivity),
             ]),
         ]);
         cx.on_window_closed(|cx, _| cx.quit()).detach();
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(window_bounds())),
             titlebar: Some(TitlebarOptions {
-                title: Some("Trace Waterfall".into()),
+                title: Some("Agents Trace Waterfall".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(18.), px(21.))),
             }),

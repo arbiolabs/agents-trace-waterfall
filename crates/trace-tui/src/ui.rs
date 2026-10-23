@@ -9,7 +9,7 @@ use ratatui::widgets::{
 };
 use trace_core::{CostProvenance, Ns, SLOWEST_DEFAULT_KINDS, SessionStatus, wire_name};
 use trace_render::{Glyphs, Theme, WaterfallState, WaterfallWidget};
-use trace_view::{Mode, TraceDoc, format_cost, format_duration, format_tokens};
+use trace_view::{Mode, TraceDoc, format_cost, format_duration, format_tokens, harness_label, pretty_model, title};
 
 const WIDE: u16 = 120;
 
@@ -35,6 +35,7 @@ pub fn render(app: &mut App, f: &mut Frame) {
         ),
     }
     let text = match (&app.prompt, &app.message) {
+        (Some(p), _) if app.note_prompt => format!("note: {p}▏  Enter save · Esc cancel · empty removes"),
         (Some(p), _) => format!("/{p}▏  Enter keep · Esc clear"),
         (None, Some(m)) => m.clone(),
         (None, None) => hints(app),
@@ -60,13 +61,13 @@ fn hints(app: &App) -> String {
                 }
                 (Focus::Timeline, _) => "h/l pan · j/k move · +/- zoom · Tab inspector · ? help",
                 (_, Mode::Live { .. }) => {
-                    "j/k h/l · Enter inspect · Space pause · f follow · +/- H/L · / search · e all · ? help"
+                    "j/k h/l · Enter inspect · Space pause · f follow · +/- H/L · / search · E fold all · n note · ? help"
                 }
                 (_, Mode::Replay { .. }) => {
                     "Space play · [ ] step · < > speed · H/L seek · Enter inspect · r exit replay · ? help"
                 }
                 (_, Mode::Static) => {
-                    "j/k h/l · Enter inspect · +/- H/L · / search · e all · r replay · s sessions · ? help"
+                    "j/k h/l · Enter inspect · +/- H/L · { } skip idle · E fold all · n note · r replay · ? help"
                 }
             };
             format!("{} │ {keys}", v.doc.status())
@@ -127,7 +128,7 @@ const SESSION_COLS: [Col; 10] = [
     col("", 1, false),
     col("id", 10, false),
     col("project", 14, false),
-    col("source", 14, true),
+    col("harness", 14, true),
     col("started", 19, true),
     col("dur", 7, false),
     col("model", 14, true),
@@ -149,10 +150,10 @@ fn sessions(app: &mut App, f: &mut Frame, area: Rect) {
             session_glyph(s.status, &app.theme).to_owned(),
             s.session_id.0.chars().take(10).collect(),
             s.project_id.clone(),
-            s.source_adapter.clone(),
+            harness_label(&s.harness, &s.source_adapter).unwrap_or_else(|| "—".into()),
             s.started_at_utc_ns.map_or("—".into(), utc),
             dur,
-            s.model.clone().unwrap_or_else(|| "—".into()),
+            s.model.as_deref().map_or_else(|| "—".into(), pretty_model),
             format!(
                 "{}/{}",
                 format_tokens(s.totals.tokens_input),
@@ -249,6 +250,7 @@ fn draw_waterfall(v: &mut View, theme: &Theme, buf: &mut Buffer, area: Rect, tre
     let vp = v
         .doc
         .layout(area.width.saturating_sub(tree_width.saturating_add(1)));
+    let idle = v.idle_gaps();
     let d = &v.doc;
     let mut wf = WaterfallState {
         offset: v.scroll,
@@ -263,6 +265,8 @@ fn draw_waterfall(v: &mut View, theme: &Theme, buf: &mut Buffer, area: Rect, tre
         theme,
         tree_width,
         focused: v.focus != Focus::Inspector,
+        notes: Some(&v.notes),
+        idle: &idle,
     };
     widget.render(area, buf, &mut wf);
     v.scroll = wf.offset;
@@ -344,7 +348,12 @@ fn inspector(v: &View, f: &mut Frame, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border)
         .title(Line::from(title));
-    let lines = inspector_lines(&v.doc, ins.tab);
+    let mut lines = inspector_lines(&v.doc, ins.tab);
+    if ins.tab == Tab::Overview
+        && let Some(note) = v.doc.selected.as_ref().and_then(|id| v.notes.get(id))
+    {
+        lines.insert(1, Line::from(format!("note      {note}")));
+    }
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -381,7 +390,8 @@ pub fn inspector_lines(v: &TraceDoc, tab: Tab) -> Vec<Line<'static>> {
                         None => format!("{p} (not arrived)"),
                     });
             out.extend([
-                format!("{}  [{} · {}]", s.name, wire_name(&s.kind), wire_name(&s.status)),
+                format!("{}  [{} · {}]", title(s, &st.session), wire_name(&s.kind), wire_name(&s.status)),
+                format!("name      {}", s.name),
                 format!("span      {}", s.span_id),
                 format!("parent    {parent}"),
                 format!(
@@ -513,6 +523,9 @@ Waterfall
   h/l ←/→      collapse / parent, expand / first child (Timeline focus: pan)
   g/G          first/last span
   e            toggle expansion of all descendants (up to 5000 spans)
+  E            collapse every branch / expand everything
+  { }          previous/next activity: jump across an idle stretch, keeping the zoom
+  n            add or edit the selected span's note (empty removes it)
   Enter        open inspector        Tab   cycle focus tree / timeline / inspector
   Esc          clear search, close inspector, back to sessions
   +/-          zoom in/out (anchored at selection, or now when following)

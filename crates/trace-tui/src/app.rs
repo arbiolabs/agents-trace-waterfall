@@ -1,12 +1,13 @@
 use base64::Engine;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::widgets::TableState;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
-use trace_core::{SessionId, SessionStatus};
+use trace_core::{Ns, SessionId, SessionStatus, SpanId};
 use trace_render::Theme;
 use trace_storage::{SessionFilter, SessionSummary, Store};
-use trace_view::{Mode, TraceDoc, export_span};
+use trace_view::{Mode, TraceDoc, Viewport, export_span, idle_gaps, skip_idle};
 const LIVE_TICK: Duration = Duration::from_millis(66);
 const SESSIONS_REFRESH: Duration = Duration::from_secs(1);
 const STATUS_FILTERS: [Option<SessionStatus>; 5] = [
@@ -70,15 +71,42 @@ pub struct View {
     pub scroll: usize,
     pub focus: Focus,
     pub inspector: Option<Inspector>,
+    /// The session's span notes, kept in step with the store.
+    pub notes: BTreeMap<SpanId, String>,
 }
 
 impl View {
-    fn new(doc: TraceDoc) -> Self {
+    fn new(doc: TraceDoc, store: &Store) -> Self {
+        let notes = store.annotations(doc.session_id()).unwrap_or_default();
         Self {
             doc,
             scroll: 0,
             focus: Focus::Tree,
             inspector: None,
+            notes,
+        }
+    }
+
+    /// Where nothing ran. Replay projects only the past, so it has none.
+    // ponytail: recomputed each frame; cache by span count if 10k-span sessions ever lag.
+    pub fn idle_gaps(&self) -> Vec<(Ns, Ns)> {
+        let d = &self.doc;
+        if matches!(d.mode, Mode::Replay { .. }) {
+            return Vec::new();
+        }
+        let end = d.state.session.ended_at_utc_ns;
+        idle_gaps(&d.state, (d.state.axis_start().unwrap_or(d.now), end.unwrap_or(d.now)), end, d.now)
+    }
+
+    /// Jumps the timeline across the nearest idle stretch, keeping the zoom.
+    fn skip_idle(&mut self, forward: bool) {
+        let gaps = self.idle_gaps();
+        let (Some(vp), w) = (self.doc.viewport, self.doc.timeline_width) else { return };
+        if let Some(start_ns) = skip_idle(&gaps, vp.start_ns, vp.end_ns(w) - vp.start_ns, forward) {
+            self.doc.viewport = Some(Viewport { start_ns, ..vp });
+            if let Mode::Live { following, .. } = &mut self.doc.mode {
+                *following = false;
+            }
         }
     }
 }
@@ -93,8 +121,10 @@ pub struct App {
     pub sessions: Vec<SessionSummary>,
     pub table: TableState,
     pub view: Option<View>,
-    /// Text being typed after `/`. Sessions: list filter. Waterfall: span search.
+    /// Text being typed after `/`. Sessions: list filter. Waterfall: span search, or the note with `note_prompt`.
     pub prompt: Option<String>,
+    /// The prompt edits the selected span's note, saved on Enter, instead of searching as you type.
+    pub note_prompt: bool,
     pub message: Option<String>,
     /// OSC52 sequence for the terminal loop to write to stdout.
     pub clipboard: Option<String>,
@@ -116,6 +146,7 @@ impl App {
             table: TableState::default().with_selected(0),
             view: None,
             prompt: None,
+            note_prompt: false,
             message: None,
             clipboard: None,
             quit: false,
@@ -133,14 +164,14 @@ impl App {
     }
 
     pub fn open(&mut self, id: SessionId) -> anyhow::Result<()> {
-        self.view = Some(View::new(TraceDoc::open(&self.store, id)?));
+        self.view = Some(View::new(TraceDoc::open(&self.store, id)?, &self.store));
         self.screen = Screen::Waterfall;
         Ok(())
     }
 
     pub fn open_replay(&mut self, id: SessionId, speed: f64, at_end: bool) -> anyhow::Result<()> {
         let doc = TraceDoc::open_replay(&self.store, id, speed, at_end)?;
-        self.view = Some(View::new(doc));
+        self.view = Some(View::new(doc, &self.store));
         self.screen = Screen::Waterfall;
         self.last_tick = Instant::now();
         Ok(())
@@ -216,6 +247,27 @@ impl App {
 
     fn prompt_key(&mut self, code: KeyCode) {
         let Some(buf) = &mut self.prompt else { return };
+        if self.note_prompt {
+            match code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => {
+                    let text = buf.clone();
+                    self.report(|a| a.save_note(&text));
+                }
+                KeyCode::Backspace => {
+                    buf.pop();
+                    return;
+                }
+                KeyCode::Char(c) => {
+                    buf.push(c);
+                    return;
+                }
+                _ => return,
+            }
+            self.prompt = None;
+            self.note_prompt = false;
+            return;
+        }
         match code {
             KeyCode::Esc => {
                 buf.clear();
@@ -234,6 +286,19 @@ impl App {
             _ => return,
         }
         self.apply_prompt();
+    }
+
+    /// Stores the selected span's note; blank text removes it.
+    fn save_note(&mut self, text: &str) -> anyhow::Result<()> {
+        let Some(v) = &mut self.view else { return Ok(()) };
+        let Some(id) = v.doc.selected.clone() else { return Ok(()) };
+        self.store.set_annotation(v.doc.session_id(), &id, text)?;
+        if text.trim().is_empty() {
+            v.notes.remove(&id);
+        } else {
+            v.notes.insert(id, text.to_owned());
+        }
+        Ok(())
     }
 
     fn apply_prompt(&mut self) {
@@ -330,6 +395,10 @@ impl App {
             KeyCode::Char('h') | KeyCode::Left => v.doc.left(),
             KeyCode::Char('l') | KeyCode::Right => v.doc.right(),
             KeyCode::Char('e') => self.message = v.doc.toggle_descendants(),
+            KeyCode::Char('E') => {
+                let fold = !v.doc.all_folded();
+                v.doc.fold_all(fold);
+            }
             KeyCode::Enter => {
                 v.inspector = Some(v.inspector.unwrap_or(Inspector {
                     tab: Tab::Overview,
@@ -363,8 +432,19 @@ impl App {
 
     /// Keys that work in every waterfall focus.
     fn common_key(&mut self, code: KeyCode) {
-        let Some(v) = &mut self.view else { return };
-        let v = &mut v.doc;
+        let Some(view) = &mut self.view else { return };
+        match code {
+            KeyCode::Char('n') => {
+                if let Some(id) = &view.doc.selected {
+                    self.prompt = Some(view.notes.get(id).cloned().unwrap_or_default());
+                    self.note_prompt = true;
+                }
+                return;
+            }
+            KeyCode::Char('{' | '}') => return view.skip_idle(code == KeyCode::Char('}')),
+            _ => {}
+        }
+        let v = &mut view.doc;
         match (code, &mut v.mode) {
             (KeyCode::Char('/'), _) => self.prompt = Some(v.search.clone()),
             (KeyCode::Char('+' | '='), _) => v.zoom(0.5),

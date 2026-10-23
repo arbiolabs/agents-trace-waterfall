@@ -1,4 +1,4 @@
-# agents-trace-waterfall
+# Agents Trace Waterfall
 
 A local-first terminal trace waterfall for coding agents. It shows runs, turns, LLM calls, tool calls, subagents, and waits on one shared time axis. You can watch a run live, browse it later, or replay it on a virtual clock.
 
@@ -32,8 +32,8 @@ trace-tui collector start --tail claude-code=$HOME/.claude/projects
 `agents-trace-waterfall` is a native macOS app built with GPUI and gpui-kit. It reads the same database as the TUI and follows the system light or dark appearance. See [docs/design.md](docs/design.md) for its design.
 
 ```sh
-scripts/bundle.sh                                       # builds target/release/Trace Waterfall.app with its icon
-open "target/release/Trace Waterfall.app"
+scripts/bundle.sh                                       # builds target/release/Agents Trace Waterfall.app with its icon
+open "target/release/Agents Trace Waterfall.app"
 ./target/release/agents-trace-waterfall                 # or run the binary directly
 ./target/release/agents-trace-waterfall --open 7ad34f22 # open a session by id prefix
 ```

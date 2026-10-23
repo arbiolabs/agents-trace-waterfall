@@ -272,7 +272,7 @@ fn renders_at_supported_sizes_with_footer() {
             s.last()
         );
         assert!(
-            s.iter().any(|l| l.contains("turn 1")),
+            s.iter().any(|l| l.contains("Turn 1")),
             "{w}x{h} shows span names"
         );
         assert!(
@@ -315,7 +315,7 @@ fn narrow_layout_tabs_between_full_width_views() {
     let mut app = opened(&sample());
     let s = screen(&mut app, 60, 18);
     assert!(
-        s[3].contains("turn 1") && s[3].contains("1.7s"),
+        s[3].contains("Turn 1") && s[3].contains("1.7s"),
         "tree view: {}",
         s[3]
     );
@@ -422,4 +422,29 @@ fn span_export_sanitizes_the_id_and_is_owner_only() {
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(back["span_id"], "../x/y");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn notes_save_from_the_prompt_and_fold_all_toggles() {
+    let mut app = opened(&sample());
+    press(&mut app, "jn");
+    press(&mut app, "flaky");
+    assert_eq!(doc(&app).search, "", "typing a note does not search");
+    key(&mut app, KeyCode::Enter);
+    let id = doc(&app).selected.clone().unwrap();
+    assert_eq!(app.view.as_ref().unwrap().notes.get(&id).map(String::as_str), Some("flaky"));
+    assert_eq!(app.store.annotations(&SessionId::from(SESSION)).unwrap().get(&id).map(String::as_str), Some("flaky"));
+    key(&mut app, KeyCode::Enter);
+    let s = screen(&mut app, 160, 45);
+    assert!(s.iter().any(|l| l.contains("note      flaky")), "the inspector shows the note");
+    key(&mut app, KeyCode::Esc);
+    press(&mut app, "n");
+    key(&mut app, KeyCode::Esc);
+    assert!(app.view.as_ref().unwrap().notes.contains_key(&id), "Esc cancels without touching the note");
+
+    press(&mut app, "E");
+    assert!(doc(&app).all_folded());
+    assert_eq!(row_names(&app), ["agent"]);
+    press(&mut app, "E");
+    assert!(!doc(&app).all_folded());
 }

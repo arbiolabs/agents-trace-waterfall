@@ -1,9 +1,9 @@
 #!/bin/sh
-# Builds target/release/Trace Waterfall.app: the desktop app as a proper macOS bundle with its icon.
+# Builds target/release/Agents Trace Waterfall.app: the desktop app as a proper macOS bundle with its icon.
 set -eu
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cargo build --release -p trace-app --manifest-path "$root/Cargo.toml"
-app="$root/target/release/Trace Waterfall.app"
+app="$root/target/release/Agents Trace Waterfall.app"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
@@ -14,8 +14,8 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>Trace Waterfall</string>
-  <key>CFBundleDisplayName</key><string>Trace Waterfall</string>
+  <key>CFBundleName</key><string>Agents Trace Waterfall</string>
+  <key>CFBundleDisplayName</key><string>Agents Trace Waterfall</string>
   <key>CFBundleIdentifier</key><string>dev.agents-trace-waterfall.app</string>
   <key>CFBundleExecutable</key><string>agents-trace-waterfall</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>

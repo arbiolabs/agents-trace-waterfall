@@ -4,8 +4,9 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::StatefulWidget;
-use trace_core::{Ns, SpanKind, SpanStatus, TraceState};
-use trace_view::{Row, RowKind, Viewport, bar_span, format_cost, format_duration, ticks};
+use std::collections::BTreeMap;
+use trace_core::{Ns, SpanId, SpanKind, SpanStatus, TraceState};
+use trace_view::{Row, RowKind, Viewport, bar_span, detail, format_cost, format_duration, ticks, title};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Glyphs {
@@ -104,6 +105,10 @@ pub struct WaterfallWidget<'a> {
     pub tree_width: u16,
     /// Unfocused selection is bold instead of reversed.
     pub focused: bool,
+    /// The user's span notes; a noted row carries a mark after its title.
+    pub notes: Option<&'a BTreeMap<SpanId, String>>,
+    /// Idle stretches, marked on the tick line where they fall in view.
+    pub idle: &'a [(Ns, Ns)],
 }
 
 impl StatefulWidget for WaterfallWidget<'_> {
@@ -135,6 +140,18 @@ impl StatefulWidget for WaterfallWidget<'_> {
             let x = tl_x + x;
             if x >= label_end {
                 label_end = buf.set_stringn(x, area.y, &label, usize::from(area.right() - x), Style::new().add_modifier(Modifier::DIM)).0 + 1;
+            }
+        }
+        let dim = Style::new().add_modifier(Modifier::DIM);
+        for &(g0, g1) in self.idle {
+            let Some((sx, ex)) = bar_span(g0, g1, &self.viewport, tl_w).filter(|(sx, ex)| ex - sx >= 3) else { continue };
+            for x in sx..ex {
+                buf[(tl_x + x, area.y)].set_char(th.pick('░', '.')).set_style(dim);
+            }
+            let label = format!(" {} idle ", format_duration(g1 - g0));
+            let lw = label.chars().count() as u16;
+            if lw <= ex - sx {
+                buf.set_string(tl_x + sx + (ex - sx - lw) / 2, area.y, &label, dim);
             }
         }
 
@@ -183,11 +200,18 @@ impl StatefulWidget for WaterfallWidget<'_> {
                 "",
                 kind_glyph(span.kind, th),
                 status_glyph(span.status, th),
-                span.name,
+                title(span, &self.state.session),
                 indent = usize::from(row.depth) * 2
             );
             let glyph_style = th.fg(if failed { FAILED } else { kind_color(span.kind) });
-            buf.set_stringn(area.x, y, &left, usize::from(name_w), Style::new());
+            let mut x = buf.set_stringn(area.x, y, &left, usize::from(name_w), Style::new()).0;
+            let room = |x: u16| usize::from((area.x + name_w).saturating_sub(x));
+            if self.notes.is_some_and(|n| n.contains_key(id)) {
+                x = buf.set_stringn(x, y, format!(" {}", th.pick('✎', '*')), room(x), dim).0;
+            }
+            if let Some(d) = detail(span, self.state) {
+                buf.set_stringn(x, y, format!(" {d}"), room(x), dim);
+            }
             let gx = area.x.saturating_add(row.depth.saturating_mul(2)) + 1;
             for x in gx..(gx + 2).min(area.x + name_w) {
                 buf[(x, y)].set_style(glyph_style);

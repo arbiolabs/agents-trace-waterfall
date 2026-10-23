@@ -176,3 +176,18 @@ fn tick_times_respect_a_pixel_gap() {
     let t = tick_times(&vp, 450.0, 0, 80.0);
     assert_eq!(t, vec![(0, "0s".to_string()), (10_000 * MS, "10s".into()), (20_000 * MS, "20s".into()), (30_000 * MS, "30s".into()), (40_000 * MS, "40s".into())]);
 }
+
+#[test]
+fn fold_all_hides_every_branch_and_keeps_the_selection_in_view() {
+    let mut doc = TraceDoc::new(sample(), Mode::Static, 0);
+    doc.refresh();
+    let i = doc.rows.iter().position(|r| r.kind == RowKind::Span("tool1".into())).unwrap();
+    doc.select(i);
+    doc.fold_all(true);
+    assert!(doc.all_folded());
+    assert_eq!(ids(&doc.state, &doc.rows), ["root", "<unresolved>", " orphan"]);
+    assert_eq!(doc.selected, Some("root".into()), "the selection climbs to what stays visible");
+    doc.fold_all(false);
+    assert!(!doc.all_folded());
+    assert_eq!(doc.rows.len(), 6);
+}

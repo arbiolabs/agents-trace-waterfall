@@ -57,7 +57,7 @@ fn render(state: &TraceState, rows: &[Row], theme: &Theme, w: u16, h: u16, sel: 
     let area = Rect::new(0, 0, w, h);
     let mut buf = Buffer::empty(area);
     let tl_w = w.saturating_sub(30 + 1).max(1);
-    WaterfallWidget { state, rows, now: 800 * MS, viewport: Viewport::fit(0, 1000 * MS, tl_w), origin_ns: 0, theme, tree_width: 30, focused: true }
+    WaterfallWidget { state, rows, now: 800 * MS, viewport: Viewport::fit(0, 1000 * MS, tl_w), origin_ns: 0, theme, tree_width: 30, focused: true, notes: None, idle: &[] }
         .render(area, &mut buf, sel);
     buf
 }
@@ -71,7 +71,7 @@ fn renders_unicode_rows() {
         lines(&buf),
         [
             "                              │0s        200ms     400ms     600ms     800ms",
-            "▾◆✓ root                 800ms│████████████████████████████████████████┊",
+            "▾◆✓ Root                 800ms│████████████████████████████████████████┊",
             "   ●✓ llm1         $0.01 300ms│     ███████████████                    ┊",
             "   ■✗ tool1              100ms│                    ░░░░x               ┊",
             "   ■▶ tool2              300ms│                         ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓┊",
@@ -93,7 +93,7 @@ fn renders_ascii_mono_rows() {
         lines(&buf),
         [
             "                              |0s        200ms     400ms     600ms     800ms",
-            "+Ao root                 800ms|########################################:",
+            "+Ao Root                 800ms|########################################:",
             "  Unresolved                  |                                        :",
             "   Wo orphan             100ms|                              #####     :",
             "                              |                                        :",
@@ -133,7 +133,7 @@ fn ten_thousand_spans_render_fast() {
     let t0 = Instant::now();
     let rows = flatten(&s, &HashSet::new(), None);
     let mut sel = WaterfallState { offset: 0, selected: 5_000 };
-    WaterfallWidget { state: &s, rows: &rows, now: 10_000 * MS, viewport: Viewport::fit(0, 10_000 * MS, 160), origin_ns: 0, theme: &Theme::default(), tree_width: 40, focused: true }
+    WaterfallWidget { state: &s, rows: &rows, now: 10_000 * MS, viewport: Viewport::fit(0, 10_000 * MS, 160), origin_ns: 0, theme: &Theme::default(), tree_width: 40, focused: true, notes: None, idle: &[] }
         .render(area, &mut buf, &mut sel);
     let took = t0.elapsed();
     println!("flatten+render 10k spans: {took:?}");
@@ -148,7 +148,31 @@ fn tree_width_equal_to_area_draws_tree_only() {
     let area = Rect::new(0, 0, 30, 4);
     let mut buf = Buffer::empty(area);
     let theme = Theme { glyphs: Glyphs::Ascii, palette: Palette::Mono };
-    WaterfallWidget { state: &s, rows: &rows, now: 800 * MS, viewport: Viewport::fit(0, 1000 * MS, 1), origin_ns: 0, theme: &theme, tree_width: 30, focused: true }
+    WaterfallWidget { state: &s, rows: &rows, now: 800 * MS, viewport: Viewport::fit(0, 1000 * MS, 1), origin_ns: 0, theme: &theme, tree_width: 30, focused: true, notes: None, idle: &[] }
         .render(area, &mut buf, &mut WaterfallState::default());
-    assert_eq!(lines(&buf), ["", "+Ao root                 800ms", "  Unresolved", "   Wo orphan             100ms"]);
+    assert_eq!(lines(&buf), ["", "+Ao Root                 800ms", "  Unresolved", "   Wo orphan             100ms"]);
+}
+
+#[test]
+fn rows_show_model_detail_note_mark_and_idle_stretches() {
+    let mut events = vec![
+        ev(1, 0, None, json!({"event_type": "session.started", "body": {"project_id": "p", "harness": "claude-code"}})),
+        start(2, 0, "root", None, "agent"),
+        ev(3, 0, Some("llm"), json!({"event_type": "span.started", "body": {"name": "llm", "kind": "llm", "parent_span_id": "root", "model": "claude-opus-5-5"}})),
+        end(4, 100 * MS, "llm", "succeeded"),
+    ];
+    events.push(start(5, 900 * MS, "late", Some("root"), "tool"));
+    events.push(end(6, 1000 * MS, "late", "succeeded"));
+    events.push(end(7, 1000 * MS, "root", "succeeded"));
+    let s = TraceState::from_events("s1".into(), &events);
+    let rows = flatten(&s, &HashSet::new(), None);
+    let notes = std::collections::BTreeMap::from([(SpanId::from("llm"), "slow".to_owned())]);
+    let area = Rect::new(0, 0, 81, 4);
+    let mut buf = Buffer::empty(area);
+    let widget = WaterfallWidget { state: &s, rows: &rows, now: 1000 * MS, viewport: Viewport::fit(0, 1000 * MS, 50), origin_ns: 0, theme: &Theme::default(), tree_width: 30, focused: true, notes: Some(&notes), idle: &[(100 * MS, 900 * MS)] };
+    widget.render(area, &mut buf, &mut WaterfallState::default());
+    let l = lines(&buf);
+    assert!(l[0].contains(" 800ms idle "), "{l:?}");
+    assert!(l[1].starts_with("▾◆✓ Claude Code Opus 5.5"), "{l:?}");
+    assert!(l[2].starts_with("   ●✓ LLM call ✎ Opus"), "{l:?}");
 }
