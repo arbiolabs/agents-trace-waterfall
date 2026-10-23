@@ -161,7 +161,8 @@ impl App {
             (Screen::Sessions, _) => Some(SESSIONS_REFRESH),
             (Screen::Waterfall, Some(v)) => match &v.doc.mode {
                 Mode::Live { .. } => Some(LIVE_TICK),
-                Mode::Replay { clock, .. } if clock.playing => Some(LIVE_TICK),
+                // A session still being recorded keeps arriving while it replays, playing or not.
+                Mode::Replay { clock, .. } if clock.playing || v.doc.recording_live => Some(LIVE_TICK),
                 _ => None,
             },
             _ => None,
@@ -182,7 +183,10 @@ impl App {
             self.refresh_sessions()?;
         }
         match &mut self.view {
-            Some(v) => v.doc.advance(&self.store, dt),
+            Some(v) => {
+                v.doc.poll_recording(&self.store)?;
+                v.doc.advance(&self.store, dt)
+            }
             None => Ok(()),
         }
     }

@@ -210,7 +210,7 @@ fn one_decimal(v: f64) -> String {
     s.strip_suffix(".0").map_or(s.clone(), str::to_owned)
 }
 
-/// `0s`, `850ns`, `12.5µs`, `250ms`, `1.5s`, `2m`, `2m30s`, `1h5m`.
+/// `0s`, `850ns`, `12.5µs`, `250ms`, `1.5s`, `2m`, `2m 30s`, `1h 5m`.
 pub fn format_duration(ns: Ns) -> String {
     let sign = if ns < 0 { "-" } else { "" };
     format!("{sign}{}", format_abs(ns.unsigned_abs()))
@@ -229,9 +229,9 @@ fn format_abs(ns: u64) -> String {
             let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
             match (h, s) {
                 (0, 0) => format!("{m}m"),
-                (0, _) => format!("{m}m{s}s"),
+                (0, _) => format!("{m}m {s}s"),
                 _ if m == 0 => format!("{h}h"),
-                _ => format!("{h}h{m}m"),
+                _ => format!("{h}h {m}m"),
             }
         }
     }

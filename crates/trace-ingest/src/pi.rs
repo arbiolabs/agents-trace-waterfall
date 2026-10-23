@@ -27,9 +27,23 @@ use trace_core::*;
 
 use crate::emit::{Emit, parse_utc, span};
 
-#[derive(Default)]
+/// Also reads Oh My Pi (`omp`, a pi fork that keeps the same session format in `~/.omp/agent/sessions`);
+/// `harness` names which one recorded the session.
 pub struct Pi {
     state: RefCell<State>,
+    harness: &'static str,
+}
+
+impl Default for Pi {
+    fn default() -> Self {
+        Self::recorded_by("pi")
+    }
+}
+
+impl Pi {
+    pub fn recorded_by(harness: &'static str) -> Self {
+        Self { state: RefCell::default(), harness }
+    }
 }
 
 #[derive(Default)]
@@ -46,14 +60,16 @@ struct State {
     leaf: Option<String>,
     turn: Option<String>,
     turns: u64,
+    /// When each open tool call started: the end of the model call that asked for it.
+    tool_starts: HashMap<String, Ns>,
 }
 
 impl TraceAdapter for Pi {
     fn source_info(&self) -> SourceInfo {
         SourceInfo {
-            source_id: "pi".into(),
-            name: "pi".into(),
-            harness: "pi".into(),
+            source_id: self.harness.into(),
+            name: self.harness.into(),
+            harness: self.harness.into(),
             unobservable: [
                 "tool execution start (taken from the requesting assistant message)",
                 "cost provenance (pi's own estimate from model prices)",
@@ -97,11 +113,9 @@ impl TraceAdapter for Pi {
         if v["type"] != "session" && st.copied_before.is_some_and(|start| ts < start) {
             return Ok(Vec::new());
         }
-        let mut e = Emit { source: SourceId(format!("pi:{sid}")), session: SessionId(root_session), observed: raw.observed_at_utc_ns, seq: st.seq, out: Vec::new() };
+        let mut e = Emit { source: SourceId(format!("{}:{sid}", self.harness)), session: SessionId(root_session), observed: raw.observed_at_utc_ns, seq: st.seq, out: Vec::new() };
         let parent = st.turn.as_deref().map_or_else(|| root.clone(), |t| span("turn", t));
         let m = &v["message"];
-        // pi stamps messages in epoch milliseconds.
-        let ms = |x: &Value| x.as_i64().and_then(|m| m.checked_mul(1_000_000)).filter(|t| VALID_TIME_NS.contains(t));
 
         let branched = v["type"] == "message"
             && m["role"] == "user"
@@ -128,13 +142,13 @@ impl TraceAdapter for Pi {
                 let body = EventBody::SessionStarted {
                     project_id: project.to_owned(),
                     working_directory: cwd.to_owned(),
-                    source_adapter: "pi".into(),
-                    harness: "pi".into(),
+                    source_adapter: self.harness.into(),
+                    harness: self.harness.into(),
                     host: String::new(),
                     labels,
                 };
                 e.push(format!("session:{sid}"), ts, None, body);
-                e.start(&root, ts, None, SpanKind::Agent, "pi", |s| s.agent_name = Some("main".into()));
+                e.start(&root, ts, None, SpanKind::Agent, self.harness, |s| s.agent_name = Some("main".into()));
             }
             (Some("message"), Some("user")) => {
                 let Some(id) = v["id"].as_str() else { return Ok(e.out) };
@@ -153,7 +167,7 @@ impl TraceAdapter for Pi {
             }
             (Some("message"), Some("assistant")) => {
                 let Some(id) = v["id"].as_str() else { return Ok(e.out) };
-                let (end, status, stop) = assistant(&mut e, m, id, "", &parent, ts);
+                let (end, status, stop) = assistant(&mut e, m, id, "", &parent, ts, &mut st.tool_starts);
                 if !matches!(stop, "toolUse" | "pending" | "deferred")
                     && let Some(old) = st.turn.take()
                 {
@@ -169,7 +183,7 @@ impl TraceAdapter for Pi {
                 let Some(call) = m["toolCallId"].as_str() else { return Ok(e.out) };
                 let tool = span("tool", call);
                 let (status, error) = if m["isError"] == true { (SpanStatus::Failed, Some("tool reported an error (output not captured)")) } else { (SpanStatus::Succeeded, None) };
-                let at = ms(&m["timestamp"]).unwrap_or(ts);
+                let at = tool_end(m, st.tool_starts.remove(call), ts);
                 e.end(format!("end:{tool}"), &tool, at, status, error);
                 for (n, r) in m["details"]["results"].as_array().into_iter().flatten().enumerate() {
                     subagent(&mut e, r, call, n, &tool);
@@ -184,11 +198,23 @@ impl TraceAdapter for Pi {
 
 /// One assistant message as a model call, with its tool calls started at its end. `scope` keeps a
 /// sub-agent's ids apart from the session's. Returns the call's end, status and stop reason.
-fn assistant<'a>(e: &mut Emit, m: &'a Value, id: &str, scope: &str, parent: &SpanId, fallback: Ns) -> (Ns, SpanStatus, &'a str) {
+/// A tool call's end: its start plus the `durationMs` pi measured for it. The result's own timestamp is
+/// only the fallback: pi runs a batch of tools in parallel and writes every result once the batch is
+/// done, so each timestamp is roughly the batch's end.
+fn tool_end(m: &Value, start: Option<Ns>, fallback: Ns) -> Ns {
+    let ms = |x: &Value| x.as_i64().and_then(|m| m.checked_mul(1_000_000)).filter(|t| VALID_TIME_NS.contains(t));
+    let written = ms(&m["timestamp"]).unwrap_or(fallback);
+    start.zip(m["durationMs"].as_i64()).and_then(|(s, d)| s.checked_add(d * 1_000_000)).map_or(written, |end| end.min(written))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assistant<'a>(e: &mut Emit, m: &'a Value, id: &str, scope: &str, parent: &SpanId, fallback: Ns, starts: &mut HashMap<String, Ns>) -> (Ns, SpanStatus, &'a str) {
     let ms = |x: &Value| x.as_i64().and_then(|m| m.checked_mul(1_000_000)).filter(|t| VALID_TIME_NS.contains(t));
     let llm = span("llm", &format!("{scope}{id}"));
     let start = ms(&m["timestamp"]).unwrap_or(fallback).min(fallback);
-    let end = m["durationMs"].as_i64().and_then(|d| start.checked_add(d * 1_000_000)).unwrap_or(fallback);
+    // pi writes `durationMs`; Oh My Pi writes `duration` (fractional milliseconds) and `completedAt`.
+    let duration = m["durationMs"].as_f64().or_else(|| m["duration"].as_f64());
+    let end = duration.and_then(|d| start.checked_add((d * 1e6) as Ns)).or_else(|| ms(&m["completedAt"])).unwrap_or(fallback);
     let model = m["model"].as_str();
     e.start(&llm, start, Some(parent), SpanKind::Llm, model.unwrap_or("llm call"), |s| {
         s.model = model.map(str::to_owned);
@@ -217,6 +243,7 @@ fn assistant<'a>(e: &mut Emit, m: &'a Value, id: &str, scope: &str, parent: &Spa
     for c in m["content"].as_array().into_iter().flatten().filter(|c| c["type"] == "toolCall") {
         let (Some(call), Some(name)) = (c["id"].as_str(), c["name"].as_str()) else { continue };
         e.start(&span("tool", &format!("{scope}{call}")), end, Some(parent), SpanKind::Tool, name, |s| s.tool_name = Some(name.to_owned()));
+        starts.insert(call.to_owned(), end);
     }
     (end, status, stop)
 }
@@ -236,14 +263,15 @@ fn subagent(e: &mut Emit, r: &Value, call: &str, n: usize, tool: &SpanId) {
         s.model = r["model"].as_str().map(str::to_owned);
     });
     let mut end = last;
+    let mut starts = HashMap::new();
     for (i, m) in messages.iter().enumerate() {
         match m["role"].as_str() {
-            Some("assistant") => end = end.max(assistant(e, m, &i.to_string(), &scope, &sub, ms(&m["timestamp"]).unwrap_or(last)).0),
+            Some("assistant") => end = end.max(assistant(e, m, &i.to_string(), &scope, &sub, ms(&m["timestamp"]).unwrap_or(last), &mut starts).0),
             Some("toolResult") => {
                 let Some(id) = m["toolCallId"].as_str() else { continue };
                 let t = span("tool", &format!("{scope}{id}"));
                 let (status, error) = if m["isError"] == true { (SpanStatus::Failed, Some("tool reported an error (output not captured)")) } else { (SpanStatus::Succeeded, None) };
-                e.end(format!("end:{t}"), &t, ms(&m["timestamp"]).unwrap_or(last), status, error);
+                e.end(format!("end:{t}"), &t, tool_end(m, starts.remove(id), last), status, error);
             }
             _ => {}
         }

@@ -403,7 +403,7 @@ fn events_tab_saturates_extreme_offsets() {
         .iter()
         .map(ToString::to_string)
         .collect();
-    assert_eq!(lines, ["+-2562047h47m first_token"]);
+    assert_eq!(lines, ["+-2562047h 47m first_token"]);
 }
 
 #[test]

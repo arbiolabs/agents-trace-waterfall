@@ -101,6 +101,7 @@ fn known_harness(h: &str) -> Option<&'static str> {
         "junie" => "Junie",
         "devin" => "Devin",
         "pi" => "Pi",
+        "omp" | "ohmypi" => "Oh My Pi",
         _ => return None,
     })
 }

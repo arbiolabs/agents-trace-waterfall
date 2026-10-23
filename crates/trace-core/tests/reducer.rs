@@ -273,3 +273,29 @@ fn validate_rejects_bad_envelopes() {
     empty.session_id = SessionId::default();
     assert_eq!(empty.validate(), Err("source_id, event_id and session_id must be non-empty".into()));
 }
+
+#[test]
+fn replay_grows_with_a_live_recording() {
+    let all: Vec<CanonicalEvent> = (0..1300u64)
+        .map(|i| {
+            let body = if i == 0 {
+                EventBody::SessionStarted { project_id: "p".into(), working_directory: String::new(), source_adapter: String::new(), harness: String::new(), host: String::new(), labels: Default::default() }
+            } else {
+                EventBody::Heartbeat {}
+            };
+            CanonicalEvent { schema_version: SCHEMA_VERSION, source_id: "src".into(), source_seq: i + 1, event_id: EventId(format!("e{i}")), observed_at_utc_ns: i as Ns, occurred_at_utc_ns: i as Ns, session_id: "s1".into(), span_id: None, body }
+        })
+        .collect();
+    let whole = Replay::new("s1".into(), all.clone());
+    let mut grown = Replay::new("s1".into(), all[..700].to_vec());
+    grown.extend(all[700..1100].to_vec());
+    grown.extend(all[1100..].to_vec());
+    assert_eq!((grown.events().len(), grown.end()), (whole.events().len(), whole.end()));
+    for t in [0, 499, 500, 999, 1000, 1299] {
+        assert_eq!(grown.state_at(t), whole.state_at(t), "t = {t}");
+    }
+    // A late event older than the end still lands in order.
+    let mut late = Replay::new("s1".into(), [all[..5].to_vec(), all[6..].to_vec()].concat());
+    late.extend([all[5].clone()]);
+    assert_eq!(late.events().iter().map(|e| e.occurred_at_utc_ns).collect::<Vec<_>>(), (0..1300).collect::<Vec<_>>());
+}

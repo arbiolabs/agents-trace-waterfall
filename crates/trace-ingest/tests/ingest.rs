@@ -530,6 +530,7 @@ fn doctor_reports_live_collector_and_adapter_blind_spots() {
             (true, "adapter claude-code"),
             (true, "adapter codex"),
             (true, "adapter pi"),
+            (true, "adapter omp"),
             (true, "adapter opencode")
         ]
     );
@@ -717,7 +718,7 @@ fn pi_session_becomes_turns_timed_calls_and_tools() {
     let u = a1.usage.as_ref().unwrap();
     assert_eq!((u.tokens_input, u.tokens_output, u.cache_read, u.cache_write, u.cost_usd_micros, u.cost_provenance), (Some(10), Some(40), Some(900), Some(100), Some(4175), CostProvenance::Estimate));
     let tool = span_of(&s, "tool:tc1");
-    assert_eq!((tool.name.as_str(), tool.started_at_utc_ns, tool.ended_at_utc_ns, tool.status), ("read", at(0, 3.4), Some(at(0, 4.0)), SpanStatus::Succeeded));
+    assert_eq!((tool.name.as_str(), tool.started_at_utc_ns, tool.ended_at_utc_ns, tool.status), ("read", at(0, 3.4), Some(at(0, 3.9)), SpanStatus::Succeeded), "it ends by its own 500ms, not when the result was written");
     assert_eq!(tool.parent_span_id.as_ref().unwrap().0, "turn:u1");
     let t1 = span_of(&s, "turn:u1");
     assert_eq!((t1.ended_at_utc_ns, t1.status), (Some(at(0, 5.9)), SpanStatus::Succeeded), "the turn ends with the call that stops without a tool");
@@ -1017,4 +1018,79 @@ fn opencode_1_json_storage_reads_steps_tools_and_sub_agents() {
     assert_eq!((sub.parent_span_id.as_ref().unwrap().0.as_str(), sub.ended_at_utc_ns), ("tool:call_task", Some((b + 5000) * MS)));
     assert_eq!(span_of(&s, "llm:msg_ba").model.as_deref(), Some("claude-haiku-5-5"));
     assert_eq!(span_of(&s, "turn:msg_au").ended_at_utc_ns, Some((b + 8000) * MS));
+}
+
+#[test]
+fn codex_reads_compressed_rollouts_and_keeps_review_threads_apart() {
+    let env = env();
+    let plain = std::fs::read(harness_fixture("codex/rollout.jsonl")).unwrap();
+    let packed = env.dir.join("rollout-old.jsonl.zst");
+    std::fs::write(&packed, ruzstd::encoding::compress_to_vec(&plain[..], ruzstd::encoding::CompressionLevel::Fastest)).unwrap();
+    let mut a = Store::open_in_memory().unwrap();
+    import_file(&mut a, &harness_fixture("codex/rollout.jsonl"), "codex", &Capture::default()).unwrap();
+    let mut b = Store::open_in_memory().unwrap();
+    import_file(&mut b, &packed, "codex", &Capture::default()).unwrap();
+    let id = SessionId::from("01a168be-ebc0-7652-9efb-c75c48a4b669");
+    assert_eq!(a.load_session(&id).unwrap().spans, b.load_session(&id).unwrap().spans, "a .jsonl.zst rollout reads like its plain copy");
+
+    // A review thread is a sub-agent with no parent: it stands as its own session.
+    let review = env.dir.join("rollout-review.jsonl");
+    let meta = json!({"timestamp": "2026-10-23T12:00:00.000Z", "type": "session_meta", "payload": {"id": "rev", "session_id": "other", "cwd": "/work/demo-proj", "source": {"subagent": "review"}}});
+    let started = json!({"timestamp": "2026-10-23T12:00:01.000Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": "t"}});
+    std::fs::write(&review, format!("{meta}\n{started}\n")).unwrap();
+    let mut c = Store::open_in_memory().unwrap();
+    import_file(&mut c, &review, "codex", &Capture::default()).unwrap();
+    let s = c.load_session(&"rev".into()).unwrap();
+    assert!(s.unresolved().is_empty() && s.spans.contains_key(&SpanId::from("agent:rev")), "{:?}", s.spans.keys().collect::<Vec<_>>());
+}
+
+#[test]
+fn pi_parallel_tools_end_by_their_own_duration() {
+    let env = env();
+    let ms0 = 1_792_756_800_000i64;
+    let lines = [
+        json!({"type": "session", "version": 3, "id": "par", "timestamp": "2026-10-23T12:00:00.000Z", "cwd": "/work/demo-proj"}),
+        json!({"type": "message", "id": "u", "parentId": null, "timestamp": "2026-10-23T12:00:00.000Z", "message": {"role": "user", "content": [], "timestamp": ms0}}),
+        json!({"type": "message", "id": "a", "parentId": "u", "timestamp": "2026-10-23T12:00:01.000Z", "message": {"role": "assistant", "content": [{"type": "toolCall", "id": "fast", "name": "read"}, {"type": "toolCall", "id": "slow", "name": "bash"}], "model": "m", "stopReason": "toolUse", "timestamp": ms0 + 500, "durationMs": 500}}),
+        // Both results land when the batch is done, at 4s; their own durations are 0.2s and 3s.
+        json!({"type": "message", "id": "r1", "parentId": "a", "timestamp": "2026-10-23T12:00:04.000Z", "message": {"role": "toolResult", "toolCallId": "fast", "content": [], "isError": false, "timestamp": ms0 + 4_000, "durationMs": 200}}),
+        json!({"type": "message", "id": "r2", "parentId": "r1", "timestamp": "2026-10-23T12:00:04.000Z", "message": {"role": "toolResult", "toolCallId": "slow", "content": [], "isError": false, "timestamp": ms0 + 4_000, "durationMs": 3_000}}),
+    ];
+    let f = env.dir.join("par.jsonl");
+    std::fs::write(&f, lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    import_file(&mut store, &f, "pi", &Capture::default()).unwrap();
+    let s = store.load_session(&"par".into()).unwrap();
+    let end = |id: &str| span_of(&s, id).ended_at_utc_ns.unwrap();
+    assert_eq!((end("tool:fast"), end("tool:slow")), ((ms0 + 1_200) * MS, (ms0 + 4_000) * MS), "each tool ends by its own duration, not the batch's");
+}
+
+#[test]
+fn opencode_fork_skips_copied_history_and_compaction_is_a_model_call() {
+    let env = env();
+    let db = env.dir.join("opencode.db");
+    let c = rusqlite::Connection::open(&db).unwrap();
+    let b = 1_792_800_000_000i64;
+    c.execute_batch(&format!(
+        "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL, version TEXT NOT NULL, parent_id TEXT, agent TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, fork_session_id TEXT, fork_boundary TEXT);
+         CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+         INSERT INTO session_v2 VALUES ('orig', '/work/demo-proj', '2.1.3', NULL, NULL, {b}, {b9}, NULL, NULL);
+         INSERT INTO session_v2 VALUES ('fork', '/work/demo-proj', '2.1.3', NULL, NULL, {b5}, {b9}, 'orig', '{{\"type\":\"through\",\"messageID\":\"o2\"}}');
+         INSERT INTO session_message VALUES ('o1', 'orig', 'user', 1, {b}, {b}, '{{}}');
+         INSERT INTO session_message VALUES ('o2', 'orig', 'idle', 2, {b1}, {b1}, '{{\"outcome\":\"succeeded\"}}');
+         INSERT INTO session_message VALUES ('f1', 'fork', 'user', 1, {b}, {b}, '{{}}');
+         INSERT INTO session_message VALUES ('f2', 'fork', 'idle', 2, {b1}, {b1}, '{{\"outcome\":\"succeeded\"}}');
+         INSERT INTO session_message VALUES ('f3', 'fork', 'user', 3, {b5}, {b5}, '{{}}');
+         INSERT INTO session_message VALUES ('f4', 'fork', 'compaction', 4, {b6}, {b7}, '{{\"status\":\"completed\",\"reason\":\"auto\",\"summary\":\"(text)\",\"model\":{{\"id\":\"claude-sonnet-4-5\",\"providerID\":\"anthropic\"}},\"cost\":0.01,\"tokens\":{{\"input\":5000,\"output\":300,\"reasoning\":0,\"cache\":{{\"read\":0,\"write\":0}}}}}}');
+         INSERT INTO session_message VALUES ('f5', 'fork', 'idle', 5, {b8}, {b8}, '{{\"outcome\":\"succeeded\"}}');",
+        b1 = b + 1000, b5 = b + 5000, b6 = b + 6000, b7 = b + 7000, b8 = b + 8000, b9 = b + 9000,
+    ))
+    .unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    import_file(&mut store, &db, "opencode", &Capture::default()).unwrap();
+    let s = store.load_session(&"fork".into()).unwrap();
+    let turns: Vec<_> = s.spans.values().filter(|x| x.kind == SpanKind::Turn).map(|x| x.span_id.0.as_str()).collect();
+    assert_eq!(turns, ["turn:f3"], "the copied history is the parent's, not the fork's");
+    let compaction = span_of(&s, "llm:f4");
+    assert_eq!((compaction.started_at_utc_ns, compaction.ended_at_utc_ns, compaction.usage.as_ref().unwrap().cost_usd_micros), ((b + 6000) * MS, Some((b + 7000) * MS), Some(10_000)));
 }

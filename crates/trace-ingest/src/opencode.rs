@@ -123,7 +123,7 @@ impl TraceAdapter for OpenCode {
                 model_call(&mut e, &llm, &parent, ts, d["model"]["id"].as_str(), d["model"]["providerID"].as_str());
                 for c in d["content"].as_array().into_iter().flatten().filter(|c| c["type"] == "tool") {
                     let t = &c["time"];
-                    tool(&mut e, &parent, c["id"].as_str(), c["name"].as_str(), ms(&t["ran"]).or_else(|| ms(&t["created"])).unwrap_or(ts), ms(&t["completed"]), c["state"]["status"].as_str());
+                    tool(&mut e, &parent, c["id"].as_str(), c["name"].as_str(), ms(&t["ran"]).or_else(|| ms(&t["created"])).unwrap_or(ts), ms(&t["completed"]), &c["state"]);
                 }
                 if let Some(end) = ms(&d["time"]["streamed"]).or_else(|| ms(&d["time"]["completed"])) {
                     let error = error_text(&d["error"]);
@@ -133,8 +133,17 @@ impl TraceAdapter for OpenCode {
                 }
             }
             (Some("message"), Some("shell")) => {
-                let failed = d["exit"].as_i64().is_some_and(|x| x != 0);
-                tool(&mut e, &parent, Some(id), Some("shell"), ts, ms(&d["time"]["completed"]), Some(if failed { "error" } else { "completed" }));
+                let state = json!({"status": if d["time"]["completed"].is_null() { "running" } else { "completed" }, "metadata": {"exit": d["exit"]}});
+                tool(&mut e, &parent, Some(id), Some("shell"), ts, ms(&d["time"]["completed"]), &state);
+            }
+            // Compacting the context is a model call of its own, with its own tokens and cost.
+            (Some("message"), Some("compaction")) if matches!(d["status"].as_str(), Some("completed" | "failed")) => {
+                let llm = span("llm", id);
+                model_call(&mut e, &llm, &parent, ts, d["model"]["id"].as_str(), d["model"]["providerID"].as_str());
+                let end = ms(&v["time_updated"]).unwrap_or(ts).max(ts);
+                usage(&mut e, &llm, end, &d["tokens"], &d["cost"]);
+                let error = error_text(&d["error"]);
+                e.end(format!("end:{llm}"), &llm, end, if d["status"] == "failed" { SpanStatus::Failed } else { SpanStatus::Succeeded }, error);
             }
             (Some("message"), Some("idle")) => {
                 let status = match d["outcome"].as_str() {
@@ -168,7 +177,7 @@ impl TraceAdapter for OpenCode {
                         }
                         Some("tool") => {
                             let t = &pd["state"]["time"];
-                            tool(&mut e, &parent, pd["callID"].as_str(), pd["tool"].as_str(), ms(&t["start"]).unwrap_or(at), ms(&t["end"]), pd["state"]["status"].as_str());
+                            tool(&mut e, &parent, pd["callID"].as_str(), pd["tool"].as_str(), ms(&t["start"]).unwrap_or(at), ms(&t["end"]), &pd["state"]);
                         }
                         _ => {}
                     }
@@ -252,12 +261,16 @@ fn usage(e: &mut Emit, llm: &SpanId, at: Ns, t: &Value, cost: &Value) {
     e.push(format!("{llm}:usage"), at, Some(llm), EventBody::UsageReported { usage, is_final: true });
 }
 
-/// A tool call from its start; it ends only once its status is final.
-fn tool(e: &mut Emit, parent: &SpanId, call: Option<&str>, name: Option<&str>, at: Ns, end: Option<Ns>, status: Option<&str>) {
+/// A tool call from its start; it ends only once its status is final. A shell command that ran to a
+/// non-zero exit is `completed` in OpenCode's terms, with the exit code in `state.metadata.exit`: that
+/// is a failure.
+fn tool(e: &mut Emit, parent: &SpanId, call: Option<&str>, name: Option<&str>, at: Ns, end: Option<Ns>, state: &Value) {
     let (Some(call), Some(name)) = (call, name) else { return };
     let tool = span("tool", call);
     e.start(&tool, at, Some(parent), SpanKind::Tool, name, |s| s.tool_name = Some(name.to_owned()));
-    let (status, error) = match status {
+    let nonzero = state["metadata"]["exit"].as_i64().is_some_and(|x| x != 0);
+    let (status, error) = match state["status"].as_str() {
+        Some("completed") if nonzero => (SpanStatus::Failed, Some("command exited non-zero (output not captured)")),
         Some("completed") => (SpanStatus::Succeeded, None),
         Some("error") => (SpanStatus::Failed, Some("tool reported an error (output not captured)")),
         _ => return,
@@ -317,11 +330,13 @@ pub fn read_db(path: &Path, since_ms: i64) -> anyhow::Result<(Vec<CanonicalEvent
         };
         feed(line)?;
         if is_v2 {
-            let mut stmt = conn.prepare("SELECT id, type, time_created, data FROM session_message WHERE session_id = ?1 ORDER BY seq")?;
-            let rows = stmt.query_map(params![id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?)))?;
+            // A fork starts with copies of its parent's rows; only what it did itself is its own.
+            let copied_through = fork_copied_through(&conn, &id)?.unwrap_or(i64::MIN);
+            let mut stmt = conn.prepare("SELECT id, type, time_created, time_updated, data FROM session_message WHERE session_id = ?1 AND seq > ?2 ORDER BY seq")?;
+            let rows = stmt.query_map(params![id, copied_through], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?)))?;
             for row in rows {
-                let (mid, kind, created, data) = row?;
-                feed(json!({"t": "message", "id": mid, "type": kind, "time_created": created, "data": parse(&data)}))?;
+                let (mid, kind, created, updated, data) = row?;
+                feed(json!({"t": "message", "id": mid, "type": kind, "time_created": created, "time_updated": updated, "data": parse(&data)}))?;
             }
         } else {
             let mut msgs = conn.prepare("SELECT id, time_created, data FROM message WHERE session_id = ?1 ORDER BY time_created, id")?;
@@ -340,6 +355,33 @@ pub fn read_db(path: &Path, since_ms: i64) -> anyhow::Result<(Vec<CanonicalEvent
 
 fn parse(data: &str) -> Value {
     serde_json::from_str(data).unwrap_or(Value::Null)
+}
+
+/// For a forked 2.x session, the last `seq` that is a copy of the parent's history: the boundary message's
+/// own `seq` for a `through` fork, the parent's last `seq` before it for a `before` fork. None when the
+/// session is no fork or the boundary cannot be resolved, so nothing is dropped on a guess (as ccusage).
+fn fork_copied_through(conn: &Connection, id: &str) -> rusqlite::Result<Option<i64>> {
+    let has = |col: &str| -> rusqlite::Result<bool> { conn.query_row("SELECT EXISTS (SELECT 1 FROM pragma_table_info('session_v2') WHERE name = ?1)", [col], |r| r.get(0)) };
+    if !has("fork_session_id")? || !has("fork_boundary")? {
+        return Ok(None);
+    }
+    let Some((parent, boundary)) = conn
+        .query_row("SELECT fork_session_id, fork_boundary FROM session_v2 WHERE id = ?1", [id], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)))
+        .optional()?
+        .and_then(|(p, b)| p.zip(b))
+    else {
+        return Ok(None);
+    };
+    let boundary = parse(&boundary);
+    let (Some(kind), Some(message)) = (boundary["type"].as_str(), boundary["messageID"].as_str()) else { return Ok(None) };
+    let Some(seq) = conn.query_row("SELECT seq FROM session_message WHERE session_id = ?1 AND id = ?2", params![parent, message], |r| r.get::<_, i64>(0)).optional()? else {
+        return Ok(None);
+    };
+    match kind {
+        "through" => Ok(Some(seq)),
+        "before" => conn.query_row("SELECT MAX(seq) FROM session_message WHERE session_id = ?1 AND seq < ?2", params![parent, seq], |r| r.get(0)),
+        _ => Ok(None),
+    }
 }
 
 /// The session's `session` line, and whether it lives in the 2.x tables.

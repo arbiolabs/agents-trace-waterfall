@@ -38,6 +38,8 @@ pub struct TraceDoc {
     pub now: Ns,
     /// Idle stretches folded out of the timeline: from the whole recording in replay, else from the state.
     pub folds: Folds,
+    /// Replay of a session that is still being recorded: the recording grows as it plays.
+    pub recording_live: bool,
 }
 
 impl TraceDoc {
@@ -55,13 +57,35 @@ impl TraceDoc {
             timeline_width: 0,
             now: 0,
             folds: Folds::default(),
+            recording_live: false,
         };
         d.refresh();
-        d.folds = match &d.mode {
-            Mode::Replay { replay, .. } => replay.end().map_or_else(Folds::default, |end| folds_for(&replay.state_at(end), end)),
-            _ => folds_for(&d.state, d.now),
-        };
+        d.folds = folds_for(&d.state, d.now);
+        d.reread_recording();
         d
+    }
+
+    /// Replay: the folds and liveness of the whole recording, as it stands.
+    fn reread_recording(&mut self) {
+        let Mode::Replay { replay, .. } = &self.mode else { return };
+        let Some(end) = replay.end() else { return };
+        let whole = replay.state_at(end);
+        self.folds = folds_for(&whole, end);
+        self.recording_live = whole.session.status == SessionStatus::Live;
+    }
+
+    /// Replay of a live session: adds what was recorded since. Cheap when nothing new arrived.
+    pub fn poll_recording(&mut self, store: &Store) -> anyhow::Result<()> {
+        if !self.recording_live {
+            return Ok(());
+        }
+        let Mode::Replay { replay, .. } = &mut self.mode else { return Ok(()) };
+        let new = store.events_since(self.last_journal_seq, Some(&self.state.session.session_id))?;
+        let Some((seq, _)) = new.last() else { return Ok(()) };
+        self.last_journal_seq = *seq;
+        replay.extend(new.into_iter().map(|(_, e)| e));
+        self.reread_recording();
+        Ok(())
     }
 
     /// Every journaled event of `id`; live if the session is still running, else static.
@@ -83,7 +107,9 @@ impl TraceDoc {
 
     /// Replay from the start (playing) or parked at the end (paused).
     pub fn open_replay(store: &Store, id: SessionId, speed: f64, at_end: bool) -> anyhow::Result<Self> {
-        let replay = Replay::new(id.clone(), store.session_events(&id)?);
+        let rows = store.events_since(0, Some(&id))?;
+        let last_journal_seq = rows.last().map_or(0, |r| r.0);
+        let replay = Replay::new(id.clone(), rows.into_iter().map(|(_, e)| e).collect());
         let (Some(start), Some(end)) = (replay.start(), replay.end()) else {
             anyhow::bail!("session {id} has no events")
         };
@@ -91,7 +117,7 @@ impl TraceDoc {
         clock.set_speed(speed);
         clock.playing = !at_end;
         let state = replay.state_at(clock.position);
-        Ok(Self::new(state, Mode::Replay { replay, clock }, 0))
+        Ok(Self::new(state, Mode::Replay { replay, clock }, last_journal_seq))
     }
 
     pub fn session_id(&self) -> &SessionId {
@@ -142,6 +168,10 @@ impl TraceDoc {
             Mode::Replay { replay, clock } if clock.playing => {
                 let before = clock.position;
                 clock.tick(dt.as_nanos() as Ns, replay.end().unwrap_or(before));
+                // At the end of a recording that is still going, playback waits for what comes next.
+                if self.recording_live {
+                    clock.playing = true;
+                }
                 // Playback never waits through idle time: it jumps to where activity resumes.
                 if let Some((_, resume)) = self.folds.inside(clock.position) {
                     clock.position = resume;
@@ -375,9 +405,11 @@ impl TraceDoc {
             }
             Mode::Replay { replay, clock } => {
                 let (at, active, wall) = self.replay_times().unwrap_or_default();
+                let at_edge = self.recording_live && clock.position >= replay.end().unwrap_or(0);
                 format!(
-                    "REPLAY {} {}x {}/{} active, {} overall, ev {}/{}",
-                    if clock.playing { "playing" } else { "paused" },
+                    "REPLAY{} {} {}x {}/{} active, {} overall, ev {}/{}",
+                    if self.recording_live { " (still recording)" } else { "" },
+                    if at_edge && clock.playing { "at live edge" } else if clock.playing { "playing" } else { "paused" },
                     clock.speed(),
                     clock_time(at),
                     clock_time(active),

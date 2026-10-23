@@ -85,10 +85,10 @@ fn ticks_and_formatting() {
     let vp = Viewport::fit(0, 1000 * MS, 50);
     assert_eq!(ticks(&vp, 50, 0), [(0, "0s".to_string()), (10, "200ms".into()), (20, "400ms".into()), (30, "600ms".into()), (40, "800ms".into())]);
     let vp = Viewport { start_ns: 30_000 * MS, ns_per_cell: 3e9, ..Default::default() };
-    assert_eq!(ticks(&vp, 40, 0), [(0, "30s".to_string()), (10, "1m".into()), (20, "1m30s".into()), (30, "2m".into())]);
+    assert_eq!(ticks(&vp, 40, 0), [(0, "30s".to_string()), (10, "1m".into()), (20, "1m 30s".into()), (30, "2m".into())]);
     assert_eq!(
         [0, 850, 12_500, 250 * MS, 1500 * MS, 120_000 * MS, 3_900_000 * MS, -250 * MS].map(format_duration),
-        ["0s", "850ns", "12.5µs", "250ms", "1.5s", "2m", "1h5m", "-250ms"]
+        ["0s", "850ns", "12.5µs", "250ms", "1.5s", "2m", "1h 5m", "-250ms"]
     );
     assert_eq!([None, Some(1234), Some(1_234_567)].map(format_cost), ["—", "$0.0012", "$1.23"]);
     assert_eq!(
@@ -126,7 +126,7 @@ fn filter_keeps_ancestors_even_when_collapsed() {
 
 #[test]
 fn extreme_timestamps_saturate_instead_of_overflowing() {
-    assert_eq!([i64::MIN, i64::MAX, i64::MIN + 1].map(format_duration), ["-2562047h47m", "2562047h47m", "-2562047h47m"]);
+    assert_eq!([i64::MIN, i64::MAX, i64::MIN + 1].map(format_duration), ["-2562047h 47m", "2562047h 47m", "-2562047h 47m"]);
     assert_eq!(Viewport::fit(i64::MIN, i64::MAX, 10), Viewport { start_ns: i64::MIN, ns_per_cell: i64::MAX as f64 / 10.0, ..Default::default() });
 }
 
@@ -152,7 +152,7 @@ fn fine_ticks_deep_into_a_session_stay_distinct() {
     let seven_hours: Ns = 7 * 3600 * 1_000_000_000 + 4 * 60 * 1_000_000_000;
     let vp = Viewport { start_ns: seven_hours, ns_per_cell: 100_000_000.0, ..Default::default() };
     let labels: Vec<String> = ticks(&vp, 50, 0).into_iter().map(|(_, l)| l).collect();
-    assert_eq!(labels, ["7h4m", "+1s", "+2s", "+3s", "+4s"]);
+    assert_eq!(labels, ["7h 4m", "+1s", "+2s", "+3s", "+4s"]);
 }
 
 #[test]
@@ -227,7 +227,7 @@ fn folds_take_idle_time_out_of_the_timeline() {
     panned.pan(50.0);
     assert_eq!(panned.start_ns, H, "panning lands on the fold, where the waiting began");
     let labels: Vec<String> = tick_times(&vp, 100.0, 0, 20.0).into_iter().map(|(_, l)| l).collect();
-    assert!(labels.contains(&"10h".to_owned()) || labels.contains(&"10h30m".to_owned()), "labels read real time after the fold: {labels:?}");
+    assert!(labels.contains(&"10h".to_owned()) || labels.contains(&"10h 30m".to_owned()), "labels read real time after the fold: {labels:?}");
 }
 
 #[test]
@@ -262,7 +262,7 @@ fn player_reads_active_time_and_names_the_overall_length() {
     assert_eq!((clock_time(65 * 1_000_000_000), clock_time(3_725 * 1_000_000_000)), ("1:05".into(), "1:02:05".into()));
     let d = 86_400 * 1_000_000_000i64;
     assert_eq!((spoken_span(14 * d), spoken_span(d), spoken_span(5 * 3_600_000_000_000), spoken_span(12 * 60_000_000_000), spoken_span(40_000_000_000)), ("14 days".into(), "24 hours".into(), "5 hours".into(), "12 minutes".into(), "40 seconds".into()));
-    assert_eq!(spoken_span(335 * 3_600_000_000_000 + 1_800_000_000_000), "14 days", "335h30m rounds to 14 days, not down to 13");
+    assert_eq!(spoken_span(335 * 3_600_000_000_000 + 1_800_000_000_000), "14 days", "335h 30m rounds to 14 days, not down to 13");
 
     const H: Ns = 3_600_000 * MS;
     let events = vec![
@@ -279,4 +279,38 @@ fn player_reads_active_time_and_names_the_overall_length() {
     doc.seek_active(0.75);
     let Mode::Replay { clock, .. } = &doc.mode else { unreachable!() };
     assert_eq!(clock.position, 10 * H + H / 2, "three quarters of the active time is past the idle stretch");
+}
+
+#[test]
+fn replay_of_a_live_session_grows_and_waits_at_the_live_edge() {
+    let mut store = trace_storage::Store::open_in_memory().unwrap();
+    let events = vec![
+        ev(1, 0, None, json!({"event_type": "session.started", "body": {"project_id": "p"}})),
+        start(2, 0, "root", None, "agent"),
+        start(3, 10 * MS, "a", Some("root"), "tool"),
+        end(4, 20 * MS, "a", "succeeded"),
+    ];
+    store.append(&events).unwrap();
+    let mut doc = TraceDoc::open_replay(&store, "s1".into(), 1.0, false).unwrap();
+    assert!(doc.recording_live, "the session has not ended");
+    let tick = |doc: &mut TraceDoc, store: &trace_storage::Store| {
+        doc.poll_recording(store).unwrap();
+        doc.advance(store, std::time::Duration::from_millis(100)).unwrap();
+    };
+    tick(&mut doc, &store);
+    let Mode::Replay { clock, .. } = &doc.mode else { unreachable!() };
+    assert_eq!((clock.position, clock.playing), (20 * MS, true), "caught up, still playing: waiting at the live edge");
+    assert!(doc.status().contains("at live edge"), "{}", doc.status());
+
+    // The agent does more; the replay picks it up and plays on into it.
+    store.append(&[start(5, 30 * MS, "b", Some("root"), "tool"), end(6, 60 * MS, "b", "succeeded")]).unwrap();
+    tick(&mut doc, &store);
+    let Mode::Replay { replay, clock } = &doc.mode else { unreachable!() };
+    assert_eq!((replay.end(), clock.position), (Some(60 * MS), 60 * MS));
+    assert!(doc.state.spans.contains_key(&SpanId::from("b")));
+
+    // Once the session ends, the replay is an ordinary recording again.
+    store.append(&[ev(7, 70 * MS, None, json!({"event_type": "session.ended", "body": {"status": "completed"}}))]).unwrap();
+    tick(&mut doc, &store);
+    assert!(!doc.recording_live);
 }

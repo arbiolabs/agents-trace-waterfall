@@ -165,7 +165,7 @@ fn hello(socket_path: &Path) -> anyhow::Result<String> {
     ))
 }
 
-/// "canonical" (pass-through JSONL), "claude-code", "codex", "pi" and "opencode". OpenCode keeps sessions in
+/// "canonical" (pass-through JSONL), "claude-code", "codex", "pi", "omp" (Oh My Pi, pi's format) and "opencode". OpenCode keeps sessions in
 /// SQLite, so its adapter reads the lines [`opencode::read_db`] makes from the database.
 pub fn adapter_by_name(name: &str) -> Option<Box<dyn TraceAdapter>> {
     match name {
@@ -173,12 +173,13 @@ pub fn adapter_by_name(name: &str) -> Option<Box<dyn TraceAdapter>> {
         "claude-code" => Some(Box::new(claude_code::ClaudeCode::default())),
         "codex" => Some(Box::new(codex::Codex::default())),
         "pi" => Some(Box::new(pi::Pi::default())),
+        "omp" => Some(Box::new(pi::Pi::recorded_by("omp"))),
         "opencode" => Some(Box::new(opencode::OpenCode::default())),
         _ => None,
     }
 }
 
-pub const ADAPTERS: &[&str] = &["canonical", "claude-code", "codex", "pi", "opencode"];
+pub const ADAPTERS: &[&str] = &["canonical", "claude-code", "codex", "pi", "omp", "opencode"];
 
 /// Adapters whose source is a database, not a JSONL file.
 fn reads_database(adapter: &str) -> bool {
@@ -198,7 +199,7 @@ pub fn import_file(store: &mut Store, path: &Path, adapter: &str, capture: &Capt
         capture.strip(&mut HashMap::new(), &mut events);
         return store.append(&events);
     }
-    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let reader = open_transcript(path)?;
     let mut out = AppendOutcome::default();
     let mut batch = Vec::new();
     let mut projects = HashMap::new();
@@ -210,7 +211,7 @@ pub fn import_file(store: &mut Store, path: &Path, adapter: &str, capture: &Capt
         batch.clear();
         Ok(())
     };
-    for (i, line) in BufReader::new(file).lines().enumerate() {
+    for (i, line) in BufReader::new(reader).lines().enumerate() {
         let raw = RawEvent {
             line: line?,
             observed_at_utc_ns: system_now_ns(),
@@ -225,6 +226,16 @@ pub fn import_file(store: &mut Store, path: &Path, adapter: &str, capture: &Capt
     }
     flush(&mut batch)?;
     Ok(out)
+}
+
+/// A transcript's bytes: zstd-compressed (`*.jsonl.zst`, as Codex keeps old rollouts) or plain.
+pub(crate) fn open_transcript(path: &Path) -> anyhow::Result<Box<dyn std::io::Read>> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    if path.extension().is_some_and(|e| e == "zst") {
+        let decoder = ruzstd::decoding::StreamingDecoder::new(file).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        return Ok(Box::new(decoder));
+    }
+    Ok(Box::new(file))
 }
 
 struct Canonical;

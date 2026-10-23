@@ -497,7 +497,16 @@ impl TraceApp {
                 doc.tick_clock();
                 Ok(())
             }
-            Mode::Replay { .. } => doc.advance(&self.store, dt),
+            Mode::Replay { .. } => {
+                // A session still being recorded keeps growing while it replays.
+                let polled = if doc.recording_live && self.last_poll.elapsed() >= POLL {
+                    self.last_poll = now;
+                    doc.poll_recording(&self.store)
+                } else {
+                    Ok(())
+                };
+                polled.and_then(|_| doc.advance(&self.store, dt))
+            }
             Mode::Static => Ok(()),
         };
         if let Err(e) = res {
@@ -1823,6 +1832,10 @@ impl TraceApp {
                 }
             };
             right = right.child(pill(pal, status, label, pulse, "hdot", 28.));
+            // Replaying a session that is still running: say so, so the replay never passes for the live view.
+            if doc.recording_live {
+                right = right.child(pill(pal, Status::Live, "Recording".to_owned(), true, "rec", 28.));
+            }
             if let Mode::Live { following, .. } = &doc.mode {
                 let on = *following && now_visible(doc);
                 right = right.child(
@@ -1836,9 +1849,15 @@ impl TraceApp {
                 );
             }
             let replaying = matches!(doc.mode, Mode::Replay { .. });
+            let back_to_live = replaying && doc.recording_live;
+            let (icon, label, tip) = match (replaying, back_to_live) {
+                (true, true) => (IconName::Radio, "Back to live", "Leave replay and follow the session live  R or ⌘R"),
+                (true, false) => (IconName::X, "Exit replay", "Leave replay  R or ⌘R"),
+                _ => (IconName::RotateCcw, "Replay", "Replay from the start  R or ⌘R"),
+            };
             right = right.child(
-                tool_button("replay", if replaying { IconName::X } else { IconName::RotateCcw }, Some(if replaying { "Exit replay" } else { "Replay" }), false, pal)
-                    .tooltip(move |w, cx| Tooltip::new(if replaying { "Leave replay  R or ⌘R" } else { "Replay from the start  R or ⌘R" }).build(w, cx))
+                tool_button("replay", icon, Some(label), back_to_live, pal)
+                    .tooltip(move |w, cx| Tooltip::new(tip).build(w, cx))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_replay();
                         cx.notify();
@@ -3095,7 +3114,8 @@ impl TraceApp {
     fn render_transport(&self, pal: &Palette, g: &Geo, cx: &mut Context<Self>) -> impl IntoElement {
         let doc = self.doc.as_ref().expect("transport needs a document");
         let Mode::Replay { replay, clock } = &doc.mode else { unreachable!("transport renders only in replay") };
-        let _ = replay;
+        // Caught up with a recording that is still going: playback waits for the agent's next move.
+        let at_edge = doc.recording_live && clock.position >= replay.end().unwrap_or(0);
         // Position and length in active time; idle time is folded out of playback.
         let (at, active, wall) = doc.replay_times().unwrap_or_default();
         let frac = (at as f64 / active.max(1) as f64) as f32;
@@ -3232,8 +3252,26 @@ impl TraceApp {
                         .text_size(px(12.))
                         .font_features(tnum())
                         .text_color(pal.text)
-                        .child(format!("{} / {}", clock_time(at), clock_time(active))),
+                        .child(if at_edge { format!("{} · live edge", clock_time(at)) } else { format!("{} / {}", clock_time(at), clock_time(active)) }),
                 )
+                .when(doc.recording_live, |el| {
+                    el.child(
+                        div()
+                            .ml(px(8.))
+                            .px(px(7.))
+                            .h(px(18.))
+                            .flex()
+                            .items_center()
+                            .gap(px(5.))
+                            .rounded_full()
+                            .bg(pal.accent.opacity(0.12))
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(pal.accent)
+                            .child(div().size(px(6.)).rounded_full().bg(pal.accent))
+                            .child("LIVE"),
+                    )
+                })
                 .when(wall > active, |el| {
                     el.child(
                         div()

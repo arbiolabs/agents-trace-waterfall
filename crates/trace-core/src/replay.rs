@@ -34,6 +34,32 @@ impl Replay {
         Self { session_id, events, checkpoints, interval }
     }
 
+    /// Adds events recorded since, for a session still being recorded. Checkpoints continue from the last
+    /// whole chunk; an event older than the recording's end rebuilds them in order.
+    pub fn extend(&mut self, new: impl IntoIterator<Item = CanonicalEvent>) {
+        let mut new: Vec<_> = new.into_iter().filter(|e| e.session_id == self.session_id).collect();
+        if new.is_empty() {
+            return;
+        }
+        sort_events(&mut new);
+        if self.events.last().is_some_and(|last| last.order_cmp(&new[0]).is_gt()) {
+            let mut all = std::mem::take(&mut self.events);
+            all.extend(new);
+            *self = Self::new(self.session_id.clone(), all);
+            return;
+        }
+        let full = self.events.len() / self.interval;
+        self.events.extend(new);
+        self.checkpoints.truncate(full + 1);
+        let mut state = self.checkpoints[full].clone();
+        for chunk in self.events[full * self.interval..].chunks(self.interval) {
+            for e in chunk {
+                state.apply(e);
+            }
+            self.checkpoints.push(state.clone());
+        }
+    }
+
     pub fn events(&self) -> &[CanonicalEvent] {
         &self.events
     }

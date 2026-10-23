@@ -6,7 +6,30 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Replaying a session that is still running follows the recording as it grows: playback waits at the
+  live edge and plays on as the agent works. Both frontends mark it: a pulsing Recording pill, a LIVE
+  tag and "live edge" in the player, and Back to live in place of Exit replay (TUI: "still recording").
+
+- Oh My Pi adapter (`omp`): tails `~/.omp/agent/sessions`, pi's format with Oh My Pi's own `duration`
+  and `completedAt` timing; sessions read as Oh My Pi.
+- A conformance test: one scenario recorded in each harness's own format must yield the same trace shape.
+- Codex rollouts compressed to `.jsonl.zst` are read, and archived sessions can be tailed.
+
+### Fixed
+
+- OpenCode: a shell command that exits non-zero is a failed tool (OpenCode marks it completed with the
+  exit code in its metadata). A fork no longer repeats its parent's copied history, and context
+  compaction counts as a model call with its tokens and cost.
+- pi: tools that ran in parallel each end by their own measured duration, not when the whole batch's
+  results were written.
+- Codex: review and compaction threads stand as their own sessions instead of dangling as sub-agents
+  with no parent; item times of 0 count as unrecorded.
+
 ### Changed
+
+- Durations put a space between units: `1h 7m`, `2m 30s`.
 
 - Idle time is folded out of the timeline in both frontends: an idle stretch takes no width and shows as
   a break with its length (`17h`, `2d`), so a long session's work fills the view. Replay jumps across

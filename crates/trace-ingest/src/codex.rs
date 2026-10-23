@@ -1,5 +1,5 @@
-//! Codex CLI rollout JSONL (`~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<thread>.jsonl`) to canonical
-//! events. Metadata only: no prompt, message, reasoning, command or tool output text is copied.
+//! Codex CLI rollout JSONL (`~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<thread>.jsonl`, compressed to
+//! `.jsonl.zst` once old, and moved to `~/.codex/archived_sessions` when archived) to canonical events. Metadata only: no prompt, message, reasoning, command or tool output text is copied.
 //!
 //! Spans: `agent:<thread>` root, `turn:<turn id>` from `task_started` to `task_complete` or
 //! `turn_aborted`, `llm:<response id>` per model response (ended by its usage record; it starts where
@@ -78,8 +78,11 @@ impl TraceAdapter for Codex {
             match &st.thread {
                 None => {
                     st.thread = p["id"].as_str().map(str::to_owned);
-                    st.session = p["session_id"].as_str().or(p["id"].as_str()).map(str::to_owned);
-                    st.subagent = p["source"]["subagent"].is_object();
+                    // Only a spawned thread has a parent to nest under; review and compaction threads
+                    // (`source.subagent.review`, `.compact`, ...) stand as their own sessions.
+                    st.subagent = p["source"]["subagent"]["thread_spawn"].is_object();
+                    let own = p["id"].as_str();
+                    st.session = if st.subagent { p["session_id"].as_str().or(own) } else { own }.map(str::to_owned);
                     st.provider = p["model_provider"].as_str().map(str::to_owned);
                 }
                 Some(own) if p["id"].as_str() != Some(own) => st.forked = true,
@@ -187,7 +190,8 @@ impl TraceAdapter for Codex {
             (Some("event_msg"), Some(kind @ ("item_started" | "item_completed"))) => {
                 let item = &p["item"];
                 let Some((id, name)) = item["id"].as_str().zip(item_tool_name(item)) else { return Ok(e.out) };
-                let ms = |k: &str| p[k].as_i64().and_then(|m| m.checked_mul(1_000_000)).filter(|t| VALID_TIME_NS.contains(t));
+                // Older items write 0 for a time they did not record.
+                let ms = |k: &str| p[k].as_i64().filter(|m| *m > 0).and_then(|m| m.checked_mul(1_000_000)).filter(|t| VALID_TIME_NS.contains(t));
                 let s = span("item", id);
                 let under = st.open_call.as_deref().map_or_else(|| parent.clone(), |c| span("tool", c));
                 e.start(&s, ms("started_at_ms").unwrap_or(ts), Some(&under), SpanKind::Tool, &name, |f| f.tool_name = Some(name.clone()));

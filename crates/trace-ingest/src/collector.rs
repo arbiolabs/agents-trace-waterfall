@@ -329,7 +329,12 @@ fn tail_loop(
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
-                match tail_file(&path, adapter, &mut files, &mut offsets, tx) {
+                let tailed = if path.extension().is_some_and(|e| e == "zst") {
+                    read_compressed(&path, adapter, &mut offsets, tx)
+                } else {
+                    tail_file(&path, adapter, &mut files, &mut offsets, tx)
+                };
+                match tailed {
                     Ok(false) => {}
                     Ok(true) => save_offsets(offsets_path, &offsets),
                     Err(e) => {
@@ -374,6 +379,27 @@ fn append_tailed(events: Vec<CanonicalEvent>, tx: &mpsc::Sender<Cmd>) -> anyhow:
         rx.blocking_recv().context("writer stopped")??;
     }
     Ok(())
+}
+
+/// A compressed transcript is finished, so it is read whole once; its offset is its compressed size.
+fn read_compressed(path: &Path, adapter: &str, offsets: &mut BTreeMap<PathBuf, u64>, tx: &mpsc::Sender<Cmd>) -> anyhow::Result<bool> {
+    let size = fs::metadata(path)?.len();
+    if offsets.get(path) == Some(&size) {
+        return Ok(false);
+    }
+    let a = adapter_by_name(adapter).with_context(|| format!("unknown adapter {adapter:?}"))?;
+    let mut text = String::new();
+    crate::open_transcript(path)?.read_to_string(&mut text)?;
+    let mut events = Vec::new();
+    for line in text.lines() {
+        match a.normalize(RawEvent { line: line.to_owned(), observed_at_utc_ns: system_now_ns() }) {
+            Ok(evs) => events.extend(evs),
+            Err(e) => eprintln!("collector: {}: {e:#}", path.display()),
+        }
+    }
+    append_tailed(events, tx)?;
+    offsets.insert(path.to_owned(), size);
+    Ok(true)
 }
 
 /// Feeds new complete lines of `path` through its adapter and appends the events. True if the offset moved.
@@ -452,6 +478,8 @@ fn jsonl_files(root: &Path) -> Vec<PathBuf> {
             match entry.file_type() {
                 Ok(t) if t.is_dir() => dirs.push(p),
                 Ok(t) if t.is_file() && p.extension().is_some_and(|e| e == "jsonl") => out.push(p),
+                // A compressed transcript counts unless its plain copy is still there.
+                Ok(t) if t.is_file() && p.to_str().is_some_and(|s| s.ends_with(".jsonl.zst")) && !p.with_extension("").exists() => out.push(p),
                 _ => {}
             }
         }

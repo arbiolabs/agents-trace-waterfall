@@ -28,6 +28,7 @@ trace-tui collector start \
   --tail claude-code=$HOME/.claude/projects \
   --tail codex=$HOME/.codex/sessions \
   --tail pi=$HOME/.pi/agent/sessions \
+  --tail omp=$HOME/.omp/agent/sessions \
   --tail opencode=$HOME/.local/share/opencode/opencode.db
 ```
 
@@ -36,11 +37,12 @@ trace-tui collector start \
 | Harness | Adapter | Reads | Notes |
 |---|---|---|---|
 | Claude Code | `claude-code` | `~/.claude/projects/**/*.jsonl` | Sub-agents nest under the tool call that launched them. |
-| Codex CLI | `codex` | `~/.codex/sessions/**/rollout-*.jsonl` | Commands, file changes, MCP calls and web searches keep Codex's own timings. Sub-agent threads join the root session under their `spawn_agent` call. |
+| Codex CLI | `codex` | `~/.codex/sessions/**/rollout-*.jsonl` (also `.jsonl.zst`; archived ones in `~/.codex/archived_sessions`) | Commands, file changes, MCP calls and web searches keep Codex's own timings. Sub-agent threads join the root session under their `spawn_agent` call. |
 | pi | `pi` | `~/.pi/agent/sessions/**/*.jsonl` | Model calls carry pi's request timing and cost estimate. Branches are marked. Sub-agent sessions started during a tool call nest under it, live; runs of pi's sub-agent extension nest once the call returns. Forks and clones stay their own sessions. |
-| OpenCode | `opencode` | `~/.local/share/opencode/opencode.db`, or `~/.local/share/opencode/storage` for 1.x | Read-only; sessions are re-read as they change. Every SQLite version, and 1.x's JSON files. Sub-agent sessions nest under the task call that started them. |
+| Oh My Pi | `omp` | `~/.omp/agent/sessions/**/*.jsonl` | pi's format and features, with Oh My Pi's own timing fields. |
+| OpenCode | `opencode` | `~/.local/share/opencode/opencode.db` (`opencode-<channel>.db` on other release channels), or `~/.local/share/opencode/storage` for 1.x | Read-only; sessions are re-read as they change. Every SQLite version, and 1.x's JSON files. Sub-agent sessions nest under the task call that started them. |
 
-Every harness nests its sub-agents inside the parent's trace, so one session shows the whole run.
+Every harness nests its sub-agents inside the parent's trace, so one session shows the whole run. `crates/trace-ingest/tests/conformance.rs` records one scenario in each harness's own format and checks every adapter yields the same trace; each adapter has also been checked against real sessions, sub-agents included.
 
 Costs a harness doesn't report are estimated from the model's API list price (Claude and GPT-5 / GPT-4 models, cache reads and writes included) and shown as `~$1.20`. On a subscription plan this is what the same usage would cost through the API, not what you are billed. Unknown models stay `—`.
 

@@ -1471,12 +1471,12 @@ mod tests {
     fn offscreen_spans_name_their_edge_and_distance() {
         let w = (3_900_000 * MS, 4_000_000 * MS);
         let now = 30_000_000 * MS;
-        assert_eq!(offscreen_hint(0, 2_700 * MS, w, None), Some((Edge::Left, "2.7s · 1h4m before".into())));
+        assert_eq!(offscreen_hint(0, 2_700 * MS, w, None), Some((Edge::Left, "2.7s · 1h 4m before".into())));
         assert_eq!(offscreen_hint(4_180_000 * MS, 4_190_000 * MS, w, None), Some((Edge::Right, "3m after".into())));
         assert_eq!(offscreen_hint(3_950_000 * MS, 4_190_000 * MS, w, None), None);
-        assert_eq!(offscreen_hint(0, 2_700 * MS, w, Some(now)), Some((Edge::Left, "2.7s · 8h19m ago".into())), "following reads from real now");
+        assert_eq!(offscreen_hint(0, 2_700 * MS, w, Some(now)), Some((Edge::Left, "2.7s · 8h 19m ago".into())), "following reads from real now");
         assert_eq!(offscreen_hint(4_180_000 * MS, 4_190_000 * MS, w, Some(now)), Some((Edge::Right, "3m after".into())));
-        assert_eq!(offscreen_hint(2_700 * MS, 2_699 * MS, w, None), Some((Edge::Left, "0s · 1h4m before".into())), "an end logged before its start reads as an instant");
+        assert_eq!(offscreen_hint(2_700 * MS, 2_699 * MS, w, None), Some((Edge::Left, "0s · 1h 4m before".into())), "an end logged before its start reads as an instant");
     }
 
     #[test]
@@ -1505,7 +1505,7 @@ mod tests {
         let h = 3_600_000 * MS;
         let m = 60_000 * MS;
         let w = (7 * h, 7 * h + 31 * m);
-        assert_eq!(now_capsule(14 * h + 20 * m, w, false), Some((Edge::Right, "Now +6h49m".into())));
+        assert_eq!(now_capsule(14 * h + 20 * m, w, false), Some((Edge::Right, "Now +6h 49m".into())));
         assert_eq!(now_capsule(14 * h + 20 * m, w, true), Some((Edge::Right, "Now".into())), "idle: the gap is told once, by the idle marker");
         assert_eq!(now_capsule(7 * h + 10 * m, w, false), None);
         const SEC: Ns = 1_000_000_000;
@@ -1543,9 +1543,9 @@ mod tests {
         let h = 3_600_000 * MS;
         let m = 60_000 * MS;
         assert_eq!(overview_label((0, 16_200 * MS), (0, 16_200 * MS)), "All · 16.2s");
-        assert_eq!(overview_label((7 * h + 18 * m, 7 * h + 31 * m), (0, 8 * h + 12 * m)), "7h18m – 7h31m of 8h12m");
+        assert_eq!(overview_label((7 * h + 18 * m, 7 * h + 31 * m), (0, 8 * h + 12 * m)), "7h 18m – 7h 31m of 8h 12m");
         let whole = (0, 2 * h + 4 * m + 30_000 * MS);
-        assert_eq!(overview_label((2 * h + 4 * m, 2 * h + 4 * m + 4_400 * MS), whole), "4.4s window at 2h4m · 2h4m total", "identical ends name length and place");
+        assert_eq!(overview_label((2 * h + 4 * m, 2 * h + 4 * m + 4_400 * MS), whole), "4.4s window at 2h 4m · 2h 4m total", "identical ends name length and place");
     }
 
     #[test]
@@ -1583,7 +1583,7 @@ mod tests {
         assert!(!shows_badge(Status::Done, Group::Earlier));
         assert!(shows_badge(Status::Done, Group::Today));
         assert!(shows_badge(Status::Failed, Group::Earlier));
-        assert_eq!(idle_gap(0, 7 * h + 2 * 60_000 * MS), "+7h2m idle");
+        assert_eq!(idle_gap(0, 7 * h + 2 * 60_000 * MS), "+7h 2m idle");
     }
 
     #[test]
