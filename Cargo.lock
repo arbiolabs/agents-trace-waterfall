@@ -7634,11 +7634,13 @@ name = "trace-ingest"
 version = "1.1.0"
 dependencies = [
  "anyhow",
+ "md-5",
  "rusqlite",
  "ruzstd",
  "serde",
  "serde_json",
  "tokio",
+ "toml 1.1.8+spec-1.1.0",
  "trace-adapter-sdk",
  "trace-core",
  "trace-storage",
