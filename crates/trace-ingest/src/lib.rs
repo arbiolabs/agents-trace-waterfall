@@ -14,6 +14,7 @@ mod kilo;
 mod kimi;
 mod openclaw;
 mod opencode;
+mod otlp;
 mod pi;
 mod qwen;
 
@@ -41,6 +42,8 @@ pub struct CollectorConfig {
     /// Files to tail with a named adapter, e.g. ("claude-code", ~/.claude/projects).
     pub tail: Vec<(String, PathBuf)>,
     pub capture: Capture,
+    /// Where the OTLP/HTTP trace receiver listens (loopback only), if anywhere.
+    pub otlp: Option<std::net::SocketAddr>,
 }
 
 /// Opt-in payload capture (docs/privacy.md). Without it the collector strips input and output previews.
@@ -196,11 +199,12 @@ pub fn adapter_by_name(name: &str) -> Option<Box<dyn TraceAdapter>> {
         "crush" => Some(crush::adapter("crush")),
         "hermes" => Some(hermes::adapter("hermes")),
         "grok" => Some(grok::adapter("grok")),
+        "otlp" => Some(Box::new(otlp::Otlp::default())),
         _ => None,
     }
 }
 
-pub const ADAPTERS: &[&str] = &["canonical", "claude-code", "codex", "pi", "omp", "opencode", "gemini-cli", "qwen-code", "kilo", "openclaw", "copilot", "cline", "roo", "kimi", "crush", "hermes", "grok"];
+pub const ADAPTERS: &[&str] = &["canonical", "claude-code", "codex", "pi", "omp", "opencode", "gemini-cli", "qwen-code", "kilo", "openclaw", "copilot", "cline", "roo", "kimi", "crush", "hermes", "grok", "otlp"];
 
 /// Reads a source that is not an appended transcript (a database, a JSON file rewritten in place): every
 /// session changed since the cursor, and the new cursor.

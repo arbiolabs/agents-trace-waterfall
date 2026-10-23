@@ -13,6 +13,8 @@ pub struct Config {
     pub retention: Retention,
     pub tail: Vec<Tail>,
     pub capture: trace_ingest::Capture,
+    /// Where the collector receives OTLP/HTTP traces, e.g. "127.0.0.1:4318". Off when unset.
+    pub otlp: Option<std::net::SocketAddr>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
