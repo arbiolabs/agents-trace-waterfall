@@ -10,9 +10,9 @@ use app::*;
 
 /// Desktop trace waterfall for coding agents.
 #[derive(Parser)]
-#[command(name = "trace-waterfall", version)]
+#[command(name = "agents-trace-waterfall", version)]
 pub struct Cli {
-    /// Store to read; defaults to $TRACE_WATERFALL_DB, then the config, then the platform default.
+    /// Store to read; defaults to $AGENTS_TRACE_WATERFALL_DB, then the config, then the platform default.
     #[arg(long)]
     pub db: Option<PathBuf>,
     /// Open the session with this id or unique id prefix.
@@ -177,7 +177,7 @@ fn main() -> anyhow::Result<()> {
                     .ok();
             }
             Err(e) => {
-                eprintln!("trace-waterfall: {e:#}");
+                eprintln!("agents-trace-waterfall: {e:#}");
                 cx.quit();
             }
         }

@@ -6,9 +6,9 @@ Protocol version 1. Harnesses send canonical events to the collector over a loca
 
 The client and the collector resolve the path in this order:
 
-1. `$TRACE_WATERFALL_SOCKET`
-2. `$XDG_RUNTIME_DIR/trace-waterfall.sock`
-3. `~/.local/state/trace-waterfall/collector.sock`
+1. `$AGENTS_TRACE_WATERFALL_SOCKET`
+2. `$XDG_RUNTIME_DIR/agents-trace-waterfall.sock`
+3. `~/.local/state/agents-trace-waterfall/collector.sock`
 
 Both defaults are private to your user. Do not point the socket at a shared directory such as `/tmp`, where another local user can create the path first and receive your events.
 

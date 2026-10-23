@@ -1,6 +1,6 @@
 # Desktop app design
 
-`trace-waterfall` is the macOS desktop app, built with GPUI through gpui-kit. It answers the same questions as the TUI: what happened, in what order, why it was slow, what it cost, and what failed. It shares the session document (`trace-view`) with the TUI, so live, pause, replay, folding, and search behave identically.
+`agents-trace-waterfall` is the macOS desktop app, built with GPUI through gpui-kit. It answers the same questions as the TUI: what happened, in what order, why it was slow, what it cost, and what failed. It shares the session document (`trace-view`) with the TUI, so live, pause, replay, folding, and search behave identically.
 
 The visual reference is the affectUI Trace Waterfall. The app should feel like a native Mac utility: quiet chrome, dense but calm data, motion that explains state changes.
 

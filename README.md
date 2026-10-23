@@ -1,6 +1,10 @@
-# trace-waterfall
+# agents-trace-waterfall
 
 A local-first terminal trace waterfall for coding agents. It shows runs, turns, LLM calls, tool calls, subagents, and waits on one shared time axis. You can watch a run live, browse it later, or replay it on a virtual clock.
+
+![The desktop app following a live Claude Code session](docs/media/desktop.gif)
+
+![The TUI following the same kind of live session, then inspecting a span](docs/media/tui.gif)
 
 See [spec.md](spec.md) for the design, [docs/protocol.md](docs/protocol.md) for the collector protocol, and [docs/privacy.md](docs/privacy.md) for what is recorded.
 
@@ -25,13 +29,13 @@ trace-tui collector start --tail claude-code=$HOME/.claude/projects
 
 ## Desktop app
 
-`trace-waterfall` is a native macOS app built with GPUI and gpui-kit. It reads the same database as the TUI and follows the system light or dark appearance. See [docs/design.md](docs/design.md) for its design.
+`agents-trace-waterfall` is a native macOS app built with GPUI and gpui-kit. It reads the same database as the TUI and follows the system light or dark appearance. See [docs/design.md](docs/design.md) for its design.
 
 ```sh
-scripts/bundle.sh                                # builds target/release/Trace Waterfall.app with its icon
+scripts/bundle.sh                                       # builds target/release/Trace Waterfall.app with its icon
 open "target/release/Trace Waterfall.app"
-./target/release/trace-waterfall                 # or run the binary directly
-./target/release/trace-waterfall --open 7ad34f22 # open a session by id prefix
+./target/release/agents-trace-waterfall                 # or run the binary directly
+./target/release/agents-trace-waterfall --open 7ad34f22 # open a session by id prefix
 ```
 
 Click a span for its details. Drag the overview strip to move through long sessions. Drop a `.jsonl` file on the window to import it. The keyboard shortcuts match the TUI.
@@ -54,12 +58,12 @@ Press `?` in the TUI for the keymap.
 
 ## Configuration
 
-`~/.config/trace-waterfall/config.toml`, or the file named by `TRACE_WATERFALL_CONFIG`:
+`~/.config/agents-trace-waterfall/config.toml`, or the file named by `AGENTS_TRACE_WATERFALL_CONFIG`:
 
 ```toml
-db = "~/.local/share/trace-waterfall/traces.db"   # or TRACE_WATERFALL_DB
-# socket = "..."                                  # or TRACE_WATERFALL_SOCKET; default is per-user, see docs/protocol.md
-theme = "default"                                 # ascii, monochrome, ascii-monochrome
+db = "~/.local/share/agents-trace-waterfall/traces.db"  # or AGENTS_TRACE_WATERFALL_DB
+# socket = "..."                                         # or AGENTS_TRACE_WATERFALL_SOCKET; default is per-user, see docs/protocol.md
+theme = "default"                                        # ascii, monochrome, ascii-monochrome
 
 [retention]
 metadata_days = 90
@@ -84,7 +88,7 @@ path = "~/.claude/projects"
 | `trace-render` | Waterfall widget, time axis, tree flattening, clipping. |
 | `trace-view` | The session document shared by the TUI and the desktop app: live polling, replay, folding, viewport. |
 | `trace-tui` | CLI and Ratatui app. |
-| `trace-app` | GPUI desktop app (`trace-waterfall`). |
+| `trace-app` | GPUI desktop app (`agents-trace-waterfall`). |
 | `trace-adapter-sdk` | Harness integration: recorder, socket client, JSONL helpers. Depends only on `trace-core`. |
 | `examples/simulated-live` | Deterministic agent run generator for demos, fixtures, and perf tests. |
 

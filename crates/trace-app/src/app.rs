@@ -54,7 +54,7 @@ const SIDEBAR_ALPHA: f32 = 0.7;
 pub const ROWS_CONTEXT: &str = "TraceRows";
 
 gpui_kit::actions!(
-    trace_waterfall,
+    agents_trace_waterfall,
     [
         Quit, About, Import, ExportSession, ToggleSidebar, ZoomIn, ZoomOut, ZoomToFit, Follow, Replay, NextEvent, PrevEvent,
         Inspect, AddNote, ZoomToSpan, ToggleBranch, CopySpanName, CopySpanJson, ExportSpanJson, ShowInReplay
@@ -1424,7 +1424,7 @@ impl TraceApp {
             1 => Some("1 turn".to_owned()),
             n => Some(format!("{n} turns")),
         };
-        let how = join(vec![Some(s.harness.clone()).filter(|h| !h.is_empty()), s.model.as_deref().map(present::pretty_model), turns.clone()]);
+        let how = join(vec![present::harness_label(&s.harness, &s.source_adapter), s.model.as_deref().map(present::pretty_model), turns.clone()]);
         let meta = join(vec![when, dur, s.totals.cost_usd_micros().map(|c| format_cost(Some(c)))]);
         let status = present::session_status(s.status, s.last_event_at_utc_ns, trace_view::wall_ns());
         let id = s.session_id.clone();
@@ -1433,7 +1433,7 @@ impl TraceApp {
         let ring = if selected { pal.card } else { pal.tray };
         // Inside a project the name is the header above, and the tile already names a known harness.
         let (title, how) = if nested && !how.is_empty() {
-            let harness = Some(s.harness.clone()).filter(|h| !h.is_empty() && present::harness_brand(h, &s.source_adapter).is_none());
+            let harness = present::harness_label(&s.harness, &s.source_adapter).filter(|_| present::harness_brand(&s.harness, &s.source_adapter).is_none());
             (join(vec![harness, s.model.as_deref().map(present::pretty_model), turns.clone()]), String::new())
         } else {
             (name, how)
@@ -1722,12 +1722,8 @@ impl TraceApp {
             let s = &doc.state.session;
             harness = present::harness_brand(&s.harness, &s.source_adapter);
             // From the trace itself, since a sidebar search may have filtered this session out of the list.
-            let mut models: HashMap<&str, usize> = HashMap::new();
-            for m in doc.state.spans.values().filter(|x| x.kind == SpanKind::Llm).filter_map(|x| x.model.as_deref()) {
-                *models.entry(m).or_default() += 1;
-            }
-            let model = models.into_iter().max_by_key(|&(m, n)| (n, std::cmp::Reverse(m))).map(|(m, _)| present::pretty_model(m));
-            subtitle = [Some(s.project_id.clone()).filter(|p| !p.is_empty()), Some(s.harness.clone()).filter(|h| !h.is_empty()), model]
+            let model = present::top_model(&doc.state);
+            subtitle = [Some(s.project_id.clone()).filter(|p| !p.is_empty()), present::harness_label(&s.harness, &s.source_adapter), model]
                 .into_iter()
                 .flatten()
                 .collect::<Vec<_>>()
@@ -2354,14 +2350,14 @@ impl TraceApp {
         let tone = present::tone(s);
         let kc = pal.kind(tone);
         let mark = span_mark(s, &doc.state.session, 20., &pal);
-        let detail = present::detail(s, &doc.state.session.harness);
+        let detail = present::detail(s, &doc.state);
         let indent = 12. + f32::from(row.depth) * INDENT;
         let end = s.effective_end(g.end, g.now);
         // Two pixels in from each edge, so a span that would draw as a sliver reads as off-screen.
         let edge_ns = (2. * g.vp.ns_per_cell) as Ns;
         let (wa, wb) = g.window();
         let hint = present::offscreen_hint(s.started_at_utc_ns, end, (wa + edge_ns, wb - edge_ns), g.following.then_some(g.now));
-        let full_title = present::title(s);
+        let full_title = present::title(s, &doc.state.session);
         // About 7pt per character at 13pt; the title gets at most 80% of what the name column leaves.
         let room = (g.name_w - indent - 14. - 20. - 12. - 10.) * 0.8;
         let shown_title = present::middle_truncate(&full_title, (room / 7.) as usize);
@@ -2470,7 +2466,7 @@ impl TraceApp {
             None => self.render_bar(key, s, &g, kc, &pal, hovered, slowest, &hidden, row_bg, window).into_any_element(),
         };
         let click_id = id.clone();
-        let spoken = present::row_label(s, &doc.state.subtree_totals(id), g.end, g.now);
+        let spoken = present::row_label(s, &doc.state, &doc.state.subtree_totals(id), g.end, g.now);
         let el = div()
             .id(("row", key))
             .role(Role::TreeItem)
@@ -2686,7 +2682,7 @@ impl TraceApp {
         let natural = if full_h > 0. { full_h + 2. } else { 0. };
         let place = present::place_popover((bx(s.started_at_utc_ns), bx(end)), bar_y, (card.1.width, card.1.height), body_top, (POPOVER_W, natural));
         let mark = span_mark(s, &doc.state.session, 28., pal);
-        let sub = [Some(present::kind_label(s.kind).to_owned()), s.model.as_deref().map(present::pretty_model).or_else(|| present::detail(s, &doc.state.session.harness))]
+        let sub = [Some(present::kind_label(s.kind).to_owned()), s.model.as_deref().map(present::pretty_model).or_else(|| present::detail(s, &doc.state))]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>()
@@ -2743,7 +2739,7 @@ impl TraceApp {
                             .min_w(px(0.))
                             .flex()
                             .flex_col()
-                            .child(div().truncate().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).text_color(pal.ink).child(present::title(s)))
+                            .child(div().truncate().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).text_color(pal.ink).child(present::title(s, &doc.state.session)))
                             .child(div().truncate().text_size(px(12.)).text_color(pal.muted).child(sub)),
                     )
                     .child(pill(pal, status, label.to_owned(), open && !quiet, "pdot", 24.))

@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use trace_render::{Glyphs, Palette, Theme};
 
-/// `~/.config/trace-waterfall/config.toml`, or `$TRACE_WATERFALL_CONFIG`. A missing file means defaults.
+/// `~/.config/agents-trace-waterfall/config.toml`, or `$AGENTS_TRACE_WATERFALL_CONFIG`. A missing file means defaults.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -50,9 +50,9 @@ pub struct Tail {
 
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
-        let path = std::env::var_os("TRACE_WATERFALL_CONFIG")
+        let path = std::env::var_os("AGENTS_TRACE_WATERFALL_CONFIG")
             .map(PathBuf::from)
-            .unwrap_or_else(|| home().join(".config/trace-waterfall/config.toml"));
+            .unwrap_or_else(|| home().join(".config/agents-trace-waterfall/config.toml"));
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
@@ -67,15 +67,15 @@ impl Config {
         Ok(c)
     }
 
-    /// `$TRACE_WATERFALL_DB`, then config, then the storage default.
+    /// `$AGENTS_TRACE_WATERFALL_DB`, then config, then the storage default.
     pub fn db_path(&self) -> PathBuf {
-        env_path("TRACE_WATERFALL_DB")
+        env_path("AGENTS_TRACE_WATERFALL_DB")
             .or_else(|| self.db.clone())
             .unwrap_or_else(trace_storage::default_db_path)
     }
 
     pub fn socket_path(&self) -> PathBuf {
-        env_path("TRACE_WATERFALL_SOCKET")
+        env_path("AGENTS_TRACE_WATERFALL_SOCKET")
             .or_else(|| self.socket.clone())
             .unwrap_or_else(trace_adapter_sdk::default_socket_path)
     }

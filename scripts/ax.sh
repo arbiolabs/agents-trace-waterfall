@@ -3,7 +3,7 @@
 # usage: scripts/ax.sh [app args...]   (env: TW_WINDOW=x,y,w,h  TW_SETTLE=seconds)
 set -eu
 export TW_WINDOW="${TW_WINDOW:-80,80,1440,900}"
-"$(dirname "$0")/../target/release/trace-waterfall" "$@" >/tmp/tw-ax.log 2>&1 &
+"$(dirname "$0")/../target/release/agents-trace-waterfall" "$@" >/tmp/tw-ax.log 2>&1 &
 pid=$!
 trap 'kill $pid 2>/dev/null || true' EXIT
 sleep "${TW_SETTLE:-3}"

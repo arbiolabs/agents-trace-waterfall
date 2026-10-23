@@ -7,7 +7,7 @@ app="$root/target/release/Trace Waterfall.app"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$root/target/release/trace-waterfall" "$app/Contents/MacOS/trace-waterfall"
+cp "$root/target/release/agents-trace-waterfall" "$app/Contents/MacOS/agents-trace-waterfall"
 cp "$root/crates/trace-app/assets/app-icon/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -16,8 +16,8 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <dict>
   <key>CFBundleName</key><string>Trace Waterfall</string>
   <key>CFBundleDisplayName</key><string>Trace Waterfall</string>
-  <key>CFBundleIdentifier</key><string>dev.trace-waterfall.app</string>
-  <key>CFBundleExecutable</key><string>trace-waterfall</string>
+  <key>CFBundleIdentifier</key><string>dev.agents-trace-waterfall.app</string>
+  <key>CFBundleExecutable</key><string>agents-trace-waterfall</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>

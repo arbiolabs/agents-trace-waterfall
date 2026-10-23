@@ -52,20 +52,20 @@ pub fn write_jsonl(mut w: impl Write, events: &[CanonicalEvent]) -> anyhow::Resu
     Ok(())
 }
 
-/// `$TRACE_WATERFALL_SOCKET`, else `$XDG_RUNTIME_DIR/trace-waterfall.sock`,
-/// else `~/.local/state/trace-waterfall/collector.sock`.
+/// `$AGENTS_TRACE_WATERFALL_SOCKET`, else `$XDG_RUNTIME_DIR/agents-trace-waterfall.sock`,
+/// else `~/.local/state/agents-trace-waterfall/collector.sock`.
 pub fn default_socket_path() -> PathBuf {
     socket_path_from(|k| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from))
 }
 
 fn socket_path_from(var: impl Fn(&str) -> Option<PathBuf>) -> PathBuf {
-    if let Some(p) = var("TRACE_WATERFALL_SOCKET") {
+    if let Some(p) = var("AGENTS_TRACE_WATERFALL_SOCKET") {
         return p;
     }
     if let Some(d) = var("XDG_RUNTIME_DIR") {
-        return d.join("trace-waterfall.sock");
+        return d.join("agents-trace-waterfall.sock");
     }
-    var("HOME").unwrap_or_default().join(".local/state/trace-waterfall/collector.sock")
+    var("HOME").unwrap_or_default().join(".local/state/agents-trace-waterfall/collector.sock")
 }
 
 #[cfg(test)]
@@ -75,8 +75,8 @@ mod tests {
     #[test]
     fn socket_path_precedence() {
         let env = |pairs: &'static [(&str, &str)]| move |k: &str| pairs.iter().find(|p| p.0 == k).map(|p| PathBuf::from(p.1));
-        assert_eq!(socket_path_from(env(&[("TRACE_WATERFALL_SOCKET", "/a.sock"), ("XDG_RUNTIME_DIR", "/run")])), PathBuf::from("/a.sock"));
-        assert_eq!(socket_path_from(env(&[("XDG_RUNTIME_DIR", "/run"), ("HOME", "/h")])), PathBuf::from("/run/trace-waterfall.sock"));
-        assert_eq!(socket_path_from(env(&[("HOME", "/h")])), PathBuf::from("/h/.local/state/trace-waterfall/collector.sock"));
+        assert_eq!(socket_path_from(env(&[("AGENTS_TRACE_WATERFALL_SOCKET", "/a.sock"), ("XDG_RUNTIME_DIR", "/run")])), PathBuf::from("/a.sock"));
+        assert_eq!(socket_path_from(env(&[("XDG_RUNTIME_DIR", "/run"), ("HOME", "/h")])), PathBuf::from("/run/agents-trace-waterfall.sock"));
+        assert_eq!(socket_path_from(env(&[("HOME", "/h")])), PathBuf::from("/h/.local/state/agents-trace-waterfall/collector.sock"));
     }
 }

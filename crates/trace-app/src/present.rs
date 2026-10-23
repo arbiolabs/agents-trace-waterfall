@@ -2,7 +2,8 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::{Hsla, rgb};
-use trace_core::{Ns, SessionStatus, Span, SpanKind, SpanStatus, Totals, TraceState};
+use std::collections::HashMap;
+use trace_core::{Ns, Session, SessionStatus, Span, SpanKind, SpanStatus, Totals, TraceState};
 use trace_storage::SessionSummary;
 use trace_view::{Row, format_cost, format_duration, format_tokens};
 
@@ -139,33 +140,59 @@ impl Brand {
     }
 }
 
-/// The harness logo for a session, from its harness or else its source adapter: `Claude-Code` and
-/// `claudecode` both read as Claude Code.
+/// A known harness's logo and name: `Claude-Code` and `claudecode` both read as Claude Code.
+fn known_harness(h: &str) -> Option<(Logo, &'static str)> {
+    let key: String = h.chars().filter(|c| !matches!(c, '-' | '_' | ' ')).flat_map(char::to_lowercase).collect();
+    Some(match key.as_str() {
+        "claudecode" => (Logo::ClaudeCode, "Claude Code"),
+        "codex" => (Logo::Codex, "Codex"),
+        "cursor" => (Logo::Cursor, "Cursor"),
+        "geminicli" => (Logo::GeminiCli, "Gemini CLI"),
+        "copilot" | "githubcopilot" => (Logo::Copilot, "GitHub Copilot"),
+        "windsurf" => (Logo::Windsurf, "Windsurf"),
+        "cline" => (Logo::Cline, "Cline"),
+        "roo" | "roocode" => (Logo::RooCode, "Roo Code"),
+        "kilo" | "kilocode" => (Logo::KiloCode, "Kilo Code"),
+        "opencode" => (Logo::OpenCode, "OpenCode"),
+        "amp" => (Logo::Amp, "Amp"),
+        "goose" => (Logo::Goose, "Goose"),
+        "trae" => (Logo::Trae, "Trae"),
+        "kiro" => (Logo::Kiro, "Kiro"),
+        "openhands" => (Logo::OpenHands, "OpenHands"),
+        "junie" => (Logo::Junie, "Junie"),
+        "devin" => (Logo::Devin, "Devin"),
+        _ => return None,
+    })
+}
+
+/// The harness logo for a session, from its harness or else its source adapter.
 pub fn harness_brand(harness: &str, source_adapter: &str) -> Option<Brand> {
-    let one = |h: &str| {
-        let key: String = h.chars().filter(|c| !matches!(c, '-' | '_' | ' ')).flat_map(char::to_lowercase).collect();
-        Some(match key.as_str() {
-            "claudecode" => Logo::ClaudeCode,
-            "codex" => Logo::Codex,
-            "cursor" => Logo::Cursor,
-            "geminicli" => Logo::GeminiCli,
-            "copilot" | "githubcopilot" => Logo::Copilot,
-            "windsurf" => Logo::Windsurf,
-            "cline" => Logo::Cline,
-            "roo" | "roocode" => Logo::RooCode,
-            "kilo" | "kilocode" => Logo::KiloCode,
-            "opencode" => Logo::OpenCode,
-            "amp" => Logo::Amp,
-            "goose" => Logo::Goose,
-            "trae" => Logo::Trae,
-            "kiro" => Logo::Kiro,
-            "openhands" => Logo::OpenHands,
-            "junie" => Logo::Junie,
-            "devin" => Logo::Devin,
-            _ => return None,
-        })
-    };
-    one(harness).or_else(|| one(source_adapter)).map(Brand::plain)
+    known_harness(harness).or_else(|| known_harness(source_adapter)).map(|(logo, _)| Brand::plain(logo))
+}
+
+/// A known harness's proper name, from the session's harness or else its source adapter.
+pub fn harness_name(harness: &str, source_adapter: &str) -> Option<&'static str> {
+    known_harness(harness).or_else(|| known_harness(source_adapter)).map(|(_, name)| name)
+}
+
+/// How a session's harness reads: its proper name when known, `Claude Code`, else as recorded.
+pub fn harness_label(harness: &str, source_adapter: &str) -> Option<String> {
+    harness_name(harness, source_adapter).map(str::to_owned).or_else(|| Some(capitalize(harness)).filter(|h| !h.is_empty()))
+}
+
+/// `turn 1` → `Turn 1`.
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
+}
+
+/// The trace's most used LLM model, prettified; ties go to the alphabetically first.
+pub fn top_model(state: &TraceState) -> Option<String> {
+    let mut models: HashMap<&str, usize> = HashMap::new();
+    for m in state.spans.values().filter(|x| x.kind == SpanKind::Llm).filter_map(|x| x.model.as_deref()) {
+        *models.entry(m).or_default() += 1;
+    }
+    models.into_iter().max_by_key(|&(m, n)| (n, std::cmp::Reverse(m))).map(|(m, _)| pretty_model(m))
 }
 
 /// The model vendor's logo, by model prefix, else by provider.
@@ -390,8 +417,8 @@ pub fn pretty_model(model: &str) -> String {
     name
 }
 
-/// The muted text after a span's title.
-pub fn detail(s: &Span, harness: &str) -> Option<String> {
+/// The muted text after a span's title. The agent's is the model it ran on.
+pub fn detail(s: &Span, state: &TraceState) -> Option<String> {
     let nonempty = |v: Option<&str>| v.filter(|v| !v.is_empty()).map(str::to_owned);
     match s.kind {
         SpanKind::Llm => s.model.as_deref().map(pretty_model).or_else(|| nonempty(s.provider.as_deref())),
@@ -399,23 +426,28 @@ pub fn detail(s: &Span, harness: &str) -> Option<String> {
         SpanKind::Tool => nonempty(s.tool_name.as_deref())
             .filter(|t| !t.eq_ignore_ascii_case(&s.name))
             .or_else(|| nonempty(s.provider.as_deref())),
-        SpanKind::Agent => nonempty(Some(harness)).or_else(|| nonempty(s.agent_name.as_deref())),
+        SpanKind::Agent => top_model(state),
         SpanKind::Subagent => s.model.as_deref().map(pretty_model).or_else(|| nonempty(s.agent_name.as_deref()).map(short_id)),
         _ => None,
     }
 }
 
-/// Opaque hex ids (harness agent ids) shorten to 7 characters, like git hashes; names pass through.
+/// Opaque hex ids (harness agent ids) shorten to 7 characters, like git hashes; names are capitalized.
 fn short_id(v: String) -> String {
-    if v.len() > 12 && v.chars().all(|c| c.is_ascii_hexdigit()) { v[..7].to_owned() } else { v }
+    if v.len() > 12 && v.chars().all(|c| c.is_ascii_hexdigit()) { v[..7].to_owned() } else { capitalize(&v) }
 }
 
 /// The row title. An LLM span named after its model reads `LLM call`, since the detail already names the model.
-/// An MCP tool name, `mcp__server__tool`, reads as the tool with the server as its detail.
-pub fn title(s: &Span) -> String {
+/// An MCP tool name, `mcp__server__tool`, reads as the tool with the server as its detail. The agent reads
+/// as its harness, `Claude Code`, else its own name.
+pub fn title(s: &Span, session: &Session) -> String {
     let generic = matches!(s.name.to_lowercase().replace(['_', '-'], " ").as_str(), "llm" | "llm call");
     match s.kind {
         SpanKind::Llm if generic || s.model.as_deref() == Some(&s.name) => kind_label(SpanKind::Llm).to_owned(),
+        SpanKind::Agent => harness_name(&session.harness, &session.source_adapter)
+            .map(str::to_owned)
+            .unwrap_or_else(|| capitalize(s.agent_name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&s.name))),
+        SpanKind::Turn => capitalize(&s.name),
         _ => mcp_parts(&s.name).map_or_else(|| s.name.clone(), |(tool, _)| tool.to_owned()),
     }
 }
@@ -717,7 +749,7 @@ pub fn bar_label(s: &Span, rollup: &Totals, session_end: Option<Ns>, now: Ns) ->
 }
 
 /// What VoiceOver reads for a row: `LLM call, Opus 5.5, 1.6 seconds, 2 cents, succeeded`.
-pub fn row_label(s: &Span, rollup: &Totals, session_end: Option<Ns>, now: Ns) -> String {
+pub fn row_label(s: &Span, state: &TraceState, rollup: &Totals, session_end: Option<Ns>, now: Ns) -> String {
     let status = match s.status {
         SpanStatus::Succeeded => "succeeded",
         SpanStatus::Failed => "failed",
@@ -725,7 +757,7 @@ pub fn row_label(s: &Span, rollup: &Totals, session_end: Option<Ns>, now: Ns) ->
         SpanStatus::Running => "running",
         _ => "status unknown",
     };
-    [Some(title(s)), detail(s, ""), Some(spoken_duration(s.elapsed(session_end, now).ns)), rollup.cost_usd_micros().map(spoken_cost), Some(status.to_owned())]
+    [Some(title(s, &state.session)), detail(s, state), Some(spoken_duration(s.elapsed(session_end, now).ns)), rollup.cost_usd_micros().map(spoken_cost), Some(status.to_owned())]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
@@ -1138,7 +1170,7 @@ mod tests {
     #[test]
     fn opaque_agent_ids_shorten_but_names_do_not() {
         assert_eq!(super::short_id("a000974c519f6187a".into()), "a000974");
-        assert_eq!(super::short_id("explorer".into()), "explorer");
+        assert_eq!(super::short_id("explorer".into()), "Explorer");
     }
 
     use super::*;
@@ -1188,6 +1220,10 @@ mod tests {
         assert_eq!(logo(harness_brand("simulated", "roo")), Some(Logo::RooCode), "falls back to the source adapter");
         assert_eq!(logo(harness_brand("copilot", "")), Some(Logo::Copilot));
         assert_eq!(logo(harness_brand("simulated", "simulated-live")), None);
+        assert_eq!(harness_label("claude-code", "").as_deref(), Some("Claude Code"));
+        assert_eq!(harness_label("simulated", "roo").as_deref(), Some("Roo Code"));
+        assert_eq!(harness_label("simulated", "simulated-live").as_deref(), Some("Simulated"));
+        assert_eq!(harness_label("", ""), None);
 
         let vendor = |m: &str| logo(vendor_brand(Some(m), None));
         assert_eq!(vendor("claude-opus-5-5"), Some(Logo::Claude));
@@ -1322,13 +1358,22 @@ mod tests {
         assert_eq!(glyph(sub), (IconName::Users, Ink::Kind(Tone::Agent)));
         assert_eq!(glyph(bash), (IconName::SquareTerminal, Ink::Kind(Tone::Tool)));
         assert_eq!(tone(bash), Tone::Error, "a failed span paints with the error palette");
-        assert_eq!(detail(llm, "").as_deref(), Some("Sonnet 5.5"));
-        assert_eq!(title(llm), "LLM call", "a span named for its kind reads as the kind");
+        assert_eq!(detail(llm, &s).as_deref(), Some("Sonnet 5.5"));
+        assert_eq!(title(llm, &s.session), "LLM call", "a span named for its kind reads as the kind");
         let mut named_after_model = llm.clone();
         named_after_model.name = "claude-sonnet-5-5".into();
-        assert_eq!(title(&named_after_model), "LLM call");
-        assert_eq!(detail(bash, ""), None, "a tool named after itself gets no detail");
-        assert_eq!(detail(&s.spans[&"root".into()], "claude-code").as_deref(), Some("claude-code"));
+        assert_eq!(title(&named_after_model, &s.session), "LLM call");
+        assert_eq!(detail(bash, &s), None, "a tool named after itself gets no detail");
+        let root = &s.spans[&"root".into()];
+        assert_eq!((title(root, &s.session), detail(root, &s)), ("Claude Code".to_owned(), Some("Sonnet 5.5".to_owned())), "the agent reads as its harness and model");
+        let mut unknown = s.session.clone();
+        unknown.harness = "simulated".into();
+        let mut named = root.clone();
+        named.agent_name = Some("main".into());
+        assert_eq!(title(&named, &unknown), "Main", "an unknown harness falls back to the agent's name");
+        let mut turn = root.clone();
+        (turn.kind, turn.name) = (SpanKind::Turn, "turn 1".into());
+        assert_eq!(title(&turn, &s.session), "Turn 1");
         let label = |id: &str| bar_label(&s.spans[&id.into()], &s.subtree_totals(&id.into()), None, 40_000 * MS);
         assert_eq!(label("llm"), "3s · $0.05");
         assert_eq!(label("Bash"), "1s");
@@ -1399,7 +1444,7 @@ mod tests {
         let mut t = s.spans[&"Bash".into()].clone();
         t.name = "mcp__github__create_issue".into();
         t.tool_name = Some(t.name.clone());
-        assert_eq!((title(&t), detail(&t, "")), ("create_issue".to_owned(), Some("github".to_owned())));
+        assert_eq!((title(&t, &s.session), detail(&t, &s)), ("create_issue".to_owned(), Some("github".to_owned())));
     }
 
     #[test]
@@ -1531,10 +1576,10 @@ mod tests {
     #[test]
     fn rows_read_aloud_as_kind_model_time_cost_and_outcome() {
         let s = state();
-        let label = |id: &str| row_label(&s.spans[&id.into()], &s.subtree_totals(&id.into()), None, 40_000 * MS);
+        let label = |id: &str| row_label(&s.spans[&id.into()], &s, &s.subtree_totals(&id.into()), None, 40_000 * MS);
         let mut llm = s.spans[&"llm".into()].clone();
         llm.name = "llm call".into();
-        assert_eq!(row_label(&llm, &s.subtree_totals(&"llm".into()), None, 40_000 * MS), "LLM call, Sonnet 5.5, 3 seconds, 5 cents, succeeded");
+        assert_eq!(row_label(&llm, &s, &s.subtree_totals(&"llm".into()), None, 40_000 * MS), "LLM call, Sonnet 5.5, 3 seconds, 5 cents, succeeded");
         assert_eq!(label("Bash"), "Bash, 1 second, failed");
         assert_eq!(spoken_duration(1_600 * MS), "1.6 seconds");
         assert_eq!(spoken_duration(250 * MS), "250 milliseconds");
@@ -1555,7 +1600,7 @@ mod tests {
         let mut llm = s.spans[&"llm".into()].clone();
         for name in ["llm call", "LLM_call", "llm"] {
             llm.name = name.into();
-            assert_eq!(title(&llm), "LLM call", "{name}");
+            assert_eq!(title(&llm, &s.session), "LLM call", "{name}");
         }
     }
 

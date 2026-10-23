@@ -25,8 +25,8 @@ fn tmp(name: &str) -> PathBuf {
 fn tui(dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_trace-tui"))
         .args(args)
-        .env("TRACE_WATERFALL_DB", dir.join("t.db"))
-        .env("TRACE_WATERFALL_CONFIG", dir.join("missing.toml"))
+        .env("AGENTS_TRACE_WATERFALL_DB", dir.join("t.db"))
+        .env("AGENTS_TRACE_WATERFALL_CONFIG", dir.join("missing.toml"))
         .output()
         .unwrap()
 }

@@ -1,6 +1,6 @@
 # Privacy
 
-Agent traces often contain secrets and proprietary source code. trace-waterfall therefore records metadata by default and never collects raw content unless you opt in.
+Agent traces often contain secrets and proprietary source code. agents-trace-waterfall therefore records metadata by default and never collects raw content unless you opt in.
 
 ## What is collected by default
 

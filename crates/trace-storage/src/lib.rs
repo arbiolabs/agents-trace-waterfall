@@ -414,13 +414,13 @@ impl Store {
     }
 }
 
-/// `$TRACE_WATERFALL_DB`, else `~/.local/share/trace-waterfall/traces.db`.
+/// `$AGENTS_TRACE_WATERFALL_DB`, else `~/.local/share/agents-trace-waterfall/traces.db`.
 pub fn default_db_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("TRACE_WATERFALL_DB") {
+    if let Some(p) = std::env::var_os("AGENTS_TRACE_WATERFALL_DB") {
         return PathBuf::from(p);
     }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    home.join(".local/share/trace-waterfall/traces.db")
+    home.join(".local/share/agents-trace-waterfall/traces.db")
 }
 
 fn redacted(e: &CanonicalEvent) -> Result<CanonicalEvent> {

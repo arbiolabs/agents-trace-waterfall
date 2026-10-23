@@ -177,7 +177,7 @@ SQLite in WAL mode, schema migrations, indexed tables for `sessions`, `spans`, `
 ## 10. Proposed crates / modules
 
 ```
-trace-waterfall/
+agents-trace-waterfall/
   Cargo.toml
   crates/
     trace-core/        # Domain types, reducer, clock, ordering, cost rules
