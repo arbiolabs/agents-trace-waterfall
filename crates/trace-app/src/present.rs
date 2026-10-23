@@ -3,6 +3,7 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::{Hsla, rgb};
 use trace_core::{Ns, SessionStatus, Span, SpanKind, SpanStatus, Totals, TraceState};
+use trace_storage::SessionSummary;
 use trace_view::{Row, format_cost, format_duration, format_tokens};
 
 /// Which palette column a span paints with.
@@ -302,7 +303,7 @@ impl ToolCategory {
             Self::Browser => IconName::AppWindow,
             Self::Agent => IconName::Users,
             Self::Plan => IconName::ListChecks,
-            Self::Memory => IconName::Bookmark,
+            Self::Memory => IconName::Brain,
             Self::Database => IconName::Database,
             Self::Git => IconName::GitBranch,
             Self::Build => IconName::Package,
@@ -453,7 +454,7 @@ pub fn offscreen_hint(start: Ns, end: Ns, window: (Ns, Ns), following_now: Optio
             Some(now) => format!("{} ago", format_duration(now - end)),
             None => format!("{} before", format_duration(window.0 - end)),
         };
-        Some((Edge::Left, format!("{} · {gap}", format_duration(end - start))))
+        Some((Edge::Left, format!("{} · {gap}", format_duration((end - start).max(0)))))
     } else if start > window.1 {
         Some((Edge::Right, format!("{} after", format_duration(start - window.1))))
     } else {
@@ -921,6 +922,178 @@ pub fn group(live: bool, started: Option<Ns>, today_start: Ns) -> Group {
     }
 }
 
+/// How the sidebar lists sessions: by recency (Live, Today, Earlier) or by where they ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SidebarMode {
+    #[default]
+    Recent,
+    Workspaces,
+}
+
+impl SidebarMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            SidebarMode::Recent => "Recent",
+            SidebarMode::Workspaces => "Workspaces",
+        }
+    }
+}
+
+/// The sidebar's tree. Recent mode yields only `Section`s; Workspaces mode only `Workspace`s.
+#[derive(Debug, PartialEq)]
+pub enum SidebarNode<'a> {
+    Section { group: Group, sessions: Vec<&'a SessionSummary> },
+    Workspace(Workspace<'a>),
+}
+
+/// The parent directory of a set of projects: `~/code/tools` holds `trace-waterfall` and `tw-r5`.
+/// `path` is empty for sessions that never reported a working directory.
+#[derive(Debug, PartialEq)]
+pub struct Workspace<'a> {
+    pub path: String,
+    pub name: String,
+    pub projects: Vec<Project<'a>>,
+}
+
+/// One working directory and the sessions that ran in it, live first, then latest first.
+#[derive(Debug, PartialEq)]
+pub struct Project<'a> {
+    pub path: String,
+    pub name: String,
+    pub sessions: Vec<&'a SessionSummary>,
+    /// How many of `sessions` are live as of the grouping's `now`; idle ones are not.
+    pub live: usize,
+}
+
+pub const NO_WORKSPACE: &str = "No workspace";
+
+impl Workspace<'_> {
+    pub fn sessions(&self) -> usize {
+        self.projects.iter().map(|p| p.sessions.len()).sum()
+    }
+
+    pub fn live(&self) -> usize {
+        self.projects.iter().map(|p| p.live).sum::<usize>()
+    }
+
+    /// The state key under which the sidebar remembers this workspace collapsed.
+    pub fn key(&self) -> String {
+        format!("w:{}", self.path)
+    }
+
+    /// `Workspace tools, 6 sessions, 1 live`, for VoiceOver.
+    pub fn spoken(&self) -> String {
+        spoken_counts(&format!("Workspace {}", self.name), self.sessions(), self.live())
+    }
+}
+
+impl Project<'_> {
+    pub fn cost(&self) -> Option<u64> {
+        self.sessions.iter().filter_map(|s| s.totals.cost_usd_micros()).reduce(|a, b| a + b)
+    }
+
+    pub fn key(&self) -> String {
+        format!("p:{}", self.path)
+    }
+
+    pub fn spoken(&self) -> String {
+        let base = spoken_counts(&format!("Project {}", self.name), self.sessions.len(), self.live);
+        match self.cost() {
+            Some(c) => format!("{base}, {}", spoken_cost(c)),
+            None => base,
+        }
+    }
+}
+
+fn spoken_counts(head: &str, sessions: usize, live: usize) -> String {
+    let n = if sessions == 1 { "1 session".to_owned() } else { format!("{sessions} sessions") };
+    if live > 0 { format!("{head}, {n}, {live} live") } else { format!("{head}, {n}") }
+}
+
+/// When a session last did anything.
+fn activity(s: &SessionSummary) -> Ns {
+    s.last_event_at_utc_ns.or(s.ended_at_utc_ns).or(s.started_at_utc_ns).unwrap_or(0)
+}
+
+/// Live work first, then the most recent: a sort key, smallest first.
+fn rank(live: bool, at: Ns) -> (bool, std::cmp::Reverse<Ns>) {
+    (!live, std::cmp::Reverse(at))
+}
+
+fn basename(path: &str) -> &str {
+    path.trim_end_matches('/').rsplit('/').next().unwrap_or("")
+}
+
+fn parent(path: &str) -> &str {
+    let p = path.trim_end_matches('/');
+    match p.rfind('/') {
+        Some(0) => "/",
+        Some(i) => &p[..i],
+        None => "",
+    }
+}
+
+/// Groups sessions for the sidebar. Recent mode buckets them into Live, Today, and Earlier by `today_start`.
+/// Workspaces mode nests them as workspace (the project directory's parent), project (the working
+/// directory), session. At every level, anything live as of `now` floats to the top, then the most
+/// recent activity; sessions without a working directory gather last under `No workspace`.
+pub fn group_sessions<'a>(sessions: &'a [SessionSummary], mode: SidebarMode, now: Ns, today_start: Ns) -> Vec<SidebarNode<'a>> {
+    let live = |s: &SessionSummary| session_status(s.status, s.last_event_at_utc_ns, now) == Status::Live;
+    let mut sorted: Vec<&SessionSummary> = sessions.iter().collect();
+    sorted.sort_by_key(|s| rank(live(s), activity(s)));
+    if mode == SidebarMode::Recent {
+        let mut out: Vec<(Group, Vec<&SessionSummary>)> = Vec::new();
+        for s in sessions {
+            let g = group(s.status == SessionStatus::Live, s.started_at_utc_ns.or(s.last_event_at_utc_ns), today_start);
+            match out.iter_mut().find(|(k, _)| *k == g) {
+                Some((_, v)) => v.push(s),
+                None => out.push((g, vec![s])),
+            }
+        }
+        out.sort_by_key(|(g, _)| *g);
+        return out.into_iter().map(|(group, sessions)| SidebarNode::Section { group, sessions }).collect();
+    }
+    let mut spaces: Vec<Workspace> = Vec::new();
+    for s in sorted {
+        let dir = s.working_directory.trim();
+        let (ws_path, project_path) = if dir.is_empty() { (String::new(), format!("#{}", s.project_id)) } else { (parent(dir).to_owned(), dir.to_owned()) };
+        let ws = match spaces.iter().position(|w| w.path == ws_path) {
+            Some(i) => &mut spaces[i],
+            None => {
+                let name = if ws_path.is_empty() { NO_WORKSPACE.to_owned() } else { Some(basename(&ws_path)).filter(|n| !n.is_empty()).unwrap_or("/").to_owned() };
+                spaces.push(Workspace { path: ws_path, name, projects: Vec::new() });
+                spaces.last_mut().expect("just pushed")
+            }
+        };
+        match ws.projects.iter_mut().find(|p| p.path == project_path) {
+            Some(p) => {
+                p.live += usize::from(live(s));
+                p.sessions.push(s);
+            }
+            None => {
+                let name = Some(basename(dir)).filter(|n| !n.is_empty()).map(str::to_owned).or_else(|| Some(s.project_id.clone()).filter(|p| !p.is_empty())).unwrap_or_else(|| "Untitled".to_owned());
+                ws.projects.push(Project { path: project_path, name, live: usize::from(live(s)), sessions: vec![s] });
+            }
+        }
+    }
+    // Sessions arrived ranked, so each project's first session and each workspace's first project carry
+    // its rank, and a stable sort by that keeps the order the sessions gave.
+    let head = |p: &Project| rank(live(p.sessions[0]), activity(p.sessions[0]));
+    for w in &mut spaces {
+        w.projects.sort_by_key(|p| head(p));
+    }
+    spaces.sort_by_key(|w| (w.path.is_empty(), head(&w.projects[0])));
+    spaces.into_iter().map(SidebarNode::Workspace).collect()
+}
+
+/// `/Users/d/code/tools` → `~/code/tools` when `home` is `/Users/d`.
+pub fn tilde(path: &str, home: &str) -> String {
+    match path.strip_prefix(home) {
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => format!("~{rest}"),
+        _ => path.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1232,6 +1405,7 @@ mod tests {
         assert_eq!(offscreen_hint(3_950_000 * MS, 4_190_000 * MS, w, None), None);
         assert_eq!(offscreen_hint(0, 2_700 * MS, w, Some(now)), Some((Edge::Left, "2.7s · 8h19m ago".into())), "following reads from real now");
         assert_eq!(offscreen_hint(4_180_000 * MS, 4_190_000 * MS, w, Some(now)), Some((Edge::Right, "3m after".into())));
+        assert_eq!(offscreen_hint(2_700 * MS, 2_699 * MS, w, None), Some((Edge::Left, "0s · 1h4m before".into())), "an end logged before its start reads as an instant");
     }
 
     #[test]
@@ -1371,5 +1545,92 @@ mod tests {
         assert_eq!(group(false, Some(150), 100), Group::Today);
         assert_eq!(group(false, Some(50), 100), Group::Earlier);
         assert_eq!(group(false, None, 100), Group::Earlier);
+    }
+
+    fn summary(id: &str, dir: &str, status: SessionStatus, last: Ns) -> SessionSummary {
+        SessionSummary {
+            session_id: id.into(),
+            project_id: format!("{id}-project"),
+            working_directory: dir.into(),
+            source_adapter: String::new(),
+            harness: String::new(),
+            host: String::new(),
+            status,
+            started_at_utc_ns: Some(last - 10),
+            ended_at_utc_ns: None,
+            last_event_at_utc_ns: Some(last),
+            model: None,
+            totals: Totals::default(),
+            span_count: 0,
+            turn_count: 0,
+        }
+    }
+
+    #[test]
+    fn workspaces_nest_projects_and_float_live_work_to_the_top() {
+        let h = 3_600_000 * MS;
+        let now = 100 * h;
+        let mut sessions = vec![
+            summary("a", "/u/code/tools/trace-waterfall", SessionStatus::Completed, now - 9 * h),
+            summary("b", "/u/code/tools/tw-r5/", SessionStatus::Live, now - MS),
+            summary("c", "/u/code/tools/trace-waterfall", SessionStatus::Completed, now - 7 * h),
+            summary("d", "/u/work/api", SessionStatus::Completed, now - 5 * h),
+            summary("e", "", SessionStatus::Failed, now - h),
+            summary("f", "/u/work/api", SessionStatus::Live, now - 20 * h),
+        ];
+        sessions[0].totals.cost_actual_usd_micros = 20_000;
+        sessions[0].totals.billable_records = 1;
+        sessions[2].totals.cost_actual_usd_micros = 5_000;
+        sessions[2].totals.billable_records = 1;
+        let tree = group_sessions(&sessions, SidebarMode::Workspaces, now, 0);
+        let shape: Vec<(String, Vec<(String, Vec<String>)>)> = tree
+            .iter()
+            .map(|n| match n {
+                SidebarNode::Workspace(w) => (w.name.clone(), w.projects.iter().map(|p| (p.name.clone(), p.sessions.iter().map(|s| s.session_id.0.clone()).collect())).collect()),
+                SidebarNode::Section { .. } => panic!("workspaces mode has no sections"),
+            })
+            .collect();
+        let own = |w: &str, ps: &[(&str, &[&str])]| (w.to_owned(), ps.iter().map(|(p, ss)| (p.to_string(), ss.iter().map(|s| s.to_string()).collect())).collect::<Vec<_>>());
+        assert_eq!(
+            shape,
+            [
+                own("tools", &[("tw-r5", &["b"]), ("trace-waterfall", &["c", "a"])]),
+                own("work", &[("api", &["d", "f"])]),
+                own(NO_WORKSPACE, &[("e-project", &["e"])]),
+            ],
+            "live first, then latest; an idle live session sorts by its last activity; no workspace goes last"
+        );
+        let SidebarNode::Workspace(tools) = &tree[0] else { unreachable!() };
+        assert_eq!(tools.path, "/u/code/tools");
+        assert_eq!(tools.spoken(), "Workspace tools, 3 sessions, 1 live");
+        assert_eq!(tools.projects[1].spoken(), "Project trace-waterfall, 2 sessions, 3 cents");
+        assert_eq!(tools.projects[1].cost(), Some(25_000));
+        assert_eq!(tools.projects[0].cost(), None);
+        let SidebarNode::Workspace(work) = &tree[1] else { unreachable!() };
+        assert_eq!((work.live(), work.spoken()), (0, "Workspace work, 2 sessions".to_owned()), "idle is not live");
+        assert_eq!((tools.key(), tools.projects[0].key()), ("w:/u/code/tools".to_owned(), "p:/u/code/tools/tw-r5/".to_owned()));
+    }
+
+    #[test]
+    fn recent_mode_buckets_by_liveness_then_day() {
+        let now = 1_000;
+        let sessions = [summary("a", "/x", SessionStatus::Completed, 300), summary("b", "/x", SessionStatus::Live, 900), summary("c", "/x", SessionStatus::Completed, 600)];
+        let tree = group_sessions(&sessions, SidebarMode::Recent, now, 500);
+        let shape: Vec<(Group, Vec<&str>)> = tree
+            .iter()
+            .map(|n| match n {
+                SidebarNode::Section { group, sessions } => (*group, sessions.iter().map(|s| s.session_id.0.as_str()).collect()),
+                SidebarNode::Workspace(_) => panic!("recent mode has no workspaces"),
+            })
+            .collect();
+        assert_eq!(shape, [(Group::Live, vec!["b"]), (Group::Today, vec!["c"]), (Group::Earlier, vec!["a"])]);
+    }
+
+    #[test]
+    fn home_abbreviates_to_a_tilde() {
+        assert_eq!(tilde("/Users/d/code/tools", "/Users/d"), "~/code/tools");
+        assert_eq!(tilde("/Users/d", "/Users/d"), "~");
+        assert_eq!(tilde("/Users/dan/x", "/Users/d"), "/Users/dan/x");
+        assert_eq!(tilde("/opt/x", ""), "/opt/x");
     }
 }

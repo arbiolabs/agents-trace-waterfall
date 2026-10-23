@@ -1110,8 +1110,10 @@ impl TraceApp {
             .child(list)
             .child(
                 div().px(px(14.)).pb(px(14.)).pt(px(6.)).child(
-                    div()
-                        .id("import")
+                    focusable(div().id("import"), pal, pal.tray, TAB_SIDEBAR)
+                        .role(Role::Button)
+                        .aria_label("Import JSONL")
+                        .tooltip(|w, cx| Tooltip::new("Import a JSONL trace  ⌘O").build(w, cx))
                         .h(px(30.))
                         .flex()
                         .items_center()
@@ -1225,7 +1227,8 @@ fn soft_shadow(pal: &Palette, alpha: f32, y: f32, blur: f32) -> BoxShadow {
 /// harness has no logo. `badge` is false for rows that go without one.
 fn session_lead(pal: &Palette, harness: Option<present::Brand>, status: Status, badge: bool, ring: Hsla, id: impl Into<ElementId>) -> AnyElement {
     let slot = div().w(px(16.)).flex_shrink_0().flex().justify_center();
-    let Some(b) = harness else { return slot.pt(px(4.)).child(status_mark(pal, status, id)).into_any_element() };
+    // Without a tile, a row that goes without a badge keeps its glyph, faded, so the column stays aligned.
+    let Some(b) = harness else { return slot.pt(px(4.)).when(!badge, |el| el.opacity(0.4)).child(status_mark(pal, status, id)).into_any_element() };
     slot.pt(px(1.))
         .child(
             div()
@@ -2251,11 +2254,11 @@ impl TraceApp {
             .rounded(px(5.))
             .when(clip_l, |el| el.rounded_l(px(0.)))
             .when(clip_r, |el| el.rounded_r(px(0.)))
-            .border_1()
+            .border(px(if pal.contrast { 1.5 } else { 1. }))
             .overflow_hidden()
             .border_color(if hovered { kc.mark } else { kc.edge });
         bar = if open {
-            bar.bg(linear_gradient(90., linear_color_stop(kc.bg, 0.55), linear_color_stop(kc.bg.opacity(0.0), 1.))).border_color(kc.edge.opacity(0.7)).child(
+            bar.bg(linear_gradient(90., linear_color_stop(kc.bg, 0.55), linear_color_stop(kc.bg.opacity(0.0), 1.))).border_color(if pal.contrast { kc.edge } else { kc.edge.opacity(0.7) }).child(
                 div().absolute().top_0().bottom_0().w(px(60.)).bg(linear_gradient(90., linear_color_stop(kc.mark.opacity(0.), 0.), linear_color_stop(kc.mark.opacity(0.18), 1.))).with_animation(
                     ("sweep", ix),
                     Animation::new(Duration::from_millis(1500)).repeat(),
@@ -2713,19 +2716,20 @@ impl TraceApp {
         // A faint, inert waterfall behind the copy that fades out radially around it, so the empty card
         // already looks like what it will hold. Painted per column: GPUI has no radial gradient.
         // A waterfall: an agent bar over the whole run, then calls stepping down and to the right.
-        let sample = [(Tone::Agent, 0.08, 0.84), (Tone::Llm, 0.11, 0.2), (Tone::Tool, 0.32, 0.12), (Tone::Llm, 0.45, 0.24), (Tone::Tool, 0.7, 0.18)];
+        let sample = [(Tone::Agent, 0.06, 0.86), (Tone::Llm, 0.1, 0.22), (Tone::Tool, 0.3, 0.14), (Tone::Llm, 0.42, 0.24), (Tone::Tool, 0.64, 0.2)];
         let colors = sample.map(|(t, x, w)| (pal.kind(t).edge, x, w));
         let ghost = canvas(|_, _, _| {}, move |b, _, window, _| {
             let (w, h) = (b.size.width.to_f64() as f32, b.size.height.to_f64() as f32);
             let (cx, cy) = (w / 2., h / 2.);
             let rows = colors.len() as f32;
             for (i, (color, x0, bw)) in colors.iter().enumerate() {
-                let y = cy + (i as f32 - (rows - 1.) / 2.) * 4.5 * BAR_H;
+                let y = cy + (i as f32 - (rows - 1.) / 2.) * 4. * BAR_H;
                 let (a, z) = ((x0 * w).round() as i32, ((x0 + bw) * w).round() as i32);
                 for x in a..z {
                     let d = (((x as f32 - cx) / 300.).powi(2) + ((y - cy) / 150.).powi(2)).sqrt();
                     let taper = ((x - a).min(z - 1 - x) as f32 / 5.).clamp(0.2, 1.);
-                    let alpha = ((d - 0.8) / 0.9).clamp(0., 1.) * 0.4 * taper;
+                    // Never fully gone behind the copy, so all five rows still read as one waterfall.
+                    let alpha = (0.15 + 0.85 * ((d - 0.7) / 0.8).clamp(0., 1.)) * 0.4 * taper;
                     if alpha > 0. {
                         window.paint_quad(fill(Bounds::new(b.origin + point(px(x as f32), px(y - BAR_H / 2.)), size(px(1.), px(BAR_H))), color.opacity(alpha)));
                     }
@@ -2823,7 +2827,11 @@ fn list_section(pal: &Palette, title: String, items: Vec<(String, String)>) -> i
 /// A span's mark at the size it draws inside a `tile` point tile: its brand logo, else its lucide glyph.
 fn span_mark(s: &Span, session: &trace_core::Session, tile: f32, pal: &Palette) -> AnyElement {
     match present::brand_for(s, present::harness_brand(&session.harness, &session.source_adapter)) {
-        Some(b) => logo(b, b.logo.size_in(tile), pal),
+        // Below 24pt the harness mascots smudge, so they draw as their small marks, as in the sidebar.
+        Some(b) => {
+            let b = if tile < 24. { present::Brand { logo: b.logo.small(), ..b } } else { b };
+            logo(b, b.logo.size_in(tile), pal)
+        }
         None => {
             let size = (tile * 0.6).round();
             let (icon, ink) = present::glyph(s);
