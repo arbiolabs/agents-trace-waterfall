@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-10-24
+
+### Changed
+
+- Following a live session keeps its newest activity in view: the span list scrolls down as new events
+  arrive, to the new span's row or the collapsed row it sits under.
+
 ## [1.2.0] - 2026-10-23
 
 Twelve more harnesses and an OpenTelemetry receiver, live sessions that stay live without a separate
@@ -138,7 +145,8 @@ terminal UI over the same recorded traces.
   time axis and previous / next activity (`{` / `}`).
 - Unicode and ASCII glyphs, colour and monochrome themes. Usable down to 60×18.
 
-[Unreleased]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/diego-arbio-dev/agents-trace-waterfall/releases/tag/v1.0.0

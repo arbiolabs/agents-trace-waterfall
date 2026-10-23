@@ -513,11 +513,22 @@ impl TraceApp {
             self.error = Some(format!("{e:#}"));
         }
         if doc.state.spans.len() != self.seen.len() {
-            for id in doc.state.spans.keys() {
+            let mut newest: Option<SpanId> = None;
+            for (id, s) in &doc.state.spans {
                 if !self.seen.contains_key(id) {
                     self.seen.insert(id.clone(), now);
                     self.reveal_until = now + REVEAL;
+                    if newest.as_ref().is_none_or(|n| doc.state.spans[n].started_at_utc_ns <= s.started_at_utc_ns) {
+                        newest = Some(id.clone());
+                    }
                 }
+            }
+            // Following keeps the newest activity in view: its row, or the folded row it sits under.
+            if matches!(doc.mode, Mode::Live { following: true, .. })
+                && now_visible(doc)
+                && let Some(row) = newest.and_then(|id| row_of_or_ancestor(doc, id))
+            {
+                self.list.scroll_to_item(row, ScrollStrategy::Nearest);
             }
         }
         let running = match &doc.mode {
@@ -3456,6 +3467,16 @@ fn idle(doc: &TraceDoc) -> Option<Ns> {
 /// Where open spans stop drawing; see `present::shown_end`.
 fn shown_end(doc: &TraceDoc) -> Option<Ns> {
     present::shown_end(&doc.state, idle(doc))
+}
+
+/// The row showing `id`, or the nearest ancestor's row when a collapsed parent hides it.
+fn row_of_or_ancestor(doc: &TraceDoc, mut id: SpanId) -> Option<usize> {
+    loop {
+        if let Some(i) = doc.rows.iter().position(|r| r.kind == RowKind::Span(id.clone())) {
+            return Some(i);
+        }
+        id = doc.state.spans.get(&id)?.parent_span_id.clone()?;
+    }
 }
 
 fn now_visible(doc: &TraceDoc) -> bool {
