@@ -135,6 +135,7 @@ pub struct SessionSummary {
     pub model: Option<String>,
     pub totals: Totals,
     pub span_count: usize,
+    pub turn_count: usize,
 }
 
 pub struct Store {
@@ -242,7 +243,9 @@ impl Store {
     }
 
     pub fn list_sessions(&self, filter: &SessionFilter) -> Result<Vec<SessionSummary>> {
-        let mut sql = String::from("SELECT * FROM sessions WHERE 1 = 1");
+        let mut sql = String::from(
+            "SELECT *, (SELECT COUNT(*) FROM spans p WHERE p.session_id = sessions.session_id AND p.kind = 'turn') FROM sessions WHERE 1 = 1",
+        );
         let mut args: Vec<String> = Vec::new();
         let mut bind = |sql: &mut String, clause: &str, arg: String| {
             args.push(arg);
@@ -566,6 +569,7 @@ fn summary_row(r: &rusqlite::Row) -> rusqlite::Result<SessionSummary> {
             failed_spans: u(19)? as usize,
         },
         span_count: u(20)? as usize,
+        turn_count: u(21)? as usize,
     })
 }
 

@@ -327,6 +327,7 @@ fn list_sessions_filters_and_totals() {
             model: Some("opus".into()),
             totals: expected_totals(),
             span_count: 4,
+            turn_count: 0,
         }
     );
     assert_eq!(all[0].status, SessionStatus::Live);

@@ -1597,7 +1597,7 @@ impl TraceApp {
             }));
         if selected && !matches!(self.popover, Pop::Closed) {
             let end = s.effective_end(doc.state.session.ended_at_utc_ns, g.now);
-            let x = g.name_w + present::popover_x(g.x(s.started_at_utc_ns), g.x(end), g.tl_w + TL_PAD_R, POPOVER_W);
+            let x = g.name_w + g.x(s.started_at_utc_ns).max(0.) + 0. * g.x(end);
             el = el.child(
                 deferred(
                     anchored()

@@ -115,6 +115,7 @@ pub fn detail(s: &Span, harness: &str) -> Option<String> {
     let nonempty = |v: Option<&str>| v.filter(|v| !v.is_empty()).map(str::to_owned);
     match s.kind {
         SpanKind::Llm => s.model.as_deref().map(pretty_model).or_else(|| nonempty(s.provider.as_deref())),
+        SpanKind::Tool if mcp_parts(&s.name).is_some() => mcp_parts(&s.name).map(|(_, server)| server.to_owned()),
         SpanKind::Tool => nonempty(s.tool_name.as_deref())
             .filter(|t| !t.eq_ignore_ascii_case(&s.name))
             .or_else(|| nonempty(s.provider.as_deref())),
@@ -130,10 +131,128 @@ fn short_id(v: String) -> String {
 }
 
 /// The row title. An LLM span named after its model reads `LLM call`, since the detail already names the model.
+/// An MCP tool name, `mcp__server__tool`, reads as the tool with the server as its detail.
 pub fn title(s: &Span) -> String {
     match (&s.kind, s.model.as_deref()) {
         (SpanKind::Llm, Some(m)) if m == s.name => kind_label(SpanKind::Llm).to_owned(),
-        _ => s.name.clone(),
+        _ => mcp_parts(&s.name).map_or_else(|| s.name.clone(), |(tool, _)| tool.to_owned()),
+    }
+}
+
+/// `mcp__github__create_issue` → `(create_issue, github)`.
+pub fn mcp_parts(name: &str) -> Option<(&str, &str)> {
+    let (server, tool) = name.strip_prefix("mcp__")?.split_once("__")?;
+    (!server.is_empty() && !tool.is_empty()).then_some((tool, server))
+}
+
+/// Keeps both ends of a long name, which is where paths and tool names differ: `read_project_fi…_config.json`.
+pub fn middle_truncate(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max || max < 3 {
+        return s.to_owned();
+    }
+    let tail = (max - 1) / 2;
+    let head = max - 1 - tail;
+    let chars: Vec<char> = s.chars().collect();
+    format!("{}…{}", chars[..head].iter().collect::<String>(), chars[n - tail..].iter().collect::<String>())
+}
+
+/// Which timeline edge a span lies beyond.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    Left,
+    Right,
+}
+
+/// For a span wholly outside the visible `window`, the edge it lies past and what the edge hint reads:
+/// `2.7s · 1h5m ago` (its length, then how long before the window it ended) or `3m later`.
+pub fn offscreen_hint(start: Ns, end: Ns, window: (Ns, Ns)) -> Option<(Edge, String)> {
+    if end < window.0 {
+        Some((Edge::Left, format!("{} · {} ago", format_duration(end - start), format_duration(window.0 - end))))
+    } else if start > window.1 {
+        Some((Edge::Right, format!("{} later", format_duration(start - window.1))))
+    } else {
+        None
+    }
+}
+
+/// Above this many spans a trace opens with its finished turns folded.
+pub const FOLD_ABOVE: usize = 500;
+
+/// Turns to fold when a big trace opens: every turn with children except the latest and any still running.
+pub fn default_folds(state: &TraceState) -> Vec<trace_core::SpanId> {
+    if state.spans.len() <= FOLD_ABOVE {
+        return Vec::new();
+    }
+    let turns: Vec<&Span> = state.spans.values().filter(|s| s.kind == SpanKind::Turn && !state.children(&s.span_id).is_empty()).collect();
+    let latest = turns.iter().max_by(|a, b| (a.started_at_utc_ns, &a.span_id).cmp(&(b.started_at_utc_ns, &b.span_id))).map(|s| s.span_id.clone());
+    let mut out: Vec<_> = turns.into_iter().filter(|s| s.ended_at_utc_ns.is_some() && Some(&s.span_id) != latest.as_ref()).map(|s| s.span_id.clone()).collect();
+    out.sort();
+    out
+}
+
+/// The overview's caption: `All · 16.2s` for the whole trace, else `7h18m – 7h31m · 13m of 8h12m`.
+pub fn overview_label(window: (Ns, Ns), whole: (Ns, Ns)) -> String {
+    let total = whole.1 - whole.0;
+    if window.0 <= whole.0 && window.1 >= whole.1 {
+        return format!("All · {}", format_duration(total));
+    }
+    let a = (window.0 - whole.0).clamp(0, total);
+    let b = (window.1 - whole.0).clamp(a, total);
+    format!("{} – {} · {} of {}", format_duration(a), format_duration(b), format_duration(window.1 - window.0), format_duration(total))
+}
+
+/// Overview density: each span counts once in every column it touches, per lane, and a column's alpha
+/// is its count over the lane's busiest column, floored so a lone span stays visible.
+pub fn density(spans: impl IntoIterator<Item = (f32, f32, usize)>, cols: usize) -> Vec<[f32; 4]> {
+    const FLOOR: f32 = 0.18;
+    let mut counts = vec![[0u32; 4]; cols];
+    if cols == 0 {
+        return Vec::new();
+    }
+    for (x0, x1, lane) in spans {
+        let col = |x: f32| (x.floor().max(0.) as usize).min(cols - 1);
+        let (a, b) = (col(x0), col(x1));
+        counts[a..=b.max(a)].iter_mut().for_each(|c| c[lane] += 1);
+    }
+    let mut peak = [1u32; 4];
+    for c in &counts {
+        for k in 0..4 {
+            peak[k] = peak[k].max(c[k]);
+        }
+    }
+    counts.iter().map(|c| std::array::from_fn(|k| if c[k] == 0 { 0. } else { (c[k] as f32 / peak[k] as f32).max(FLOOR) })).collect()
+}
+
+/// The overview lens never draws narrower than this, so it stays grabbable.
+pub const LENS_MIN: f32 = 24.;
+const LENS_HANDLE: f32 = 6.;
+
+/// The lens as drawn: the window's true extent widened about its center to `LENS_MIN`, kept inside the strip.
+pub fn lens_rect(x0: f32, x1: f32, strip_w: f32) -> (f32, f32) {
+    let w = (x1 - x0).max(LENS_MIN).min(strip_w);
+    let a = ((x0 + x1 - w) / 2.).clamp(0., (strip_w - w).max(0.));
+    (a, a + w)
+}
+
+/// What a press at `x` grabs on the drawn lens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grab {
+    Start,
+    End,
+    Inside,
+    Outside,
+}
+
+pub fn lens_grab(x: f32, lens: (f32, f32)) -> Grab {
+    if (lens.0 - 2.0..lens.0 + LENS_HANDLE).contains(&x) {
+        Grab::Start
+    } else if (lens.1 - LENS_HANDLE..=lens.1 + 2.0).contains(&x) {
+        Grab::End
+    } else if (lens.0..lens.1).contains(&x) {
+        Grab::Inside
+    } else {
+        Grab::Outside
     }
 }
 
@@ -197,17 +316,37 @@ pub fn label_at(bar_x: f32, bar_w: f32, label_w: f32, width: f32) -> LabelAt {
     }
 }
 
-/// Left edge of the detail popover: beside the bar so it never hides the span's own subtree,
-/// right of it when there is room, else left of it, else pinned to the timeline's right edge.
-pub fn popover_x(bar_x0: f32, bar_x1: f32, width: f32, pop_w: f32) -> f32 {
-    const GAP: f32 = 16.0;
-    if bar_x1 + GAP + pop_w <= width {
-        bar_x1.max(0.0) + GAP
-    } else if bar_x0 - GAP - pop_w >= 0.0 {
-        bar_x0 - GAP - pop_w
-    } else {
-        (width - pop_w).max(0.0)
-    }
+pub const POP_GAP: f32 = 6.;
+pub const POP_ARROW: f32 = 8.;
+const POP_MARGIN: f32 = 12.;
+
+/// Where the detail popover sits, in card coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placement {
+    pub x: f32,
+    /// Top of the popover body; the arrow sits in the gap between it and the bar.
+    pub y: f32,
+    pub max_h: f32,
+    pub above: bool,
+    /// Center of the arrow's base.
+    pub arrow_x: f32,
+}
+
+/// Below the bar, aligned to its start and kept 12pt inside the card. It flips above only when it would
+/// overflow below and there is more room above; either way it never grows past the card, and scrolls instead.
+/// `bar` is the bar's drawn x extent, `bar_y` its top and bottom, `pop` the popover's width and natural height.
+pub fn place_popover(bar: (f32, f32), bar_y: (f32, f32), card: (f32, f32), pop: (f32, f32)) -> Placement {
+    let (cw, ch) = card;
+    let (pw, ph) = pop;
+    let x = bar.0.min(cw - POP_MARGIN - pw).max(POP_MARGIN);
+    let below = bar_y.1 + POP_GAP + POP_ARROW;
+    let room_below = ch - POP_MARGIN - below;
+    let above_bottom = bar_y.0 - POP_GAP - POP_ARROW;
+    let room_above = above_bottom - POP_MARGIN;
+    let above = ph > room_below && room_above > room_below;
+    let (y, max_h) = if above { (above_bottom - ph.min(room_above), room_above) } else { (below, room_below) };
+    let arrow_x = (bar.0 + ((bar.1 - bar.0) / 2.).min(14.)).clamp(x + 18., x + pw - 18.);
+    Placement { x, y, max_h, above, arrow_x }
 }
 
 /// Ease-out quint, within 0.01 of the design's cubic-bezier(0.22, 1, 0.36, 1).
@@ -476,11 +615,93 @@ mod tests {
     }
 
     #[test]
-    fn popover_sits_beside_the_bar() {
-        assert_eq!(popover_x(10.0, 100.0, 1000.0, 330.0), 116.0);
-        assert_eq!(popover_x(600.0, 900.0, 1000.0, 330.0), 254.0);
-        assert_eq!(popover_x(100.0, 900.0, 1000.0, 330.0), 670.0);
-        assert_eq!(popover_x(-50.0, -20.0, 1000.0, 330.0), 16.0, "an off-screen bar puts it at the left edge");
+    fn popover_anchors_below_the_bar_and_flips_only_on_overflow() {
+        let p = place_popover((400., 600.), (100., 116.), (1200., 800.), (330., 300.));
+        assert_eq!(p, Placement { x: 400., y: 130., max_h: 658., above: false, arrow_x: 418. });
+        let p = place_popover((1000., 1010.), (100., 116.), (1200., 800.), (330., 300.));
+        assert_eq!((p.x, p.arrow_x), (858., 1005.), "clamped inside the card; the arrow still points at the bar");
+        let p = place_popover((400., 600.), (700., 716.), (1200., 800.), (330., 300.));
+        assert_eq!(p, Placement { x: 400., y: 386., max_h: 674., above: true, arrow_x: 418. });
+        let p = place_popover((400., 600.), (60., 76.), (1200., 400.), (330., 900.));
+        assert_eq!((p.y, p.max_h, p.above), (90., 298., false), "tall content scrolls below rather than flipping into less room");
+        assert_eq!(place_popover((0., 4.), (0., 16.), (1200., 800.), (330., 100.)).x, 12.);
+    }
+
+    #[test]
+    fn mcp_tools_read_as_tool_and_server() {
+        assert_eq!(mcp_parts("mcp__github__create_issue"), Some(("create_issue", "github")));
+        assert_eq!(mcp_parts("mcp__claude_ai_Linear__list_issues"), Some(("list_issues", "claude_ai_Linear")));
+        assert_eq!(mcp_parts("mcp__broken"), None);
+        assert_eq!(mcp_parts("Bash"), None);
+        let s = state();
+        let mut t = s.spans[&"Bash".into()].clone();
+        t.name = "mcp__github__create_issue".into();
+        t.tool_name = Some(t.name.clone());
+        assert_eq!((title(&t), detail(&t, "")), ("create_issue".to_owned(), Some("github".to_owned())));
+    }
+
+    #[test]
+    fn long_titles_keep_both_ends() {
+        assert_eq!(middle_truncate("read_project_file_config.json", 15), "read_pr…ig.json");
+        assert_eq!(middle_truncate("Bash", 15), "Bash");
+        assert_eq!(middle_truncate("abcdef", 5), "ab…ef");
+    }
+
+    #[test]
+    fn offscreen_spans_name_their_edge_and_distance() {
+        let w = (3_900_000 * MS, 4_000_000 * MS);
+        let left = offscreen_hint(0, 2_700 * MS, w);
+        assert_eq!(left, Some((Edge::Left, "2.7s · 1h4m ago".into())));
+        assert_eq!(offscreen_hint(4_180_000 * MS, 4_190_000 * MS, w), Some((Edge::Right, "3m later".into())));
+        assert_eq!(offscreen_hint(3_950_000 * MS, 4_190_000 * MS, w), None);
+    }
+
+    #[test]
+    fn big_traces_fold_finished_turns_but_the_latest() {
+        let mut events = vec![ev(1, 0, None, json!({"event_type": "session.started", "body": {"project_id": "p"}}))];
+        let mut seq = 2;
+        for t in 0..3 {
+            let turn = format!("turn{t}");
+            let at = t * 1_000 * MS;
+            events.push(start(seq, at, &turn, None, json!({"kind": "turn"})));
+            for k in 0..200 {
+                events.push(start(seq + 1 + k, at, &format!("{turn}.{k}"), Some(&turn), json!({"kind": "tool"})));
+            }
+            if t < 2 {
+                events.push(ev(seq + 500, at + 900 * MS, Some(&turn), json!({"event_type": "span.ended", "body": {"status": "succeeded"}})));
+            }
+            seq += 1000;
+        }
+        let s = TraceState::from_events("s1".into(), &events);
+        assert_eq!(default_folds(&s), vec![trace_core::SpanId::from("turn0"), "turn1".into()]);
+        assert!(default_folds(&state()).is_empty(), "small traces open unfolded");
+    }
+
+    #[test]
+    fn overview_label_reads_range_length_and_total() {
+        let h = 3_600_000 * MS;
+        let m = 60_000 * MS;
+        assert_eq!(overview_label((0, 16_200 * MS), (0, 16_200 * MS)), "All · 16.2s");
+        assert_eq!(overview_label((7 * h + 18 * m, 7 * h + 31 * m), (0, 8 * h + 12 * m)), "7h18m – 7h31m · 13m of 8h12m");
+    }
+
+    #[test]
+    fn density_scales_each_lane_by_its_busiest_column() {
+        let d = density([(0., 3.5, 1), (1., 1., 1), (1., 2., 1), (2., 2., 2)], 5);
+        let lane = |k: usize| d.iter().map(|c| c[k]).collect::<Vec<_>>();
+        assert_eq!(lane(1), [1. / 3., 1., 2. / 3., 1. / 3., 0.]);
+        assert_eq!(lane(2), [0., 0., 1., 0., 0.]);
+        let sparse = density((0..1).map(|_| (0., 0., 0)).chain((0..10).map(|_| (1., 1., 0))), 2);
+        assert_eq!(sparse.iter().map(|c| c[0]).collect::<Vec<_>>(), [0.18, 1.], "a lone span stays visible");
+    }
+
+    #[test]
+    fn lens_has_a_minimum_width_and_edge_handles() {
+        assert_eq!(lens_rect(100., 104., 500.), (90., 114.));
+        assert_eq!(lens_rect(0., 2., 500.), (0., 24.));
+        assert_eq!(lens_rect(100., 300., 500.), (100., 300.));
+        let l = (90., 114.);
+        assert_eq!([89., 95., 102., 109., 115., 140.].map(|x| lens_grab(x, l)), [Grab::Start, Grab::Start, Grab::Inside, Grab::End, Grab::End, Grab::Outside]);
     }
 
     #[test]
