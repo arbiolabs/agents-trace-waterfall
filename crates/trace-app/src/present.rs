@@ -341,6 +341,14 @@ fn words(s: &str) -> Vec<String> {
 /// `claude-opus-5-5` → `Opus 5.5`, `claude-3-5-sonnet-20241022` → `Sonnet 3.5`. Other models pass through.
 pub fn pretty_model(model: &str) -> String {
     let base = model.split('[').next().unwrap_or(model);
+    let base = base.rsplit('/').next().unwrap_or(base);
+    if let Some(v) = base.strip_prefix("gpt-") {
+        return format!("GPT-{v}");
+    }
+    if let Some(rest) = base.strip_prefix("gemini-") {
+        let words: Vec<String> = rest.split('-').map(|w| w[..1].to_uppercase() + &w[1..]).collect();
+        return format!("Gemini {}", words.join(" "));
+    }
     let Some(rest) = base.strip_prefix("claude-") else { return model.to_owned() };
     let parts: Vec<&str> = rest.split('-').collect();
     let Some(family) = parts.iter().find(|p| matches!(**p, "opus" | "sonnet" | "haiku")) else { return model.to_owned() };
@@ -879,7 +887,10 @@ mod tests {
         assert_eq!(pretty_model("claude-3-5-sonnet-20241022"), "Sonnet 3.5");
         assert_eq!(pretty_model("claude-haiku-4-5[1m]"), "Haiku 4.5");
         assert_eq!(pretty_model("claude-opus-4-1-20250805"), "Opus 4.1");
-        assert_eq!(pretty_model("gpt-4o"), "gpt-4o");
+        assert_eq!(pretty_model("gpt-4o"), "GPT-4o");
+        assert_eq!(pretty_model("openai/gpt-5"), "GPT-5");
+        assert_eq!(pretty_model("gemini-3-pro"), "Gemini 3 Pro");
+        assert_eq!(pretty_model("mistral-large"), "mistral-large");
         assert_eq!(pretty_model("claude-instant"), "claude-instant");
     }
 
