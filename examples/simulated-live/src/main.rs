@@ -5,7 +5,8 @@
 //! simulated-live --fixtures ROOT                      regenerate the committed sample and fixtures
 //!
 //! --harness NAME names the session's harness (default `simulated`). --brands mixes real model names and
-//! branded and categorized tools into each turn, for checking the app's icons.
+//! branded and categorized tools into each turn, for checking the app's icons. --cwd PATH sets the working
+//! directory (default `/work/demo`) and names the project after its last component.
 
 use anyhow::{Context, bail};
 use serde_json::json;
@@ -35,9 +36,10 @@ const BRAND_TOOLS: [&str; 20] = [
 struct Flavor<'a> {
     harness: &'a str,
     brands: bool,
+    cwd: Option<&'a str>,
 }
 
-const PLAIN: Flavor = Flavor { harness: "simulated", brands: false };
+const PLAIN: Flavor = Flavor { harness: "simulated", brands: false, cwd: None };
 
 struct Lcg(u64);
 
@@ -202,7 +204,10 @@ fn generate(seed: u64, spans: usize, t0: Ns, speed: f64, flavor: Flavor) -> Vec<
     let clock = now.clone();
     let rec = Recorder::with_clock(format!("simulated-live-{session_id}").as_str().into(), session_id.as_str().into(), move || clock.load(Ordering::SeqCst));
     let mut sim = Sim { rec, now, rng: Lcg(seed), speed, spans: 0, brands: flavor.brands, llms: 0 };
-    sim.rec.session_started("demo-project", "/work/demo", flavor.harness);
+    match flavor.cwd {
+        Some(dir) => sim.rec.session_started(dir.trim_end_matches('/').rsplit('/').next().unwrap_or(dir), dir, flavor.harness),
+        None => sim.rec.session_started("demo-project", "/work/demo", flavor.harness),
+    }
     sim.spans += 1;
     let root = sim.rec.span_started(SpanStart { agent_name: Some("main".into()), ..SpanStart::new(SpanKind::Agent, "agent") });
     let mut i = 0;
@@ -276,6 +281,7 @@ fn main() -> anyhow::Result<()> {
     let mut path: Option<PathBuf> = None;
     let mut flavor = PLAIN;
     let mut harness = String::new();
+    let mut cwd = None;
     while let Some(a) = args.next() {
         let mut value = || args.next().with_context(|| format!("{a} needs a value"));
         match a.as_str() {
@@ -295,12 +301,14 @@ fn main() -> anyhow::Result<()> {
             "--speed" => speed = value()?.parse()?,
             "--harness" => harness = value()?,
             "--brands" => flavor.brands = true,
-            _ => bail!("unknown argument {a}\nusage: simulated-live (--jsonl | --socket [PATH] | --fixtures ROOT) [--spans N] [--seed S] [--speed X] [--harness NAME] [--brands]"),
+            "--cwd" => cwd = Some(value()?),
+            _ => bail!("unknown argument {a}\nusage: simulated-live (--jsonl | --socket [PATH] | --fixtures ROOT) [--spans N] [--seed S] [--speed X] [--harness NAME] [--brands] [--cwd PATH]"),
         }
     }
     if !harness.is_empty() {
         flavor.harness = &harness;
     }
+    flavor.cwd = cwd.as_deref();
     match mode {
         Some("jsonl") => {
             write_jsonl(std::io::stdout().lock(), &generate(seed, spans, SYNTHETIC_T0, 1.0, flavor))?;
@@ -337,6 +345,13 @@ mod tests {
         let a = jsonl(&generate(42, 200, SYNTHETIC_T0, 1.0, PLAIN));
         assert_eq!(a, jsonl(&generate(42, 200, SYNTHETIC_T0, 1.0, PLAIN)));
         assert_ne!(a, jsonl(&generate(43, 200, SYNTHETIC_T0, 1.0, PLAIN)));
+    }
+
+    #[test]
+    fn cwd_names_the_project_after_its_directory() {
+        let events = generate(1, 20, SYNTHETIC_T0, 1.0, Flavor { cwd: Some("/u/code/tools/tw-r5"), ..PLAIN });
+        let s = state(&events);
+        assert_eq!((s.session.project_id.as_str(), s.session.working_directory.as_str()), ("tw-r5", "/u/code/tools/tw-r5"));
     }
 
     #[test]

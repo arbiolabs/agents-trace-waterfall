@@ -2,7 +2,8 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::{Hsla, rgb};
-use trace_core::{Ns, Span, SpanKind, SpanStatus, Totals, TraceState};
+use trace_core::{Ns, SessionStatus, Span, SpanKind, SpanStatus, Totals, TraceState};
+use trace_storage::SessionSummary;
 use trace_view::{Row, format_cost, format_duration, format_tokens};
 
 /// Which palette column a span paints with.
@@ -69,7 +70,7 @@ macro_rules! logos {
 
 logos! {
     Amp = "amp-color", Claude = "claude-color", ClaudeCode = "claudecode-color", Cline = "cline", Codex = "codex-color",
-    Cursor = "cursor", DeepSeek = "deepseek-color", Devin = "devin-color", Docker = "docker", Figma = "figma",
+    Cursor = "cursor", DeepSeek = "deepseek-color", Devin = "devin-color", Docker = "docker", Figma = "figma-color",
     Gemini = "gemini-color", GeminiCli = "geminicli-color", Git = "git", GitHub = "github", Copilot = "githubcopilot",
     GoogleDrive = "googledrive", Goose = "goose", Grok = "grok", Junie = "junie-color", KiloCode = "kilocode",
     Kimi = "kimi-color", Kiro = "kiro-color", Linear = "linear", Meta = "meta-color", Mistral = "mistral-color",
@@ -96,6 +97,32 @@ impl Logo {
     /// Full-color marks draw as images; the rest are masks tinted like text.
     pub fn is_color(self) -> bool {
         self.file().ends_with("-color")
+    }
+
+    /// Outline and thin-stroke marks cover less of their box than solid ones, so they draw larger to
+    /// carry the same optical weight: in a 20pt tile a solid mark is 12pt and an outline mark 14pt.
+    pub fn outline(self) -> bool {
+        matches!(
+            self,
+            Logo::OpenAi | Logo::Cursor | Logo::Claude | Logo::Cline | Logo::OpenCode | Logo::KiloCode | Logo::Notion
+                | Logo::Linear | Logo::Windsurf | Logo::Perplexity | Logo::Ollama | Logo::Copilot | Logo::Gemini
+                | Logo::Goose | Logo::RooCode | Logo::Grok
+        )
+    }
+
+    /// The mark's size inside a `tile` point tile.
+    pub fn size_in(self, tile: f32) -> f32 {
+        (tile * if self.outline() { 0.7 } else { 0.6 }).round()
+    }
+
+    /// The mark to draw at sidebar and header sizes: the Claude Code mascot smudges at 16pt, so it reads as
+    /// the Claude spark; Codex reads as the OpenAI knot.
+    pub fn small(self) -> Logo {
+        match self {
+            Logo::ClaudeCode => Logo::Claude,
+            Logo::Codex => Logo::OpenAi,
+            l => l,
+        }
     }
 }
 
@@ -247,6 +274,7 @@ pub fn brand_for(s: &Span, harness: Option<Brand>) -> Option<Brand> {
 pub enum ToolCategory {
     Shell,
     Read,
+    Write,
     Edit,
     Search,
     Web,
@@ -268,6 +296,7 @@ impl ToolCategory {
         match self {
             Self::Shell => IconName::SquareTerminal,
             Self::Read => IconName::FileText,
+            Self::Write => IconName::FilePlus,
             Self::Edit => IconName::FilePen,
             Self::Search => IconName::Search,
             Self::Web => IconName::Globe,
@@ -300,7 +329,8 @@ const CATEGORY_WORDS: &[(ToolCategory, &[&str])] = &[
     (ToolCategory::Git, &["git", "commit", "branch", "checkout", "rebase", "merge"]),
     (ToolCategory::Database, &["sql", "psql", "sqlite", "query", "database", "db"]),
     (ToolCategory::Shell, &["bash", "shell", "exec", "terminal", "command", "run"]),
-    (ToolCategory::Edit, &["edit", "write", "patch", "multiedit", "notebookedit", "create", "replace"]),
+    (ToolCategory::Edit, &["edit", "patch", "multiedit", "notebookedit", "replace"]),
+    (ToolCategory::Write, &["write", "create", "new"]),
     (ToolCategory::Search, &["grep", "glob", "search", "find", "ls"]),
     (ToolCategory::Read, &["read", "view", "cat", "open"]),
 ];
@@ -383,8 +413,9 @@ fn short_id(v: String) -> String {
 /// The row title. An LLM span named after its model reads `LLM call`, since the detail already names the model.
 /// An MCP tool name, `mcp__server__tool`, reads as the tool with the server as its detail.
 pub fn title(s: &Span) -> String {
-    match (&s.kind, s.model.as_deref()) {
-        (SpanKind::Llm, Some(m)) if m == s.name => kind_label(SpanKind::Llm).to_owned(),
+    let generic = matches!(s.name.to_lowercase().replace(['_', '-'], " ").as_str(), "llm" | "llm call");
+    match s.kind {
+        SpanKind::Llm if generic || s.model.as_deref() == Some(&s.name) => kind_label(SpanKind::Llm).to_owned(),
         _ => mcp_parts(&s.name).map_or_else(|| s.name.clone(), |(tool, _)| tool.to_owned()),
     }
 }
@@ -415,14 +446,17 @@ pub enum Edge {
 }
 
 /// For a span wholly outside the visible `window`, the edge it lies past and what the edge hint reads:
-/// its length, then how far past the window it lies. While live, `2.7s · 1h5m ago` or `3m later`;
-/// a finished trace has no present to be ago from, so `2.7s · 1h5m before` or `3m after`.
-pub fn offscreen_hint(start: Ns, end: Ns, window: (Ns, Ns), live: bool) -> Option<(Edge, String)> {
-    let (before, after) = if live { ("ago", "later") } else { ("before", "after") };
+/// its length, then how far past the window it lies: `2.7s · 1h5m before`, `3m after`. Only while
+/// following, when the window ends at now, does a span behind it read from real now: `2.7s · 7h13m ago`.
+pub fn offscreen_hint(start: Ns, end: Ns, window: (Ns, Ns), following_now: Option<Ns>) -> Option<(Edge, String)> {
     if end < window.0 {
-        Some((Edge::Left, format!("{} · {} {before}", format_duration(end - start), format_duration(window.0 - end))))
+        let gap = match following_now {
+            Some(now) => format!("{} ago", format_duration(now - end)),
+            None => format!("{} before", format_duration(window.0 - end)),
+        };
+        Some((Edge::Left, format!("{} · {gap}", format_duration((end - start).max(0)))))
     } else if start > window.1 {
-        Some((Edge::Right, format!("{} {after}", format_duration(start - window.1))))
+        Some((Edge::Right, format!("{} after", format_duration(start - window.1))))
     } else {
         None
     }
@@ -455,6 +489,104 @@ pub fn now_capsule(now: Ns, window: (Ns, Ns)) -> Option<(Edge, String)> {
     }
 }
 
+/// The overview's right-edge marker while a live session is idle: the gap from its last activity to now.
+pub fn idle_gap(last: Ns, now: Ns) -> String {
+    format!("+{} idle", format_duration(now - last))
+}
+
+/// One status vocabulary, so the sidebar badge, the header pill, and the popover pill always agree on
+/// color and shape. Status is never color alone: each has its own glyph shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Live,
+    Idle,
+    Paused,
+    Done,
+    Failed,
+    Interrupted,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hue {
+    Accent,
+    Amber,
+    Ok,
+    Error,
+    Neutral,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    Dot,
+    Ring,
+    Check,
+    Cross,
+    Pause,
+}
+
+impl Status {
+    pub fn look(self) -> (Hue, Shape) {
+        match self {
+            Status::Live => (Hue::Accent, Shape::Dot),
+            Status::Idle => (Hue::Amber, Shape::Ring),
+            Status::Paused => (Hue::Neutral, Shape::Pause),
+            Status::Done => (Hue::Ok, Shape::Check),
+            Status::Failed => (Hue::Error, Shape::Cross),
+            Status::Interrupted => (Hue::Amber, Shape::Pause),
+            Status::Unknown => (Hue::Neutral, Shape::Ring),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Status::Live => "Live",
+            Status::Idle => "Idle",
+            Status::Paused => "Paused",
+            Status::Done => "Done",
+            Status::Failed => "Failed",
+            Status::Interrupted => "Interrupted",
+            Status::Unknown => "Unknown",
+        }
+    }
+}
+
+/// A stored session's status as of `now`: a live session quiet for `IDLE_AFTER` reads as idle.
+pub fn session_status(status: SessionStatus, last_event: Option<Ns>, now: Ns) -> Status {
+    match status {
+        SessionStatus::Live if last_event.is_some_and(|t| now - t > IDLE_AFTER) => Status::Idle,
+        SessionStatus::Live => Status::Live,
+        SessionStatus::Completed => Status::Done,
+        SessionStatus::Failed => Status::Failed,
+        SessionStatus::Interrupted => Status::Interrupted,
+        SessionStatus::Unknown => Status::Unknown,
+    }
+}
+
+/// A span's status for its popover pill. `quiet` is an open span in an idle session.
+pub fn span_status(s: SpanStatus, open: bool, quiet: bool) -> (Status, &'static str) {
+    match s {
+        SpanStatus::Failed => (Status::Failed, "Failed"),
+        SpanStatus::Succeeded => (Status::Done, "Done"),
+        SpanStatus::Cancelled => (Status::Interrupted, "Cancelled"),
+        SpanStatus::Running if quiet => (Status::Idle, "Idle"),
+        SpanStatus::Running if open => (Status::Live, "Running"),
+        _ => (Status::Unknown, "Unknown"),
+    }
+}
+
+/// Whether a sidebar row shows its status badge. A finished session in Earlier is the common case, so it
+/// goes without one and the rows that need attention stand out.
+pub fn shows_badge(status: Status, group: Group) -> bool {
+    !(status == Status::Done && group == Group::Earlier)
+}
+
+/// Where an axis tick label starts: 5pt right of its tick, but never closer than 8pt to the card's edge
+/// at `right`, so the last label never touches it.
+pub fn tick_label_x(tick_x: f32, label_w: f32, right: f32) -> f32 {
+    (tick_x + 5.).min(right - 8. - label_w)
+}
+
 /// Above this many spans a trace opens with its finished turns folded.
 pub const FOLD_ABOVE: usize = 500;
 
@@ -471,7 +603,7 @@ pub fn default_folds(state: &TraceState) -> Vec<trace_core::SpanId> {
 }
 
 /// The overview's caption: `All · 16.2s` for the whole trace, else `7h18m – 7h31m of 8h12m`. When both
-/// ends would read the same, it names the window's length and place instead: `4.4s at 2h4m of 2h4m`.
+/// ends would read the same, it names the window's length and place instead: `4.4s window at 2h4m · 2h4m total`.
 pub fn overview_label(window: (Ns, Ns), whole: (Ns, Ns)) -> String {
     let total = whole.1 - whole.0;
     if window.0 <= whole.0 && window.1 >= whole.1 {
@@ -481,7 +613,7 @@ pub fn overview_label(window: (Ns, Ns), whole: (Ns, Ns)) -> String {
     let b = (window.1 - whole.0).clamp(a, total);
     let (fa, fb, ft) = (format_duration(a), format_duration(b), format_duration(total));
     if fa == fb {
-        return format!("{} at {fa} of {ft}", format_duration(window.1 - window.0));
+        return format!("{} window at {fa} · {ft} total", format_duration(window.1 - window.0));
     }
     format!("{fa} – {fb} of {ft}")
 }
@@ -568,6 +700,51 @@ pub fn bar_label(s: &Span, rollup: &Totals, session_end: Option<Ns>, now: Ns) ->
     match rollup.cost_usd_micros() {
         Some(c) => format!("{d} · {}", format_cost(Some(c))),
         None => d,
+    }
+}
+
+/// What VoiceOver reads for a row: `LLM call, Opus 5.5, 1.6 seconds, 2 cents, succeeded`.
+pub fn row_label(s: &Span, rollup: &Totals, session_end: Option<Ns>, now: Ns) -> String {
+    let status = match s.status {
+        SpanStatus::Succeeded => "succeeded",
+        SpanStatus::Failed => "failed",
+        SpanStatus::Cancelled => "cancelled",
+        SpanStatus::Running => "running",
+        _ => "status unknown",
+    };
+    [Some(title(s)), detail(s, ""), Some(spoken_duration(s.elapsed(session_end, now).ns)), rollup.cost_usd_micros().map(spoken_cost), Some(status.to_owned())]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `1.6 seconds`, `250 milliseconds`, `2 minutes 30 seconds`, `1 hour 5 minutes`.
+pub fn spoken_duration(ns: Ns) -> String {
+    let unit = |n: u64, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
+    let ms = ns.max(0) / 1_000_000;
+    if ms < 1_000 {
+        return unit(ms as u64, "millisecond");
+    }
+    if ms < 60_000 {
+        let secs = format!("{:.1}", ms as f64 / 1e3);
+        let secs = secs.strip_suffix(".0").unwrap_or(&secs);
+        return if secs == "1" { "1 second".into() } else { format!("{secs} seconds") };
+    }
+    let s = (ms / 1_000) as u64;
+    let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
+    let parts = [(h, "hour"), (m, "minute"), (s, "second")];
+    let first = parts.iter().position(|(n, _)| *n > 0).unwrap_or(2);
+    parts[first..(first + 2).min(3)].iter().filter(|(n, _)| *n > 0).map(|(n, w)| unit(*n, w)).collect::<Vec<_>>().join(" ")
+}
+
+/// `2 cents`, `less than a cent`, `$1.23`.
+pub fn spoken_cost(micros: u64) -> String {
+    match (micros as f64 / 10_000.).round() as u64 {
+        _ if micros < 5_000 => "less than a cent".into(),
+        1 => "1 cent".into(),
+        c if c < 100 => format!("{c} cents"),
+        _ => format_cost(Some(micros)),
     }
 }
 
@@ -698,20 +875,25 @@ pub fn descendants<'a>(state: &'a TraceState, id: &trace_core::SpanId, cap: usiz
     out
 }
 
-/// The six cells of the popover's stats panel, in reading order. Cost and tokens cover the span's subtree (`rollup`).
+/// The popover's stats cells, in reading order. Cost and tokens cover the span's subtree (`rollup`).
+/// Tokens and Spans drop out when there is nothing to count, as for a tool call, so the grid holds only facts.
 /// `end` is where open spans stop, from `shown_end`.
-pub fn popover_stats(state: &TraceState, s: &Span, rollup: &Totals, end: Option<Ns>, now: Ns) -> [(&'static str, String); 6] {
+pub fn popover_stats(state: &TraceState, s: &Span, rollup: &Totals, end: Option<Ns>, now: Ns) -> Vec<(&'static str, String)> {
     let origin = state.axis_start().unwrap_or(s.started_at_utc_ns);
-    let billed = rollup.billable_records > 0;
-    let tokens = |n: u64| if billed { format_tokens(n) } else { "—".into() };
-    [
+    let mut out = vec![
         ("Duration", format_duration(s.elapsed(end, now).ns)),
         ("Started", format!("+{}", format_duration(s.started_at_utc_ns - origin))),
         ("Cost", format_cost(rollup.cost_usd_micros())),
-        ("Tokens in", tokens(rollup.tokens_input)),
-        ("Tokens out", tokens(rollup.tokens_output)),
-        ("Spans", descendants(state, &s.span_id, usize::MAX).len().to_string()),
-    ]
+    ];
+    if rollup.billable_records > 0 && rollup.tokens_input + rollup.tokens_output > 0 {
+        out.push(("Tokens in", format_tokens(rollup.tokens_input)));
+        out.push(("Tokens out", format_tokens(rollup.tokens_output)));
+    }
+    let spans = descendants(state, &s.span_id, usize::MAX).len();
+    if spans > 0 {
+        out.push(("Spans", spans.to_string()));
+    }
+    out
 }
 
 /// Sidebar group of a session: live ones first, then by local calendar day.
@@ -737,6 +919,178 @@ pub fn group(live: bool, started: Option<Ns>, today_start: Ns) -> Group {
         (true, _) => Group::Live,
         (_, Some(t)) if t >= today_start => Group::Today,
         _ => Group::Earlier,
+    }
+}
+
+/// How the sidebar lists sessions: by recency (Live, Today, Earlier) or by where they ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SidebarMode {
+    #[default]
+    Recent,
+    Workspaces,
+}
+
+impl SidebarMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            SidebarMode::Recent => "Recent",
+            SidebarMode::Workspaces => "Workspaces",
+        }
+    }
+}
+
+/// The sidebar's tree. Recent mode yields only `Section`s; Workspaces mode only `Workspace`s.
+#[derive(Debug, PartialEq)]
+pub enum SidebarNode<'a> {
+    Section { group: Group, sessions: Vec<&'a SessionSummary> },
+    Workspace(Workspace<'a>),
+}
+
+/// The parent directory of a set of projects: `~/code/tools` holds `trace-waterfall` and `tw-r5`.
+/// `path` is empty for sessions that never reported a working directory.
+#[derive(Debug, PartialEq)]
+pub struct Workspace<'a> {
+    pub path: String,
+    pub name: String,
+    pub projects: Vec<Project<'a>>,
+}
+
+/// One working directory and the sessions that ran in it, live first, then latest first.
+#[derive(Debug, PartialEq)]
+pub struct Project<'a> {
+    pub path: String,
+    pub name: String,
+    pub sessions: Vec<&'a SessionSummary>,
+    /// How many of `sessions` are live as of the grouping's `now`; idle ones are not.
+    pub live: usize,
+}
+
+pub const NO_WORKSPACE: &str = "No workspace";
+
+impl Workspace<'_> {
+    pub fn sessions(&self) -> usize {
+        self.projects.iter().map(|p| p.sessions.len()).sum()
+    }
+
+    pub fn live(&self) -> usize {
+        self.projects.iter().map(|p| p.live).sum::<usize>()
+    }
+
+    /// The state key under which the sidebar remembers this workspace collapsed.
+    pub fn key(&self) -> String {
+        format!("w:{}", self.path)
+    }
+
+    /// `Workspace tools, 6 sessions, 1 live`, for VoiceOver.
+    pub fn spoken(&self) -> String {
+        spoken_counts(&format!("Workspace {}", self.name), self.sessions(), self.live())
+    }
+}
+
+impl Project<'_> {
+    pub fn cost(&self) -> Option<u64> {
+        self.sessions.iter().filter_map(|s| s.totals.cost_usd_micros()).reduce(|a, b| a + b)
+    }
+
+    pub fn key(&self) -> String {
+        format!("p:{}", self.path)
+    }
+
+    pub fn spoken(&self) -> String {
+        let base = spoken_counts(&format!("Project {}", self.name), self.sessions.len(), self.live);
+        match self.cost() {
+            Some(c) => format!("{base}, {}", spoken_cost(c)),
+            None => base,
+        }
+    }
+}
+
+fn spoken_counts(head: &str, sessions: usize, live: usize) -> String {
+    let n = if sessions == 1 { "1 session".to_owned() } else { format!("{sessions} sessions") };
+    if live > 0 { format!("{head}, {n}, {live} live") } else { format!("{head}, {n}") }
+}
+
+/// When a session last did anything.
+fn activity(s: &SessionSummary) -> Ns {
+    s.last_event_at_utc_ns.or(s.ended_at_utc_ns).or(s.started_at_utc_ns).unwrap_or(0)
+}
+
+/// Live work first, then the most recent: a sort key, smallest first.
+fn rank(live: bool, at: Ns) -> (bool, std::cmp::Reverse<Ns>) {
+    (!live, std::cmp::Reverse(at))
+}
+
+fn basename(path: &str) -> &str {
+    path.trim_end_matches('/').rsplit('/').next().unwrap_or("")
+}
+
+fn parent(path: &str) -> &str {
+    let p = path.trim_end_matches('/');
+    match p.rfind('/') {
+        Some(0) => "/",
+        Some(i) => &p[..i],
+        None => "",
+    }
+}
+
+/// Groups sessions for the sidebar. Recent mode buckets them into Live, Today, and Earlier by `today_start`.
+/// Workspaces mode nests them as workspace (the project directory's parent), project (the working
+/// directory), session. At every level, anything live as of `now` floats to the top, then the most
+/// recent activity; sessions without a working directory gather last under `No workspace`.
+pub fn group_sessions<'a>(sessions: &'a [SessionSummary], mode: SidebarMode, now: Ns, today_start: Ns) -> Vec<SidebarNode<'a>> {
+    let live = |s: &SessionSummary| session_status(s.status, s.last_event_at_utc_ns, now) == Status::Live;
+    let mut sorted: Vec<&SessionSummary> = sessions.iter().collect();
+    sorted.sort_by_key(|s| rank(live(s), activity(s)));
+    if mode == SidebarMode::Recent {
+        let mut out: Vec<(Group, Vec<&SessionSummary>)> = Vec::new();
+        for s in sessions {
+            let g = group(s.status == SessionStatus::Live, s.started_at_utc_ns.or(s.last_event_at_utc_ns), today_start);
+            match out.iter_mut().find(|(k, _)| *k == g) {
+                Some((_, v)) => v.push(s),
+                None => out.push((g, vec![s])),
+            }
+        }
+        out.sort_by_key(|(g, _)| *g);
+        return out.into_iter().map(|(group, sessions)| SidebarNode::Section { group, sessions }).collect();
+    }
+    let mut spaces: Vec<Workspace> = Vec::new();
+    for s in sorted {
+        let dir = s.working_directory.trim();
+        let (ws_path, project_path) = if dir.is_empty() { (String::new(), format!("#{}", s.project_id)) } else { (parent(dir).to_owned(), dir.to_owned()) };
+        let ws = match spaces.iter().position(|w| w.path == ws_path) {
+            Some(i) => &mut spaces[i],
+            None => {
+                let name = if ws_path.is_empty() { NO_WORKSPACE.to_owned() } else { Some(basename(&ws_path)).filter(|n| !n.is_empty()).unwrap_or("/").to_owned() };
+                spaces.push(Workspace { path: ws_path, name, projects: Vec::new() });
+                spaces.last_mut().expect("just pushed")
+            }
+        };
+        match ws.projects.iter_mut().find(|p| p.path == project_path) {
+            Some(p) => {
+                p.live += usize::from(live(s));
+                p.sessions.push(s);
+            }
+            None => {
+                let name = Some(basename(dir)).filter(|n| !n.is_empty()).map(str::to_owned).or_else(|| Some(s.project_id.clone()).filter(|p| !p.is_empty())).unwrap_or_else(|| "Untitled".to_owned());
+                ws.projects.push(Project { path: project_path, name, live: usize::from(live(s)), sessions: vec![s] });
+            }
+        }
+    }
+    // Sessions arrived ranked, so each project's first session and each workspace's first project carry
+    // its rank, and a stable sort by that keeps the order the sessions gave.
+    let head = |p: &Project| rank(live(p.sessions[0]), activity(p.sessions[0]));
+    for w in &mut spaces {
+        w.projects.sort_by_key(|p| head(p));
+    }
+    spaces.sort_by_key(|w| (w.path.is_empty(), head(&w.projects[0])));
+    spaces.into_iter().map(SidebarNode::Workspace).collect()
+}
+
+/// `/Users/d/code/tools` → `~/code/tools` when `home` is `/Users/d`.
+pub fn tilde(path: &str, home: &str) -> String {
+    match path.strip_prefix(home) {
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => format!("~{rest}"),
+        _ => path.to_owned(),
     }
 }
 
@@ -907,7 +1261,8 @@ mod tests {
             ("MultiEdit", Edit),
             ("apply_patch", Edit),
             ("str_replace", Edit),
-            ("create_file", Edit),
+            ("create_file", Write),
+            ("Write", Write),
             ("Grep", Search),
             ("Glob", Search),
             ("codebase_search", Search),
@@ -955,7 +1310,7 @@ mod tests {
         assert_eq!(glyph(bash), (IconName::SquareTerminal, Ink::Kind(Tone::Tool)));
         assert_eq!(tone(bash), Tone::Error, "a failed span paints with the error palette");
         assert_eq!(detail(llm, "").as_deref(), Some("Sonnet 5.5"));
-        assert_eq!(title(llm), "llm");
+        assert_eq!(title(llm), "LLM call", "a span named for its kind reads as the kind");
         let mut named_after_model = llm.clone();
         named_after_model.name = "claude-sonnet-5-5".into();
         assert_eq!(title(&named_after_model), "LLM call");
@@ -980,12 +1335,12 @@ mod tests {
     fn popover_stats_read_from_the_span_and_its_subtree() {
         let s = state();
         let sub = &s.spans[&"sub".into()];
-        let stats = popover_stats(&s, sub, &s.subtree_totals(&"sub".into()), None, 40_000 * MS).map(|(k, v)| format!("{k} {v}"));
+        let stats = popover_stats(&s, sub, &s.subtree_totals(&"sub".into()), None, 40_000 * MS).into_iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>();
         assert_eq!(stats, ["Duration 30s", "Started +8.1s", "Cost $0.05", "Tokens in 41.2k", "Tokens out 1.4k", "Spans 2"]);
-        let llm = popover_stats(&s, &s.spans[&"llm".into()], &s.subtree_totals(&"llm".into()), None, 40_000 * MS).map(|(_, v)| v);
-        assert_eq!(llm, ["3s", "+9s", "$0.05", "41.2k", "1.4k", "0"]);
-        let bash = popover_stats(&s, &s.spans[&"Bash".into()], &s.subtree_totals(&"Bash".into()), None, 40_000 * MS).map(|(_, v)| v);
-        assert_eq!(bash[2..5], ["—", "—", "—"], "nothing billed reads unknown, not zero");
+        let llm = popover_stats(&s, &s.spans[&"llm".into()], &s.subtree_totals(&"llm".into()), None, 40_000 * MS).into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+        assert_eq!(llm, ["Duration", "Started", "Cost", "Tokens in", "Tokens out"], "a leaf has no Spans cell");
+        let bash = popover_stats(&s, &s.spans[&"Bash".into()], &s.subtree_totals(&"Bash".into()), None, 40_000 * MS).into_iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>();
+        assert_eq!(bash, ["Duration 1s", "Started +12s", "Cost —"], "an unbilled tool call keeps only what it has");
     }
 
     #[test]
@@ -1044,11 +1399,13 @@ mod tests {
     #[test]
     fn offscreen_spans_name_their_edge_and_distance() {
         let w = (3_900_000 * MS, 4_000_000 * MS);
-        assert_eq!(offscreen_hint(0, 2_700 * MS, w, true), Some((Edge::Left, "2.7s · 1h4m ago".into())));
-        assert_eq!(offscreen_hint(4_180_000 * MS, 4_190_000 * MS, w, true), Some((Edge::Right, "3m later".into())));
-        assert_eq!(offscreen_hint(3_950_000 * MS, 4_190_000 * MS, w, true), None);
-        assert_eq!(offscreen_hint(0, 2_700 * MS, w, false), Some((Edge::Left, "2.7s · 1h4m before".into())), "a finished trace has no ago");
-        assert_eq!(offscreen_hint(4_180_000 * MS, 4_190_000 * MS, w, false), Some((Edge::Right, "3m after".into())));
+        let now = 30_000_000 * MS;
+        assert_eq!(offscreen_hint(0, 2_700 * MS, w, None), Some((Edge::Left, "2.7s · 1h4m before".into())));
+        assert_eq!(offscreen_hint(4_180_000 * MS, 4_190_000 * MS, w, None), Some((Edge::Right, "3m after".into())));
+        assert_eq!(offscreen_hint(3_950_000 * MS, 4_190_000 * MS, w, None), None);
+        assert_eq!(offscreen_hint(0, 2_700 * MS, w, Some(now)), Some((Edge::Left, "2.7s · 8h19m ago".into())), "following reads from real now");
+        assert_eq!(offscreen_hint(4_180_000 * MS, 4_190_000 * MS, w, Some(now)), Some((Edge::Right, "3m after".into())));
+        assert_eq!(offscreen_hint(2_700 * MS, 2_699 * MS, w, None), Some((Edge::Left, "0s · 1h4m before".into())), "an end logged before its start reads as an instant");
     }
 
     #[test]
@@ -1110,7 +1467,7 @@ mod tests {
         assert_eq!(overview_label((0, 16_200 * MS), (0, 16_200 * MS)), "All · 16.2s");
         assert_eq!(overview_label((7 * h + 18 * m, 7 * h + 31 * m), (0, 8 * h + 12 * m)), "7h18m – 7h31m of 8h12m");
         let whole = (0, 2 * h + 4 * m + 30_000 * MS);
-        assert_eq!(overview_label((2 * h + 4 * m, 2 * h + 4 * m + 4_400 * MS), whole), "4.4s at 2h4m of 2h4m", "identical ends name length and place");
+        assert_eq!(overview_label((2 * h + 4 * m, 2 * h + 4 * m + 4_400 * MS), whole), "4.4s window at 2h4m · 2h4m total", "identical ends name length and place");
     }
 
     #[test]
@@ -1136,10 +1493,145 @@ mod tests {
     }
 
     #[test]
+    fn one_status_map_gives_every_status_its_own_shape() {
+        let all = [Status::Live, Status::Idle, Status::Paused, Status::Done, Status::Failed, Status::Interrupted];
+        assert_eq!(all.map(|s| s.look().1), [Shape::Dot, Shape::Ring, Shape::Pause, Shape::Check, Shape::Cross, Shape::Pause]);
+        assert_eq!(Status::Idle.look().0, Hue::Amber, "idle is amber everywhere");
+        let h = 3_600_000 * MS;
+        assert_eq!(session_status(SessionStatus::Live, Some(0), 7 * h), Status::Idle);
+        assert_eq!(session_status(SessionStatus::Live, Some(0), 60_000 * MS), Status::Live);
+        assert_eq!(session_status(SessionStatus::Completed, Some(0), 7 * h), Status::Done);
+        assert_eq!(span_status(SpanStatus::Running, true, true), (Status::Idle, "Idle"));
+        assert!(!shows_badge(Status::Done, Group::Earlier));
+        assert!(shows_badge(Status::Done, Group::Today));
+        assert!(shows_badge(Status::Failed, Group::Earlier));
+        assert_eq!(idle_gap(0, 7 * h + 2 * 60_000 * MS), "+7h2m idle");
+    }
+
+    #[test]
+    fn rows_read_aloud_as_kind_model_time_cost_and_outcome() {
+        let s = state();
+        let label = |id: &str| row_label(&s.spans[&id.into()], &s.subtree_totals(&id.into()), None, 40_000 * MS);
+        let mut llm = s.spans[&"llm".into()].clone();
+        llm.name = "llm call".into();
+        assert_eq!(row_label(&llm, &s.subtree_totals(&"llm".into()), None, 40_000 * MS), "LLM call, Sonnet 5.5, 3 seconds, 5 cents, succeeded");
+        assert_eq!(label("Bash"), "Bash, 1 second, failed");
+        assert_eq!(spoken_duration(1_600 * MS), "1.6 seconds");
+        assert_eq!(spoken_duration(250 * MS), "250 milliseconds");
+        assert_eq!(spoken_duration(150_000 * MS), "2 minutes 30 seconds");
+        assert_eq!(spoken_duration(3_900_000 * MS), "1 hour 5 minutes");
+        assert_eq!([1_200, 15_000, 20_000, 1_234_567].map(spoken_cost), ["less than a cent", "2 cents", "2 cents", "$1.23"]);
+    }
+
+    #[test]
+    fn the_last_tick_label_keeps_off_the_card_edge() {
+        assert_eq!(tick_label_x(100., 40., 1000.), 105.);
+        assert_eq!(tick_label_x(980., 40., 1000.), 952.);
+    }
+
+    #[test]
+    fn llm_spans_with_generic_names_read_as_llm_call() {
+        let s = state();
+        let mut llm = s.spans[&"llm".into()].clone();
+        for name in ["llm call", "LLM_call", "llm"] {
+            llm.name = name.into();
+            assert_eq!(title(&llm), "LLM call", "{name}");
+        }
+    }
+
+    #[test]
     fn groups_sessions_by_liveness_then_day() {
         assert_eq!(group(true, Some(0), 100), Group::Live);
         assert_eq!(group(false, Some(150), 100), Group::Today);
         assert_eq!(group(false, Some(50), 100), Group::Earlier);
         assert_eq!(group(false, None, 100), Group::Earlier);
+    }
+
+    fn summary(id: &str, dir: &str, status: SessionStatus, last: Ns) -> SessionSummary {
+        SessionSummary {
+            session_id: id.into(),
+            project_id: format!("{id}-project"),
+            working_directory: dir.into(),
+            source_adapter: String::new(),
+            harness: String::new(),
+            host: String::new(),
+            status,
+            started_at_utc_ns: Some(last - 10),
+            ended_at_utc_ns: None,
+            last_event_at_utc_ns: Some(last),
+            model: None,
+            totals: Totals::default(),
+            span_count: 0,
+            turn_count: 0,
+        }
+    }
+
+    #[test]
+    fn workspaces_nest_projects_and_float_live_work_to_the_top() {
+        let h = 3_600_000 * MS;
+        let now = 100 * h;
+        let mut sessions = vec![
+            summary("a", "/u/code/tools/trace-waterfall", SessionStatus::Completed, now - 9 * h),
+            summary("b", "/u/code/tools/tw-r5/", SessionStatus::Live, now - MS),
+            summary("c", "/u/code/tools/trace-waterfall", SessionStatus::Completed, now - 7 * h),
+            summary("d", "/u/work/api", SessionStatus::Completed, now - 5 * h),
+            summary("e", "", SessionStatus::Failed, now - h),
+            summary("f", "/u/work/api", SessionStatus::Live, now - 20 * h),
+        ];
+        sessions[0].totals.cost_actual_usd_micros = 20_000;
+        sessions[0].totals.billable_records = 1;
+        sessions[2].totals.cost_actual_usd_micros = 5_000;
+        sessions[2].totals.billable_records = 1;
+        let tree = group_sessions(&sessions, SidebarMode::Workspaces, now, 0);
+        type Shape = Vec<(String, Vec<(String, Vec<String>)>)>;
+        let shape: Shape = tree
+            .iter()
+            .map(|n| match n {
+                SidebarNode::Workspace(w) => (w.name.clone(), w.projects.iter().map(|p| (p.name.clone(), p.sessions.iter().map(|s| s.session_id.0.clone()).collect())).collect()),
+                SidebarNode::Section { .. } => panic!("workspaces mode has no sections"),
+            })
+            .collect();
+        let own = |w: &str, ps: &[(&str, &[&str])]| (w.to_owned(), ps.iter().map(|(p, ss)| (p.to_string(), ss.iter().map(|s| s.to_string()).collect())).collect::<Vec<_>>());
+        assert_eq!(
+            shape,
+            [
+                own("tools", &[("tw-r5", &["b"]), ("trace-waterfall", &["c", "a"])]),
+                own("work", &[("api", &["d", "f"])]),
+                own(NO_WORKSPACE, &[("e-project", &["e"])]),
+            ],
+            "live first, then latest; an idle live session sorts by its last activity; no workspace goes last"
+        );
+        let SidebarNode::Workspace(tools) = &tree[0] else { unreachable!() };
+        assert_eq!(tools.path, "/u/code/tools");
+        assert_eq!(tools.spoken(), "Workspace tools, 3 sessions, 1 live");
+        assert_eq!(tools.projects[1].spoken(), "Project trace-waterfall, 2 sessions, 3 cents");
+        assert_eq!(tools.projects[1].cost(), Some(25_000));
+        assert_eq!(tools.projects[0].cost(), None);
+        let SidebarNode::Workspace(work) = &tree[1] else { unreachable!() };
+        assert_eq!((work.live(), work.spoken()), (0, "Workspace work, 2 sessions".to_owned()), "idle is not live");
+        assert_eq!((tools.key(), tools.projects[0].key()), ("w:/u/code/tools".to_owned(), "p:/u/code/tools/tw-r5/".to_owned()));
+    }
+
+    #[test]
+    fn recent_mode_buckets_by_liveness_then_day() {
+        let now = 1_000;
+        let sessions = [summary("a", "/x", SessionStatus::Completed, 300), summary("b", "/x", SessionStatus::Live, 900), summary("c", "/x", SessionStatus::Completed, 600)];
+        let tree = group_sessions(&sessions, SidebarMode::Recent, now, 500);
+        let shape: Vec<(Group, Vec<&str>)> = tree
+            .iter()
+            .map(|n| match n {
+                SidebarNode::Section { group, sessions } => (*group, sessions.iter().map(|s| s.session_id.0.as_str()).collect()),
+                SidebarNode::Workspace(_) => panic!("recent mode has no workspaces"),
+            })
+            .collect();
+        assert_eq!(shape, [(Group::Live, vec!["b"]), (Group::Today, vec!["c"]), (Group::Earlier, vec!["a"])]);
+    }
+
+    #[test]
+    fn home_abbreviates_to_a_tilde() {
+        assert_eq!(tilde("/Users/d/code/tools", "/Users/d"), "~/code/tools");
+        assert_eq!(tilde("/Users/d", "/Users/d"), "~");
+        assert_eq!(tilde("/Users/dan/x", "/Users/d"), "/Users/dan/x");
+        assert_eq!(tilde("/opt/x", ""), "/opt/x");
     }
 }

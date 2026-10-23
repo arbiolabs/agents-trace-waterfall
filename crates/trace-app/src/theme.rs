@@ -1,6 +1,6 @@
 //! Color tokens from docs/design.md, one column per appearance.
 
-use crate::present::{Ink, Tone};
+use crate::present::{Hue, Ink, Tone};
 use gpui_kit::{Hsla, rgb, rgba};
 
 #[derive(Clone, Copy)]
@@ -20,6 +20,8 @@ pub struct Pill {
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub dark: bool,
+    /// macOS Increase Contrast: stronger hairlines and solid 1.5pt bar edges.
+    pub contrast: bool,
     pub tray: Hsla,
     pub card: Hsla,
     /// Floating surfaces; a step above the card in dark mode.
@@ -68,13 +70,35 @@ fn kind(bg: u32, edge: u32, ink: u32, mark: u32) -> KindColors {
 }
 
 impl Palette {
-    pub fn new(dark: bool) -> Self {
-        if dark { Self::dark() } else { Self::light() }
+    pub fn new(dark: bool, contrast: bool) -> Self {
+        let mut p = if dark { Self::dark() } else { Self::light() };
+        if contrast {
+            p.contrast = true;
+            p.line = p.faint;
+            p.grid = if dark { c(0x3a3a40) } else { c(0xdcdcdc) };
+            p.guide = p.faint;
+            for k in [&mut p.agent, &mut p.llm, &mut p.tool, &mut p.error] {
+                k.edge = k.mark;
+            }
+        }
+        p
+    }
+
+    /// One color per status hue, shared by every status glyph and its text.
+    pub fn hue(&self, h: Hue) -> Hsla {
+        match h {
+            Hue::Accent => self.accent,
+            Hue::Amber => self.slow.fg,
+            Hue::Ok => self.ok.fg,
+            Hue::Error => self.error.ink,
+            Hue::Neutral => self.text,
+        }
     }
 
     fn light() -> Self {
         Self {
             dark: false,
+            contrast: false,
             tray: c(0xf0f0f0),
             card: c(0xffffff),
             pop: c(0xffffff),
@@ -106,6 +130,7 @@ impl Palette {
     fn dark() -> Self {
         Self {
             dark: true,
+            contrast: false,
             tray: c(0x19191c),
             card: c(0x232326),
             pop: c(0x2a2a2e),

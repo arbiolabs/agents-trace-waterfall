@@ -29,6 +29,14 @@ The visual reference is the affectUI Trace Waterfall. The app should feel like a
 
 **Sidebar** (260px, tray background). It has a search field, then sessions grouped into **Live**, **Today**, and **Earlier**. Each row shows a status dot (pulsing while live), the project name, a line with harness, model, and turn count, and a muted line with start time, duration, and cost. Prompts are never stored, so rows tell sessions apart by how they ran. The selected row gets a card-colored pill.
 
+A compact **Recent | Workspaces** segmented control sits under the search field. Workspaces mode is a three-level source list. A session's project is its working directory, labelled with the directory's name (else its project id). Its workspace is that directory's parent, labelled with its name, with the `~`-abbreviated path as a tooltip. Sessions without a working directory gather under **No workspace**, last. At every level live work floats to the top, then the most recent activity (`present::group_sessions`).
+
+- **Workspace header.** Chevron, folder icon, name (12.5px semibold), a live dot when any session in it is live, and its session count.
+- **Project row.** Indented one level: chevron, name, live dot, total cost, and a count capsule.
+- **Session rows.** Indented under their project. The project name is already above, so the title reads `model · turns`, with the harness named only when it has no logo.
+
+Clicking a header, or Enter, Space, Left, and Right on a focused one, folds it; its chevron turns over 240ms. A search shows every match, so it opens whatever group holds one. The mode and the folded groups are saved to `<store>.sidebar.json` beside the store. Right-clicking a header offers Collapse All Others, Reveal in Finder, and Copy Path. VoiceOver reads a header as `Workspace tools, 6 sessions, 1 live`.
+
 **Header.** It shows "✦ Trace" in strong ink, then the session subtitle in muted ink. On the right are a status pill (Live, Idle, Done, Failed, Interrupted, or `Replay · 0:06`), a Follow toggle when live, and a Replay button. Follow reads as pressed only while now is in the visible window. Every header control is 28px tall with 8px gaps. The status pill has a card fill, a 1px **line** ring, and a soft shadow; the status color appears only on its dot and text.
 
 **Trace card.** It holds the stats strip, the time axis, and the rows.
@@ -78,7 +86,8 @@ Every span row and the popover head show one mark in a tile. `present::brand_for
 | Git | git-branch | git, commit, branch, checkout, rebase, merge |
 | Database | database | sql, psql, sqlite, query, database, db |
 | Shell | square-terminal | bash, shell, exec, terminal, command, run |
-| Edit | file-pen | edit, write, patch, multiedit, notebookedit, create, replace |
+| Edit | file-pen | edit, patch, multiedit, notebookedit, replace |
+| Write | file-plus | write, create, new |
 | Search | search | grep, glob, search, find, ls |
 | Read | file-text | read, view, cat, open |
 | MCP | plug | any other `mcp__*` |
@@ -120,6 +129,10 @@ Values come from the reference. Kinds map as follows: agent, turn, subagent, wai
 Muted text meets 4.5:1 on the card in both appearances. Only grid, guide, and faint are lighter, and they never carry text. In dark mode the LLM fill is the lavender mark at 28% over the card with a lighter 1px edge, and agent bars sit one surface step above the card, so neither sinks into it.
 
 Wait spans use the agent palette with an amber mark (`#d99a2b`) so idle time reads as waiting, not work.
+
+Hue means work, and nothing else. Agent, turn, subagent, and custom spans are structure, so they share the neutral agent gray rather than taking a third hue; only LLM (lavender) and tool (teal) spans are colored, and amber always means waiting or idle. The overview's three lanes use the same rule: amber for wait, lavender for LLM, teal for tool, with failures as a red rug.
+
+Increase Contrast (`TW_CONTRAST=1` forces it for screenshots) draws hairlines in **faint**, and bar edges solid in the kind's mark color at 1.5pt.
 
 ## Type and spacing
 

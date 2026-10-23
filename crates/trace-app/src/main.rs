@@ -6,7 +6,7 @@ use clap::Parser;
 use gpui_kit::*;
 use std::path::PathBuf;
 
-gpui_kit::actions!(trace_waterfall, [Quit]);
+use app::*;
 
 /// Desktop trace waterfall for coding agents.
 #[derive(Parser)]
@@ -45,6 +45,21 @@ pub struct Cli {
     /// selected span; with `--popover`, holds the popover opening.
     #[arg(long, hide = true)]
     pub freeze_anim: Option<f32>,
+    /// Press Tab this many times once the window has drawn, for focus ring screenshots.
+    #[arg(long, hide = true)]
+    pub tab: Option<usize>,
+    /// Right-click at `X,Y` in window points once the window has drawn, for context menu screenshots.
+    #[arg(long, hide = true, value_parser = parse_window)]
+    pub context_menu: Option<(f64, f64)>,
+    /// List sessions by recency or by workspace; overrides the remembered choice.
+    #[arg(long, hide = true, value_parser = ["recent", "workspaces"])]
+    pub sidebar_mode: Option<String>,
+    /// Collapse the sidebar workspace or project with this name; repeatable.
+    #[arg(long, hide = true)]
+    pub collapse: Vec<String>,
+    /// Type this into the session search field.
+    #[arg(long, hide = true)]
+    pub search: Option<String>,
 }
 
 fn parse_window(v: &str) -> Result<(f64, f64), String> {
@@ -93,8 +108,48 @@ fn main() -> anyhow::Result<()> {
         cx.set_window_appearance(forced_dark.map(|d| if d { WindowAppearance::Dark } else { WindowAppearance::Light }));
         #[cfg(target_os = "macos")]
         cx.set_reduce_motion(objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion());
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-o", Import, None),
+            KeyBinding::new("cmd-e", ExportSession, None),
+            KeyBinding::new("cmd-alt-s", ToggleSidebar, None),
+            KeyBinding::new("cmd-=", ZoomIn, None),
+            KeyBinding::new("cmd-+", ZoomIn, None),
+            KeyBinding::new("cmd--", ZoomOut, None),
+            KeyBinding::new("cmd-0", ZoomToFit, None),
+            KeyBinding::new("cmd-shift-f", Follow, None),
+            KeyBinding::new("cmd-r", Replay, None),
+            KeyBinding::new("cmd-]", NextEvent, None),
+            KeyBinding::new("cmd-[", PrevEvent, None),
+            KeyBinding::new("enter", Inspect, Some(ROWS_CONTEXT)),
+            KeyBinding::new("cmd-c", CopySpanName, Some(ROWS_CONTEXT)),
+        ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.set_menus([
+            Menu::new("Trace Waterfall").items([
+                MenuItem::action("About Trace Waterfall", About),
+                MenuItem::separator(),
+                MenuItem::os_submenu("Services", SystemMenuType::Services),
+                MenuItem::separator(),
+                MenuItem::action("Quit Trace Waterfall", Quit),
+            ]),
+            Menu::new("File").items([MenuItem::action("Import JSONL…", Import), MenuItem::action("Export Session…", ExportSession)]),
+            Menu::new("View").items([
+                MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                MenuItem::separator(),
+                MenuItem::action("Zoom In", ZoomIn),
+                MenuItem::action("Zoom Out", ZoomOut),
+                MenuItem::action("Zoom to Fit", ZoomToFit),
+                MenuItem::separator(),
+                MenuItem::action("Follow", Follow),
+            ]),
+            Menu::new("Go").items([
+                MenuItem::action("Replay", Replay),
+                MenuItem::separator(),
+                MenuItem::action("Next Event", NextEvent),
+                MenuItem::action("Previous Event", PrevEvent),
+            ]),
+        ]);
         cx.on_window_closed(|cx, _| cx.quit()).detach();
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(window_bounds())),
@@ -104,12 +159,26 @@ fn main() -> anyhow::Result<()> {
                 traffic_light_position: Some(point(px(18.), px(21.))),
             }),
             window_min_size: Some(size(px(960.), px(600.))),
+            window_background: WindowBackgroundAppearance::Blurred,
             ..Default::default()
         };
-        let opened = open_window(options, cx, |window, cx| cx.new(|cx| app::TraceApp::new(store, cfg.capture.clone(), forced_dark, &cli, window, cx)));
-        if let Err(e) = opened {
-            eprintln!("trace-waterfall: {e:#}");
-            cx.quit();
+        let opened = open_window(options, cx, |window, cx| cx.new(|cx| app::TraceApp::new(store, cfg.capture.clone(), forced_dark, &cli, db.with_extension("sidebar.json"), window, cx)));
+        match opened {
+            // The kit's root paints the theme background over the whole window; clear it so the
+            // sidebar's translucent tray shows the window's blur.
+            Ok((handle, _)) => {
+                handle
+                    .update(cx, |_, window, cx| {
+                        if let Some(Some(root)) = window.root::<gpui_kit::base::Root>() {
+                            root.update(cx, |r, _| Styled::style(r).background = Some(transparent_black().into()));
+                        }
+                    })
+                    .ok();
+            }
+            Err(e) => {
+                eprintln!("trace-waterfall: {e:#}");
+                cx.quit();
+            }
         }
         cx.activate(true);
     });
