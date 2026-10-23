@@ -223,9 +223,10 @@ impl TraceDoc {
     }
 
     /// Expands every descendant if any is collapsed, else collapses them all. Stops after EXPAND_ALL_LIMIT spans.
-    /// Whether every branch is folded.
+    /// Whether no visible branch is open. Judged on the rows, so a branch that arrives live under a folded
+    /// parent does not make a second fold-all fold again instead of expanding.
     pub fn all_folded(&self) -> bool {
-        self.state.spans.keys().all(|id| self.state.children(id).is_empty() || self.collapsed.contains(id))
+        self.rows.iter().all(|r| !matches!(r.kind, RowKind::Span(_)) || !r.has_children || r.collapsed)
     }
 
     /// Folds or unfolds every branch. Folding moves the selection up to its top-level span, which stays in view.

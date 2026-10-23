@@ -190,4 +190,8 @@ fn fold_all_hides_every_branch_and_keeps_the_selection_in_view() {
     doc.fold_all(false);
     assert!(!doc.all_folded());
     assert_eq!(doc.rows.len(), 6);
+    doc.fold_all(true);
+    doc.state.apply(&start(20, 800 * MS, "late", Some("tool2"), "tool"));
+    doc.refresh();
+    assert!(doc.all_folded(), "a branch arriving under a folded parent stays out of sight, so the next toggle expands");
 }
