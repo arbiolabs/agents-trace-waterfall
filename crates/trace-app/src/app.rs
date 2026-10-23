@@ -63,6 +63,9 @@ struct Geo {
     origin: Ns,
     /// The whole session, as the overview strip shows it.
     overview: (Ns, Ns),
+    /// Where open spans stop: the session end, or the last event while idle.
+    end: Option<Ns>,
+    live: bool,
 }
 
 impl Geo {
@@ -132,6 +135,9 @@ pub struct TraceApp {
     popover: Pop,
     /// Popover content height from the last frame, so the open and close animations can clip it.
     pop_h: Rc<Cell<f32>>,
+    pop_scroll: ScrollHandle,
+    /// `--popover-scroll-end`: hold the popover's body scrolled to its end.
+    pop_scroll_end: bool,
     hovered: Option<usize>,
     list: UniformListScrollHandle,
     focus: FocusHandle,
@@ -206,6 +212,8 @@ impl TraceApp {
             doc: None,
             popover: Pop::Closed,
             pop_h: Rc::new(Cell::new(0.)),
+            pop_scroll: ScrollHandle::new(),
+            pop_scroll_end: cli.popover_scroll_end,
             hovered: None,
             list: UniformListScrollHandle::new(),
             focus: cx.focus_handle(),
@@ -299,7 +307,11 @@ impl TraceApp {
     }
 
     /// New journal rows since the last look refresh the sidebar; the open document polls on its own.
+    /// An idle live document draws no frames of its own, so this also wakes it to poll.
     fn watch(&mut self, cx: &mut Context<Self>) {
+        if self.doc.as_ref().is_some_and(|d| matches!(d.mode, Mode::Live { .. })) {
+            cx.notify();
+        }
         let seq = self.store.max_journal_seq().unwrap_or(self.journal_seq);
         if seq != self.journal_seq {
             self.journal_seq = seq;
@@ -360,7 +372,7 @@ impl TraceApp {
             }
         }
         let running = match &doc.mode {
-            Mode::Live { paused_at, .. } => paused_at.is_none(),
+            Mode::Live { paused_at, .. } => paused_at.is_none() && idle(doc).is_none(),
             Mode::Replay { clock, .. } => clock.playing,
             Mode::Static => false,
         };
@@ -520,11 +532,10 @@ impl TraceApp {
         self.open(id, !replaying);
     }
 
-    /// Back to following now at the fitted scale.
+    /// Follows now again at the current scale, so now lands at the timeline's right edge.
     fn jump_to_now(&mut self) {
         if let Some(TraceDoc { mode: Mode::Live { following, .. }, .. }) = &mut self.doc {
             *following = true;
-            self.zoomed = false;
         }
     }
 
@@ -532,7 +543,7 @@ impl TraceApp {
     fn pan_to_span(&mut self, id: &SpanId, tl_w: f32) {
         let Some(doc) = &self.doc else { return };
         let (Some(s), Some(vp)) = (doc.state.spans.get(id), doc.viewport) else { return };
-        let end = s.effective_end(doc.state.session.ended_at_utc_ns, doc.now);
+        let end = s.effective_end(shown_end(doc), doc.now);
         let len = vp.end_ns(tl_w as u16) - vp.start_ns;
         if (end - s.started_at_utc_ns) as f64 > len as f64 * 0.8 {
             self.zoom_to_span(id);
@@ -553,10 +564,14 @@ impl TraceApp {
         cx.notify();
     }
 
+    /// Follow reads as on only while now is in view, so pressing it while now is off-screen jumps there.
     fn toggle_follow(&mut self) {
-        if let Some(TraceDoc { mode: Mode::Live { following, .. }, .. }) = &mut self.doc {
-            *following = !*following;
-            self.zoomed &= !*following;
+        let Some(doc) = &mut self.doc else { return };
+        let visible = now_visible(doc);
+        match &mut doc.mode {
+            Mode::Live { following, .. } if *following && visible => *following = false,
+            Mode::Live { .. } => self.jump_to_now(),
+            _ => {}
         }
     }
 
@@ -594,7 +609,7 @@ impl TraceApp {
         self.zoomed = true;
         let Some(doc) = &mut self.doc else { return };
         let Some(s) = doc.state.spans.get(id) else { return };
-        let end = s.effective_end(doc.state.session.ended_at_utc_ns, doc.now);
+        let end = s.effective_end(shown_end(doc), doc.now);
         let pad = ((end - s.started_at_utc_ns) / 10).max(1_000_000);
         if let Mode::Live { following, .. } = &mut doc.mode {
             *following = false;
@@ -1088,7 +1103,10 @@ impl TraceApp {
             }
             let (color, label, pulse) = match &doc.mode {
                 Mode::Live { paused_at: Some(_), .. } => (pal.text, "Paused".to_owned(), false),
-                Mode::Live { .. } => (pal.accent, "Live".to_owned(), true),
+                Mode::Live { .. } => match idle(doc) {
+                    Some(last) => (pal.slow.fg, format!("Idle · {}", format_duration(doc.now - last)), false),
+                    None => (pal.accent, "Live".to_owned(), true),
+                },
                 Mode::Replay { replay, clock } => (pal.accent, format!("Replay · {}", clock_time(clock.position - replay.start().unwrap_or(0))), false),
                 Mode::Static => match s.status {
                     SessionStatus::Failed => (pal.error.ink, "Failed".to_owned(), false),
@@ -1099,7 +1117,7 @@ impl TraceApp {
             };
             right = right.child(pill(pal, color, label, pulse, "hdot", 28.));
             if let Mode::Live { following, .. } = &doc.mode {
-                let on = *following;
+                let on = *following && now_visible(doc);
                 right = right.child(
                     tool_button("follow", IconName::Crosshair, Some("Follow"), on, pal)
                         .tooltip(|w, cx| Tooltip::new("Keep the latest activity in view  F").build(w, cx))
@@ -1178,8 +1196,15 @@ impl TraceApp {
             } else {
                 let fit_w = if matches!(doc.mode, Mode::Live { .. }) { tl_w } else { tl_w * 0.86 };
                 let fit = doc.fit(fit_w as u16);
-                let focus = if matches!(doc.mode, Mode::Replay { .. }) { None } else { focus_window(doc, fit.ns_per_cell, fit_w) };
+                let focus = if matches!(doc.mode, Mode::Replay { .. }) { None } else { focus_window(doc, fit.ns_per_cell, tl_w * 0.86) };
                 doc.viewport = Some(focus.as_ref().map_or(fit, |f| f.1));
+                // Opening on the latest turn of a long session leaves now off-screen, so it does not follow.
+                if let (Some((_, f)), Mode::Live { following, .. }) = (&focus, &mut doc.mode)
+                    && f.end_ns(tl_w as u16) < doc.now
+                {
+                    *following = false;
+                    self.zoomed = true;
+                }
                 // Row 0 is the default selection; anything else came from `--select`.
                 if let Some((id, _)) = focus.filter(|_| doc.selected_row == 0)
                     && let Some(i) = doc.rows.iter().position(|r| r.kind == RowKind::Span(id.clone()))
@@ -1193,11 +1218,12 @@ impl TraceApp {
         if !self.zoomed && matches!(doc.mode, Mode::Live { following: true, .. }) {
             let fit_w = tl_w * 0.9;
             let fit = Viewport::fit(overview.0, doc.now, fit_w as u16);
-            vp = focus_window(doc, fit.ns_per_cell, fit_w).map_or(fit, |f| f.1);
+            vp = focus_window(doc, fit.ns_per_cell, fit_w).map(|f| f.1).filter(|f| f.end_ns(tl_w as u16) >= doc.now).unwrap_or(fit);
             doc.viewport = Some(vp);
         }
         let origin = overview.0;
-        Some(Geo { left: card_left + 1., name_w, tl_w, vp, now: doc.now, origin, overview })
+        let live = matches!(doc.mode, Mode::Live { .. });
+        Some(Geo { left: card_left + 1., name_w, tl_w, vp, now: doc.now, origin, overview, end: shown_end(doc), live })
     }
 
     fn render_card(&mut self, pal: &Palette, vw: f32, card_left: f32, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1298,19 +1324,20 @@ impl TraceApp {
                 .into_any_element(),
             })
             .child(gpui_kit::component::scroll::Scrollbar::vertical(&self.list))
-            .when(matches!(doc.mode, Mode::Live { following: false, .. }) && !(0.0..=g.tl_w).contains(&now_x), |el| {
+            .when_some(g.live.then(|| present::now_capsule(g.now, g.window())).flatten(), |el, (edge, text)| {
+                let left = edge == Edge::Left;
+                let chevron = Icon::new(if left { IconName::ChevronLeft } else { IconName::ChevronRight }).size(px(14.)).text_color(pal.accent);
                 el.child(
                     div()
                         .id("jump-now")
                         .absolute()
                         .top(px(8.))
-                        .right(px(14.))
+                        .when(left, |el| el.left(px(g.name_w + 8.)).pl(px(8.)).pr(px(12.)))
+                        .when(!left, |el| el.right(px(14.)).pl(px(12.)).pr(px(8.)))
                         .h(px(28.))
                         .flex()
                         .items_center()
                         .gap(px(4.))
-                        .pl(px(12.))
-                        .pr(px(8.))
                         .rounded_full()
                         .bg(pal.card)
                         .border_1()
@@ -1318,12 +1345,12 @@ impl TraceApp {
                         .shadow(vec![soft_shadow(pal, 0.10, 4., 12.), soft_shadow(pal, 0.05, 1., 2.)])
                         .text_size(px(12.))
                         .font_weight(FontWeight::MEDIUM)
+                        .font_features(tnum())
                         .text_color(pal.accent)
                         .cursor_pointer()
                         .hover(|s| s.bg(pal.wash))
-                        .child("Jump to now")
-                        .child(Icon::new(IconName::ChevronRight).size(px(14.)).text_color(pal.accent))
-                        .tooltip(|w, cx| Tooltip::new("Follow now again  F").build(w, cx))
+                        .map(|el| if left { el.child(chevron).child(text) } else { el.child(text).child(chevron) })
+                        .tooltip(|w, cx| Tooltip::new("Jump to now and follow  F").build(w, cx))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.jump_to_now();
                             cx.notify();
@@ -1400,27 +1427,38 @@ impl TraceApp {
         const LANE: f32 = 3.;
         const LANE_GAP: f32 = 2.;
         let doc = self.doc.as_ref().expect("overview needs a document");
-        let session_end = doc.state.session.ended_at_utc_ns;
+        const LANES_H: f32 = present::LANES as f32 * LANE + (present::LANES - 1) as f32 * LANE_GAP;
+        let session_end = g.end;
         let cols = g.tl_w.ceil().max(1.) as usize;
-        // One thin lane per tone (wait in amber, LLM, tool, error).
-        let spans = doc.state.spans.values().filter(|s| matches!(s.kind, SpanKind::Llm | SpanKind::Tool | SpanKind::Wait) || s.status == SpanStatus::Failed);
-        let alpha = present::density(spans.map(|s| (g.ov_x(s.started_at_utc_ns), g.ov_x(s.effective_end(session_end, g.now)), present::tone(s) as usize)), cols);
-        let tones = [Tone::Agent, Tone::Llm, Tone::Tool, Tone::Error];
-        let colors = tones.map(|t| if t == Tone::Agent { pal.amber } else { pal.kind(t).mark });
-        let marks: Vec<(f32, f32, Hsla)> = alpha
+        // One thin lane per kind (wait in amber, LLM, tool); failures tick across all three in red.
+        let lane = |k: SpanKind| match k {
+            SpanKind::Wait => Some(0),
+            SpanKind::Llm => Some(1),
+            SpanKind::Tool => Some(2),
+            _ => None,
+        };
+        let spans = doc.state.spans.values().filter_map(|s| Some((g.ov_x(s.started_at_utc_ns), g.ov_x(s.effective_end(session_end, g.now)), lane(s.kind)?)));
+        let alpha = present::density(spans, cols);
+        let colors = [pal.amber, pal.llm.mark, pal.tool.mark];
+        let mut marks: Vec<(f32, f32, f32, Hsla)> = alpha
             .iter()
             .enumerate()
-            .flat_map(|(i, a)| (0..4).filter(|&k| a[k] > 0.).map(move |k| (i, k, a[k])))
-            .map(|(i, k, a)| (i as f32, k as f32 * (LANE + LANE_GAP), colors[k].opacity(a)))
+            .flat_map(|(i, a)| (0..present::LANES).filter(|&k| a[k] > 0.).map(move |k| (i, k, a[k])))
+            .map(|(i, k, a)| (i as f32, k as f32 * (LANE + LANE_GAP), LANE, colors[k].opacity(a)))
             .collect();
+        let mut errors: Vec<usize> = doc.state.spans.values().filter(|s| s.status == SpanStatus::Failed).map(|s| (g.ov_x(s.started_at_utc_ns).max(0.) as usize).min(cols - 1)).collect();
+        errors.sort_unstable();
+        errors.dedup();
+        // A rug above the lanes, so even hundreds of failures never hide the density beneath.
+        marks.extend(errors.into_iter().map(|i| (i as f32, -7., 4., pal.error.mark)));
         let (a, b) = g.window();
         let (lx0, lx1) = present::lens_rect(g.ov_x(a), g.ov_x(b), g.tl_w);
         let thin = g.ov_x(b) - g.ov_x(a) < present::LENS_MIN;
         let this = cx.entity().downgrade();
         let strip = canvas(|_, _, _| {}, move |bounds, _, window, _| {
-            let top = bounds.origin.y + (bounds.size.height - px(4. * LANE + 3. * LANE_GAP)) / 2.;
-            for (x, y, color) in &marks {
-                window.paint_quad(fill(Bounds::new(point(bounds.origin.x + px(*x), top + px(*y)), size(px(1.), px(LANE))), *color));
+            let top = bounds.origin.y + (bounds.size.height - px(LANES_H)) / 2. + px(3.);
+            for (x, y, h, color) in &marks {
+                window.paint_quad(fill(Bounds::new(point(bounds.origin.x + px(*x), top + px(*y)), size(px(1.), px(*h))), *color));
             }
             let local = move |p: Point<Pixels>| (p.x - bounds.origin.x).to_f64() as f32;
             let down = this.clone();
@@ -1540,8 +1578,10 @@ impl TraceApp {
             (Some(c), true) => format!("≥ {}", format_cost(Some(c))),
             (c, _) => format_cost(c),
         };
+        let idle = idle(doc);
+        let until_now = idle.map(|_| format!("{} until now", format_duration(doc.state.wall_clock(doc.now))));
         let cells = [
-            ("Duration", format_duration(doc.state.wall_clock(doc.now)), pal.ink),
+            ("Duration", format_duration(doc.state.wall_clock(idle.unwrap_or(doc.now))), pal.ink),
             ("Cost", cost, pal.ink),
             ("Tokens", format_tokens(t.tokens_input + t.tokens_output), pal.ink),
             ("LLM calls", count(SpanKind::Llm).to_string(), pal.ink),
@@ -1549,7 +1589,10 @@ impl TraceApp {
             ("Errors", t.failed_spans.to_string(), if t.failed_spans > 0 { pal.error.ink } else { pal.ink }),
         ];
         div().h(px(STATS_H)).flex_shrink_0().flex().border_b_1().border_color(pal.line).children(cells.into_iter().enumerate().map(|(i, (label, value, color))| {
+            let tip = until_now.clone().filter(|_| i == 0);
             div()
+                .id(("stat", i))
+                .when_some(tip, |el, t| el.tooltip(move |w, cx| Tooltip::new(t.clone()).build(w, cx)))
                 .flex_1()
                 .min_w(px(0.))
                 .flex()
@@ -1582,17 +1625,17 @@ impl TraceApp {
         let selected = doc.selected.as_ref() == Some(id);
         let hovered = key == ix && self.hovered == Some(ix);
         let live = !matches!(doc.mode, Mode::Static);
-        let running = live && s.ended_at_utc_ns.is_none() && s.status == SpanStatus::Running;
+        let running = live && s.ended_at_utc_ns.is_none() && s.status == SpanStatus::Running && idle(doc).is_none();
         let tone = present::tone(s);
         let kc = pal.kind(tone);
         let (icon, ink) = present::glyph(s);
         let detail = present::detail(s, &doc.state.session.harness);
         let indent = 12. + f32::from(row.depth) * INDENT;
-        let end = s.effective_end(doc.state.session.ended_at_utc_ns, g.now);
+        let end = s.effective_end(g.end, g.now);
         // Two pixels in from each edge, so a span that would draw as a sliver reads as off-screen.
         let edge_ns = (2. * g.vp.ns_per_cell) as Ns;
         let (wa, wb) = g.window();
-        let hint = present::offscreen_hint(s.started_at_utc_ns, end, (wa + edge_ns, wb - edge_ns));
+        let hint = present::offscreen_hint(s.started_at_utc_ns, end, (wa + edge_ns, wb - edge_ns), g.live);
         let full_title = present::title(s);
         // About 7pt per character at 13pt; the title gets at most 80% of what the name column leaves.
         let room = (g.name_w - indent - 14. - 20. - 12. - 10.) * 0.8;
@@ -1767,9 +1810,12 @@ impl TraceApp {
     fn render_bar(&self, ix: usize, s: &Span, g: &Geo, kc: KindColors, pal: &Palette, hovered: bool, slowest: bool, hidden: &[&Span], row_bg: Hsla, window: &mut Window) -> impl IntoElement + use<> {
         const FADE: f32 = 12.;
         let doc = self.doc.as_ref().expect("bars need a document");
-        let session_end = doc.state.session.ended_at_utc_ns;
+        let session_end = g.end;
         let end = s.effective_end(session_end, g.now);
-        let open = s.ended_at_utc_ns.is_none() && !matches!(doc.mode, Mode::Static);
+        let unended = s.ended_at_utc_ns.is_none() && !matches!(doc.mode, Mode::Static);
+        // An open span in an idle session stops at the last event and trails off instead of growing.
+        let stale = unended && g.live && session_end.is_some() && doc.state.session.ended_at_utc_ns.is_none();
+        let open = unended && !stale;
         let x0 = g.x(s.started_at_utc_ns);
         let x1 = g.x(end);
         let reveal = self.seen.get(&s.span_id).map_or(1., |t| ease(t.elapsed().as_secs_f32() / REVEAL.as_secs_f32()));
@@ -1819,12 +1865,20 @@ impl TraceApp {
         }
         bar = bar.when(clip_l, |el| el.child(fade(true))).when(clip_r && !open, |el| el.child(fade(false)));
         cell = cell.child(bar);
+        const DASH: f32 = 4.;
+        const DASH_GAP: f32 = 3.;
+        let tail_w = if stale && !clip_r { 3. * (DASH + DASH_GAP) } else { 0. };
+        for (k, a) in [0.7, 0.45, 0.2].into_iter().enumerate().take(if tail_w > 0. { 3 } else { 0 }) {
+            let x = bx + bw + DASH_GAP + k as f32 * (DASH + DASH_GAP);
+            cell = cell.child(div().absolute().left(px(x)).top(px((ROW_H - 2.) / 2.)).w(px(DASH)).h(px(2.)).rounded_full().bg(kc.mark.opacity(a)));
+        }
+        let bw_label = bw + tail_w;
         let label = present::bar_label(s, &doc.state.subtree_totals(&s.span_id), session_end, g.now);
         let lw = text_width(window, &label, LABEL_SIZE);
         let tag_w = if slowest { 58. } else { 0. };
-        let at = present::label_at(bx, bw, lw + tag_w, g.tl_w);
+        let at = present::label_at(bx, bw_label, lw + tag_w, g.tl_w);
         let lx = match at {
-            LabelAt::After => bx + bw + present::LABEL_GAP,
+            LabelAt::After => bx + bw_label + present::LABEL_GAP,
             LabelAt::Inside => bx + bw - 8. - lw,
             LabelAt::Before => bx - present::LABEL_GAP - lw - tag_w,
         };
@@ -1874,7 +1928,7 @@ impl TraceApp {
         }
         let doc = self.doc.as_ref()?;
         let s = doc.selected_span()?;
-        let end = s.effective_end(doc.state.session.ended_at_utc_ns, g.now);
+        let end = s.effective_end(g.end, g.now);
         let body_top = 1. + STATS_H + OVERVIEW_H + AXIS_H;
         let scroll = self.list.0.borrow().base_handle.offset().y.to_f64() as f32;
         let row_y = (body_top + doc.selected_row as f32 * ROW_H + scroll).clamp(body_top - ROW_H, card.1.height);
@@ -1893,14 +1947,16 @@ impl TraceApp {
             .collect::<Vec<_>>()
             .join(" · ");
         let open = s.ended_at_utc_ns.is_none() && !matches!(doc.mode, Mode::Static);
+        let quiet = open && idle(doc).is_some();
         let (status, label) = match s.status {
             SpanStatus::Failed => (pal.error.ink, "Failed"),
             SpanStatus::Succeeded => (pal.ok.fg, "Done"),
             SpanStatus::Cancelled => (pal.text, "Cancelled"),
+            SpanStatus::Running if quiet => (pal.slow.fg, "Idle"),
             SpanStatus::Running if open => (pal.accent, "Running"),
             _ => (pal.text, "Unknown"),
         };
-        let stats = present::popover_stats(&doc.state, s, &doc.state.subtree_totals(&s.span_id), doc.now);
+        let stats = present::popover_stats(&doc.state, s, &doc.state.subtree_totals(&s.span_id), g.end, doc.now);
         let cell = |(k, v): &(&'static str, String)| {
             div()
                 .flex_1()
@@ -1952,7 +2008,7 @@ impl TraceApp {
                             .child(div().truncate().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).text_color(pal.ink).child(present::title(s)))
                             .child(div().truncate().text_size(px(12.)).text_color(pal.muted).child(sub)),
                     )
-                    .child(pill(pal, status, label.to_owned(), open, "pdot", 24.))
+                    .child(pill(pal, status, label.to_owned(), open && !quiet, "pdot", 24.))
                     .child(
                         div()
                             .id("close")
@@ -2015,6 +2071,12 @@ impl TraceApp {
         // GPUI has no element scale, so the card's bounds shrink toward the bar while the content holds
         // still underneath, clipped.
         let final_h = natural.min(place.max_h);
+        if self.pop_scroll_end {
+            self.pop_scroll.scroll_to_bottom();
+        }
+        // The body scrolls when it outgrows the room; a fade at the bottom says there is more until its end.
+        let max_scroll = self.pop_scroll.max_offset().y.to_f64() as f32;
+        let more_below = natural > final_h + 1. && -(self.pop_scroll.offset().y.to_f64() as f32) < max_scroll - 1.;
         let h = final_h * scale;
         let y = if place.above { place.y + final_h - h } else { place.y };
         let arrow_x = place.arrow_x - place.x - present::POP_ARROW;
@@ -2065,7 +2127,19 @@ impl TraceApp {
                 cx.notify();
             }))
             .on_click(|_, _, cx| cx.stop_propagation())
-            .child(div().id("pop-scroll").size_full().overflow_y_scroll().child(content));
+            .child(div().id("pop-scroll").size_full().overflow_y_scroll().track_scroll(&self.pop_scroll).on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify())).child(content))
+            .when(more_below, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(24.))
+                        .rounded_b(px(16.))
+                        .bg(linear_gradient(180., linear_color_stop(pal.pop.opacity(0.), 0.), linear_color_stop(pal.pop, 1.))),
+                )
+            });
         Some(
             deferred(
                 anchored()
@@ -2217,18 +2291,33 @@ impl TraceApp {
 
     fn render_empty(&self, pal: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let copied = self.copied_at.is_some_and(|t| t.elapsed() < COPIED_FOR);
-        // A faint, inert waterfall behind the copy, so the empty card already looks like what it will hold.
-        let sample = [(Tone::Agent, 0.10, 0.62), (Tone::Llm, 0.16, 0.18), (Tone::Tool, 0.36, 0.12), (Tone::Llm, 0.50, 0.22)];
-        let ghost = div().absolute().inset_0().flex().flex_col().justify_center().gap(px(16.)).opacity(0.3).children(sample.map(|(t, x, w)| {
-            let k = pal.kind(t);
-            div().h(px(BAR_H)).relative().child(div().absolute().left(relative(x)).w(relative(w)).h_full().rounded(px(5.)).bg(k.bg).border_1().border_color(k.edge))
-        }));
+        // A faint, inert waterfall behind the copy that fades out radially around it, so the empty card
+        // already looks like what it will hold. Painted per column: GPUI has no radial gradient.
+        let sample = [(Tone::Agent, 0.06, 0.88), (Tone::Llm, 0.08, 0.22), (Tone::Tool, 0.31, 0.07), (Tone::Llm, 0.39, 0.24), (Tone::Tool, 0.64, 0.07), (Tone::Llm, 0.72, 0.21)];
+        let colors = sample.map(|(t, x, w)| (pal.kind(t).edge, x, w));
+        let ghost = canvas(|_, _, _| {}, move |b, _, window, _| {
+            let (w, h) = (b.size.width.to_f64() as f32, b.size.height.to_f64() as f32);
+            let (cx, cy) = (w / 2., h / 2.);
+            let rows = colors.len() as f32;
+            for (i, (color, x0, bw)) in colors.iter().enumerate() {
+                let y = cy + (i as f32 - (rows - 1.) / 2.) * 2. * BAR_H;
+                let (a, z) = ((x0 * w).round() as i32, ((x0 + bw) * w).round() as i32);
+                for x in a..z {
+                    let d = (((x as f32 - cx) / 300.).powi(2) + ((y - cy) / 150.).powi(2)).sqrt();
+                    let taper = ((x - a).min(z - 1 - x) as f32 / 5.).clamp(0.2, 1.);
+                    let alpha = ((d - 0.8) / 0.9).clamp(0., 1.) * 0.4 * taper;
+                    if alpha > 0. {
+                        window.paint_quad(fill(Bounds::new(b.origin + point(px(x as f32), px(y - BAR_H / 2.)), size(px(1.), px(BAR_H))), color.opacity(alpha)));
+                    }
+                }
+            }
+        })
+        .absolute()
+        .inset_0();
         div().flex_1().relative().overflow_hidden().flex().items_center().justify_center().rounded(px(16.)).bg(pal.card).border_1().border_color(pal.line).child(ghost).child(
             div()
                 .w(px(400.))
                 .p(px(24.))
-                .rounded(px(16.))
-                .bg(pal.card.opacity(0.9))
                 .flex()
                 .flex_col()
                 .items_center()
@@ -2320,10 +2409,24 @@ fn icon_tile(icon: IconName, color: Hsla, size: f32, pal: &Palette) -> impl Into
         .child(Icon::new(icon).size(px((size * 0.6).round())).text_color(color))
 }
 
+/// When a live session went quiet, for the Idle pill and stopped spinners.
+fn idle(doc: &TraceDoc) -> Option<Ns> {
+    present::idle_since(&doc.state, matches!(doc.mode, Mode::Live { .. }), doc.now)
+}
+
+/// Where open spans stop drawing; see `present::shown_end`.
+fn shown_end(doc: &TraceDoc) -> Option<Ns> {
+    present::shown_end(&doc.state, idle(doc))
+}
+
+fn now_visible(doc: &TraceDoc) -> bool {
+    doc.viewport.is_some_and(|vp| (vp.start_ns..=vp.end_ns(doc.timeline_width)).contains(&doc.now))
+}
+
 /// The latest turn's window when the whole-trace fit would draw bars as slivers.
 fn focus_window(doc: &TraceDoc, ns_per_px: f64, fit_w: f32) -> Option<(SpanId, Viewport)> {
     let t = present::focus_turn(&doc.state, ns_per_px)?;
-    let end = t.effective_end(doc.state.session.ended_at_utc_ns, doc.now);
+    let end = t.effective_end(shown_end(doc), doc.now);
     let pad = (end - t.started_at_utc_ns) / 25;
     Some((t.span_id.clone(), Viewport::fit(t.started_at_utc_ns - pad, end + pad, fit_w as u16)))
 }
