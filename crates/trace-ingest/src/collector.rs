@@ -26,7 +26,7 @@ const BATCH: usize = 1000;
 type Reply = oneshot::Sender<anyhow::Result<Option<u64>>>;
 
 /// Requests to the single task that owns the `Store`.
-enum Cmd {
+pub(crate) enum Cmd {
     /// Replies with the cursor of `source` once the batch has committed.
     Append {
         events: Vec<CanonicalEvent>,
@@ -105,6 +105,13 @@ async fn serve(
     mut stop: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
+    if let Some(addr) = cfg.otlp {
+        // The receiver writes to the store unauthenticated, so it listens on this machine only.
+        ensure!(addr.ip().is_loopback(), "otlp = {addr} is not a loopback address");
+        let l = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("binding OTLP receiver {addr}"))?;
+        eprintln!("collector: OTLP/HTTP receiver on http://{addr}/v1/traces");
+        tokio::spawn(crate::otlp::serve(l, tx.clone()));
+    }
     let listener = UnixListener::bind(&cfg.socket_path)
         .with_context(|| format!("binding {}", cfg.socket_path.display()))?;
     fs::set_permissions(&cfg.socket_path, fs::Permissions::from_mode(0o600))?;
@@ -277,7 +284,7 @@ async fn send(w: &mut OwnedWriteHalf, msg: serde_json::Value) -> std::io::Result
     w.write_all(format!("{msg}\n").as_bytes()).await
 }
 
-async fn ask(
+pub(crate) async fn ask(
     tx: &mpsc::Sender<Cmd>,
     cmd: impl FnOnce(Reply) -> Cmd,
 ) -> anyhow::Result<Option<u64>> {

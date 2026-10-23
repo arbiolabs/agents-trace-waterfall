@@ -181,6 +181,7 @@ fn main() -> anyhow::Result<()> {
                 stale_after: STALE_AFTER,
                 tail: all,
                 capture: cfg.capture.clone(),
+                otlp: cfg.otlp,
             })
         }
         Some(Cmd::Doctor) => {

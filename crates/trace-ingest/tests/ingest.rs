@@ -40,6 +40,7 @@ fn env() -> Env {
 fn config(env: &Env, tail: &[(&str, &Path)], stale_after: Duration) -> CollectorConfig {
     CollectorConfig {
         capture: Default::default(),
+        otlp: None,
         socket_path: env.sock.clone(),
         db_path: env.db.clone(),
         stale_after,
