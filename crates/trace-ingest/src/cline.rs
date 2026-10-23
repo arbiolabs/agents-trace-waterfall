@@ -29,8 +29,10 @@
 //! one aggregate `llm:` span with those totals. Cline's `new_task` starts an unlinked task, so it stays a
 //! separate session.
 //!
-//! Not covered: Cline 4.x's SDK sessions (`~/.cline/data/db/<session>/<session>.messages.json` with
-//! `sessions.db`), a different format.
+//! Cline 4.x's SDK (its CLI, and the extension's SDK bundle) keeps sessions instead, read by [`sdk`]:
+//! `~/.cline/data/sessions/<session>/` (or `data/db/<session>/` behind its SQLite store) holds the
+//! `<session>.json` manifest and `<session>.messages.json`, the provider-format conversation rewritten
+//! whole after each step. [`read`] also takes the `data` folder, `sessions`, or one session's folder.
 
 use serde_json::{Value, json};
 use std::path::Path;
@@ -51,11 +53,14 @@ struct Info(&'static str);
 impl TraceAdapter for Info {
     fn source_info(&self) -> SourceInfo {
         let mut unobservable = vec![
-            "LLM call end (taken from its first tool, or its last message)",
-            "tool end (taken from the next tool or model call)",
+            "LLM call end in tasks (taken from its first tool, or its last message)",
+            "tool end in tasks (taken from the next tool or model call)",
+            "LLM call start in SDK sessions (taken from the message before the reply)",
+            "tool start in SDK sessions (taken from the reply that called it)",
             "cost provenance (the extension's own estimate from model prices)",
-            "failure of tools other than commands, unless the extension shows an error",
-            "per-call timing, model calls and tool calls of Cline's in-process sub-agents (only their totals)",
+            "failure of task tools other than commands, unless the extension shows an error",
+            "per-call timing, model calls and tool calls of Cline 3.x's in-process sub-agents (only their totals)",
+            "which spawn call started an SDK sub-agent when several start at once (paired by order)",
             "project of tasks whose history entry lives only in VS Code's state database",
             "prompt, message, reasoning, command and tool input/output text (excluded by design)",
             "host",
@@ -71,10 +76,11 @@ impl TraceAdapter for Info {
     }
 }
 
-/// Events for every task whose `ui_messages.json` changed after `since_ms` (its mtime, epoch milliseconds),
-/// and the newest change read.
+/// Events for every task or SDK session whose messages file changed after `since_ms` (its mtime, epoch
+/// milliseconds), and the newest change read.
 // ponytail: a write in the same millisecond as the previous poll's newest waits for the task's next change.
 pub fn read(path: &Path, since_ms: i64, harness: &'static str) -> anyhow::Result<(Vec<CanonicalEvent>, i64)> {
+    anyhow::ensure!(path.is_dir(), "{} is not a {harness} tasks or sessions folder, nor one task's or session's folder", path.display());
     let (tasks, only) = if path.join("ui_messages.json").is_file() {
         (path.parent().unwrap_or(path).to_owned(), path.file_name().and_then(|n| n.to_str()))
     } else if path.join("tasks").is_dir() {
@@ -82,7 +88,6 @@ pub fn read(path: &Path, since_ms: i64, harness: &'static str) -> anyhow::Result
     } else {
         (path.to_owned(), None)
     };
-    anyhow::ensure!(tasks.is_dir(), "{} is not a {harness} tasks folder, nor one task's folder", path.display());
     let mut ids: Vec<String> = std::fs::read_dir(&tasks)?.flatten().filter_map(|e| e.file_name().into_string().ok()).filter(|id| only.is_none_or(|o| o == id)).collect();
     ids.sort();
     let mut newest = since_ms;
@@ -96,6 +101,12 @@ pub fn read(path: &Path, since_ms: i64, harness: &'static str) -> anyhow::Result
         let Some(msgs) = read_json(&tasks.join(&id).join("ui_messages.json")).and_then(|v| v.as_array().cloned()) else { continue };
         newest = newest.max(changed.unwrap_or(since_ms));
         events.extend(Task::load(&tasks, &id, msgs, harness).events());
+    }
+    for dir in sdk::sessions(path) {
+        if let Some((more, changed)) = sdk::read_session(&dir, since_ms, harness) {
+            newest = newest.max(changed);
+            events.extend(more);
+        }
     }
     Ok((events, newest))
 }
@@ -440,6 +451,191 @@ fn read_json(p: &Path) -> Option<Value> {
 fn mtime_ms(p: &Path) -> Option<i64> {
     let t = std::fs::metadata(p).and_then(|m| m.modified()).ok()?;
     Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64)
+}
+
+/// Cline 4.x SDK sessions. Each messages file is `{agent, sessionId, origin, messages}`, the messages in the
+/// provider's own shape (`role`, `content` blocks with `tool_use` and `tool_result`) plus `id`, `ts` (epoch
+/// ms, when the message was written) and, on a reply, `modelInfo {id, provider}` and `metrics {inputTokens,
+/// outputTokens, cacheReadTokens, cacheWriteTokens, cost}`.
+///
+/// Spans: `turn:` per user message that is not only tool results; `llm:` per assistant message, from the
+/// message before it (the prompt, or the last tool result in) to its own `ts`; `tool:<session>:<call id>`
+/// per `tool_use`, from its reply to the message that carries its `tool_result`, failed when that result is
+/// `is_error` or reports `success: false` (a command's non-zero exit). A reply without tool calls ends the turn.
+///
+/// Sub-agents: a sub-agent's file sits beside its root's as `<agent id>.messages.json`, its `origin`
+/// naming its `parentThreadId`. Its events join the root session inside `subagent:<its session id>`, under
+/// the parent's earliest unclaimed `spawn_agent` call made before the sub-agent's first message (spawn
+/// calls carry no child id, so they pair by order).
+pub(crate) mod sdk {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    /// The session folders at `path`: itself, or those in it, its `sessions` or its `db` folder.
+    pub fn sessions(path: &Path) -> Vec<PathBuf> {
+        let own = |d: &Path| d.file_name().and_then(|n| n.to_str()).is_some_and(|n| d.join(format!("{n}.messages.json")).is_file());
+        if own(path) {
+            return vec![path.to_owned()];
+        }
+        let mut out: Vec<PathBuf> = [path.to_owned(), path.join("sessions"), path.join("db")]
+            .iter()
+            .flat_map(|base| std::fs::read_dir(base).into_iter().flatten().flatten().map(|e| e.path()))
+            .filter(|p| own(p))
+            .collect();
+        out.sort();
+        out
+    }
+
+    struct Thread {
+        id: String,
+        parent: Option<String>,
+        msgs: Vec<Value>,
+    }
+
+    /// The session's events if any of its messages files changed after `since_ms`, with that change; None
+    /// when unchanged, or when a file is caught mid-rewrite (the next poll reads the session whole).
+    pub fn read_session(dir: &Path, since_ms: i64, harness: &'static str) -> Option<(Vec<CanonicalEvent>, i64)> {
+        let root = dir.file_name()?.to_str()?.to_owned();
+        let files: Vec<PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.to_str().is_some_and(|s| s.ends_with(".messages.json"))).collect();
+        let changed = files.iter().filter_map(|f| mtime_ms(f)).max()?;
+        if changed <= since_ms {
+            return None;
+        }
+        let mut threads = Vec::new();
+        for f in &files {
+            let v = read_json(f)?;
+            let id = v["sessionId"].as_str().unwrap_or(&root).to_owned();
+            let parent = v["origin"]["parentThreadId"].as_str().filter(|_| id != root).map(str::to_owned);
+            threads.push(Thread { id, parent, msgs: v["messages"].as_array().cloned().unwrap_or_default() });
+        }
+        threads.sort_by_key(|t| (t.parent.is_some(), first_ts(t), t.id.clone()));
+        let spawned_by = spawn_calls(&threads);
+        let manifest = read_json(&dir.join(format!("{root}.json"))).unwrap_or_default();
+        let mut events = Vec::new();
+        for t in &threads {
+            events.extend(thread_events(t, &root, spawned_by.get(&t.id), &manifest, harness));
+        }
+        Some((events, changed))
+    }
+
+    fn first_ts(t: &Thread) -> Option<Ns> {
+        t.msgs.iter().find_map(ts)
+    }
+
+    /// Pairs each sub-agent with the spawn call that started it.
+    fn spawn_calls(threads: &[Thread]) -> HashMap<String, SpanId> {
+        let mut calls: HashMap<&str, Vec<(Ns, String)>> = HashMap::new();
+        for t in threads {
+            for m in t.msgs.iter().filter(|m| m["role"] == "assistant") {
+                let Some(at) = ts(m) else { continue };
+                for b in blocks(m).filter(|b| b["type"] == "tool_use" && b["name"] == "spawn_agent") {
+                    calls.entry(&t.id).or_default().push((at, b["id"].as_str().unwrap_or_default().to_owned()));
+                }
+            }
+        }
+        let mut out = HashMap::new();
+        // Threads are sorted by first message, so sub-agents claim calls in the order they started.
+        for t in threads {
+            let (Some(parent), Some(start)) = (t.parent.as_deref(), first_ts(t)) else { continue };
+            let Some(free) = calls.get_mut(parent) else { continue };
+            if let Some(i) = free.iter().position(|(at, _)| *at <= start) {
+                let (_, call) = free.remove(i);
+                out.insert(t.id.clone(), span("tool", &format!("{parent}:{call}")));
+            }
+        }
+        out
+    }
+
+    fn blocks(m: &Value) -> impl Iterator<Item = &Value> {
+        m["content"].as_array().into_iter().flatten()
+    }
+
+    fn thread_events(t: &Thread, root: &str, spawned_by: Option<&SpanId>, manifest: &Value, harness: &'static str) -> Vec<CanonicalEvent> {
+        let Some(first) = first_ts(t) else { return Vec::new() };
+        // Each tool call's result: when it came back, and whether it failed.
+        let mut results: HashMap<&str, (Ns, bool)> = HashMap::new();
+        for m in t.msgs.iter().filter(|m| m["role"] == "user") {
+            let Some(at) = ts(m) else { continue };
+            for b in blocks(m).filter(|b| b["type"] == "tool_result") {
+                let failed = b["is_error"] == true || b["content"].as_array().into_iter().flatten().any(|c| c["success"] == false);
+                results.insert(b["tool_use_id"].as_str().unwrap_or_default(), (at, failed));
+            }
+        }
+        let sub = t.parent.is_some();
+        let top = if sub { span("subagent", &t.id) } else { span("agent", &t.id) };
+        let mut e = Emit { source: SourceId(format!("{harness}:{}", t.id)), session: SessionId(root.to_owned()), observed: system_now_ns(), seq: 0, out: Vec::new() };
+        if let Some(parent) = &t.parent {
+            let under = spawned_by.cloned().unwrap_or_else(|| if parent == root { span("agent", root) } else { span("subagent", parent) });
+            e.start(&top, first, Some(&under), SpanKind::Subagent, "subagent", |s| s.agent_name = Some("subagent".into()));
+        } else {
+            let cwd = manifest["cwd"].as_str().unwrap_or_default().to_owned();
+            let project = Path::new(&cwd).file_name().and_then(|n| n.to_str()).unwrap_or(&cwd).to_owned();
+            let body = EventBody::SessionStarted { project_id: project, working_directory: cwd, source_adapter: harness.into(), harness: harness.into(), host: String::new(), labels: Attributes::new() };
+            e.push(format!("session:{}", t.id), first, None, body);
+            e.start(&top, first, None, SpanKind::Agent, harness, |s| s.agent_name = Some("main".into()));
+        }
+        let (mut turn, mut turns, mut prev, mut sub_open) = (None::<SpanId>, 0, first, sub);
+        for m in &t.msgs {
+            let Some(at) = ts(m) else { continue };
+            let id = format!("{}:{}", t.id, m["id"].as_str().map_or_else(|| m["ts"].to_string(), str::to_owned));
+            let prompt = m["role"] == "user" && (m["content"].is_string() || blocks(m).any(|b| b["type"] != "tool_result"));
+            if prompt || (m["role"] == "assistant" && turn.is_none()) {
+                if let Some(old) = turn.take() {
+                    e.end(format!("end:{old}"), &old, prev, SpanStatus::Succeeded, None);
+                }
+                turns += 1;
+                let new = span("turn", &id);
+                e.start(&new, if prompt { at } else { prev }, Some(&top), SpanKind::Turn, &format!("turn {turns}"), |_| {});
+                turn = Some(new);
+            }
+            if m["role"] == "assistant" {
+                let parent = turn.clone().expect("started above");
+                let llm = span("llm", &id);
+                let (model, provider) = (m["modelInfo"]["id"].as_str(), m["modelInfo"]["provider"].as_str());
+                e.start(&llm, prev.min(at), Some(&parent), SpanKind::Llm, model.unwrap_or("llm call"), |s| {
+                    s.model = model.map(str::to_owned);
+                    s.provider = provider.map(str::to_owned);
+                });
+                let x = &m["metrics"];
+                let totals = json!({"tokensIn": x["inputTokens"], "tokensOut": x["outputTokens"], "cacheReads": x["cacheReadTokens"], "cacheWrites": x["cacheWriteTokens"]});
+                if let Some(usage) = usage(&totals, &x["cost"]) {
+                    e.push(format!("{llm}:usage"), at, Some(&llm), EventBody::UsageReported { usage, is_final: true });
+                }
+                e.end(format!("end:{llm}"), &llm, at, SpanStatus::Succeeded, None);
+                let mut called = false;
+                for b in blocks(m).filter(|b| b["type"] == "tool_use") {
+                    let (Some(call), Some(name)) = (b["id"].as_str(), b["name"].as_str()) else { continue };
+                    called = true;
+                    let tool = span("tool", &format!("{}:{call}", t.id));
+                    e.start(&tool, at, Some(&parent), SpanKind::Tool, name, |s| s.tool_name = Some(name.to_owned()));
+                    if let Some(&(end, failed)) = results.get(call) {
+                        let (status, error) = if failed { (SpanStatus::Failed, Some("tool reported failure (output not captured)")) } else { (SpanStatus::Succeeded, None) };
+                        e.end(format!("end:{tool}"), &tool, end.max(at), status, error);
+                    }
+                }
+                if !called {
+                    let done = turn.take().expect("started above");
+                    e.end(format!("end:{done}"), &done, at, SpanStatus::Succeeded, None);
+                    if sub_open {
+                        e.end(format!("end:{top}"), &top, at, SpanStatus::Succeeded, None);
+                        sub_open = false;
+                    }
+                }
+            }
+            prev = prev.max(at);
+        }
+        // A run that stopped mid-turn: the manifest's final status ends it.
+        let stopped = match manifest["status"].as_str() {
+            Some("failed") => Some(SpanStatus::Failed),
+            Some("cancelled") => Some(SpanStatus::Cancelled),
+            _ => None,
+        };
+        if let (Some(open), Some(status), false) = (turn, stopped, sub) {
+            e.end(format!("end:{open}"), &open, prev, status, None);
+        }
+        e.out
+    }
 }
 
 #[cfg(test)]
