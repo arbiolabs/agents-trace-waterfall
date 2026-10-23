@@ -19,7 +19,7 @@
 //!
 //! The wire never names the model: the model is `config.toml`'s default model, or the one a sub-agent's
 //! `meta.json` launched it with. The Kimi Code CLI (TypeScript) that replaced kimi-cli keeps a different
-//! format in `~/.kimi-code` and is not read here.
+//! format in `~/.kimi-code`, read by [`crate::kimi_code`].
 
 use anyhow::Context;
 use md5::{Digest, Md5};
@@ -299,20 +299,20 @@ impl Models {
     }
 }
 
-fn read_json(p: &Path) -> Value {
+pub(crate) fn read_json(p: &Path) -> Value {
     std::fs::read(p).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null)
 }
 
-fn name(p: &Path) -> String {
+pub(crate) fn name(p: &Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-fn mtime_ms(p: &Path) -> i64 {
+pub(crate) fn mtime_ms(p: &Path) -> i64 {
     std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis() as i64)
 }
 
 /// The subfolders of `dir`, sorted; nothing if it is missing.
-fn dirs(dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn dirs(dir: &Path) -> Vec<PathBuf> {
     let mut out: Vec<_> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
     out.sort();
     out
