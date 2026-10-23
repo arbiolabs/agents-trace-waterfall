@@ -123,8 +123,6 @@ fn main() -> anyhow::Result<()> {
             KeyBinding::new("cmd-r", Replay, None),
             KeyBinding::new("cmd-]", NextEvent, None),
             KeyBinding::new("cmd-[", PrevEvent, None),
-            KeyBinding::new("cmd-alt-]", NextActivity, None),
-            KeyBinding::new("cmd-alt-[", PrevActivity, None),
             KeyBinding::new("enter", Inspect, Some(ROWS_CONTEXT)),
             KeyBinding::new("n", AddNote, Some(ROWS_CONTEXT)),
             KeyBinding::new("cmd-c", CopySpanName, Some(ROWS_CONTEXT)),
@@ -156,9 +154,6 @@ fn main() -> anyhow::Result<()> {
                 MenuItem::separator(),
                 MenuItem::action("Next Event", NextEvent),
                 MenuItem::action("Previous Event", PrevEvent),
-                MenuItem::separator(),
-                MenuItem::action("Next Activity", NextActivity),
-                MenuItem::action("Previous Activity", PrevActivity),
             ]),
         ]);
         cx.on_window_closed(|cx, _| cx.quit()).detach();

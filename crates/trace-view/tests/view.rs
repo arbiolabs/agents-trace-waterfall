@@ -54,7 +54,7 @@ fn ids(state: &TraceState, rows: &[Row]) -> Vec<String> {
 
 #[test]
 fn bar_span_clips_and_marks() {
-    let vp = Viewport { start_ns: 100, ns_per_cell: 10.0 };
+    let vp = Viewport { start_ns: 100, ns_per_cell: 10.0, ..Default::default() };
     assert_eq!(bar_span(120, 155, &vp, 10), Some((2, 6)));
     assert_eq!(bar_span(50, 130, &vp, 10), Some((0, 3)), "clipped at left edge");
     assert_eq!(bar_span(180, 400, &vp, 10), Some((8, 10)), "clipped at right edge");
@@ -72,9 +72,9 @@ fn bar_span_clips_and_marks() {
 #[test]
 fn viewport_zoom_keeps_anchor_and_pans() {
     let mut vp = Viewport::fit(0, 1000, 10);
-    assert_eq!(vp, Viewport { start_ns: 0, ns_per_cell: 100.0 });
+    assert_eq!(vp, Viewport { start_ns: 0, ns_per_cell: 100.0, ..Default::default() });
     vp.zoom(0.5, 500);
-    assert_eq!(vp, Viewport { start_ns: 250, ns_per_cell: 50.0 });
+    assert_eq!(vp, Viewport { start_ns: 250, ns_per_cell: 50.0, ..Default::default() });
     assert_eq!(vp.col_of(500), 5.0);
     vp.pan(-2.0);
     assert_eq!((vp.start_ns, vp.end_ns(10)), (150, 650));
@@ -84,7 +84,7 @@ fn viewport_zoom_keeps_anchor_and_pans() {
 fn ticks_and_formatting() {
     let vp = Viewport::fit(0, 1000 * MS, 50);
     assert_eq!(ticks(&vp, 50, 0), [(0, "0s".to_string()), (10, "200ms".into()), (20, "400ms".into()), (30, "600ms".into()), (40, "800ms".into())]);
-    let vp = Viewport { start_ns: 30_000 * MS, ns_per_cell: 3e9 };
+    let vp = Viewport { start_ns: 30_000 * MS, ns_per_cell: 3e9, ..Default::default() };
     assert_eq!(ticks(&vp, 40, 0), [(0, "30s".to_string()), (10, "1m".into()), (20, "1m30s".into()), (30, "2m".into())]);
     assert_eq!(
         [0, 850, 12_500, 250 * MS, 1500 * MS, 120_000 * MS, 3_900_000 * MS, -250 * MS].map(format_duration),
@@ -127,7 +127,7 @@ fn filter_keeps_ancestors_even_when_collapsed() {
 #[test]
 fn extreme_timestamps_saturate_instead_of_overflowing() {
     assert_eq!([i64::MIN, i64::MAX, i64::MIN + 1].map(format_duration), ["-2562047h47m", "2562047h47m", "-2562047h47m"]);
-    assert_eq!(Viewport::fit(i64::MIN, i64::MAX, 10), Viewport { start_ns: i64::MIN, ns_per_cell: i64::MAX as f64 / 10.0 });
+    assert_eq!(Viewport::fit(i64::MIN, i64::MAX, 10), Viewport { start_ns: i64::MIN, ns_per_cell: i64::MAX as f64 / 10.0, ..Default::default() });
 }
 
 #[test]
@@ -150,7 +150,7 @@ fn flattens_a_hundred_thousand_deep_chain() {
 #[test]
 fn fine_ticks_deep_into_a_session_stay_distinct() {
     let seven_hours: Ns = 7 * 3600 * 1_000_000_000 + 4 * 60 * 1_000_000_000;
-    let vp = Viewport { start_ns: seven_hours, ns_per_cell: 100_000_000.0 };
+    let vp = Viewport { start_ns: seven_hours, ns_per_cell: 100_000_000.0, ..Default::default() };
     let labels: Vec<String> = ticks(&vp, 50, 0).into_iter().map(|(_, l)| l).collect();
     assert_eq!(labels, ["7h4m", "+1s", "+2s", "+3s", "+4s"]);
 }
@@ -172,7 +172,7 @@ fn resolves_unique_session_prefixes() {
 
 #[test]
 fn tick_times_respect_a_pixel_gap() {
-    let vp = Viewport { start_ns: 0, ns_per_cell: 100.0 * MS as f64 };
+    let vp = Viewport { start_ns: 0, ns_per_cell: 100.0 * MS as f64, ..Default::default() };
     let t = tick_times(&vp, 450.0, 0, 80.0);
     assert_eq!(t, vec![(0, "0s".to_string()), (10_000 * MS, "10s".into()), (20_000 * MS, "20s".into()), (30_000 * MS, "30s".into()), (40_000 * MS, "40s".into())]);
 }
@@ -203,4 +203,56 @@ fn total_cost_marks_estimates_and_lower_bounds() {
     assert_eq!(format_total_cost(&t(1_000_000, 200_000, 0, 2)), "~$1.20", "part estimated from list prices");
     assert_eq!(format_total_cost(&t(0, 1_200_000, 1, 2)), "≥ $1.20", "a call of unknown cost makes it a lower bound");
     assert_eq!(format_total_cost(&t(0, 0, 1, 1)), "—");
+}
+
+#[test]
+fn folds_take_idle_time_out_of_the_timeline() {
+    const H: Ns = 3_600_000 * MS;
+    let f = Folds::new(&[(H, 10 * H), (12 * H, 20 * H)]);
+    assert_eq!((f.fold(H / 2), f.fold(5 * H), f.fold(11 * H), f.fold(21 * H)), (H / 2, H, 2 * H, 4 * H), "inside a stretch folds onto its start");
+    for t in [0, H / 2, 10 * H + 1, 11 * H, 21 * H] {
+        assert_eq!(f.unfold(f.fold(t)), t, "unfold inverts fold outside stretches");
+    }
+    assert_eq!(f.unfold(H), H, "a fold point unfolds to where the waiting began");
+    assert_eq!(f.inside(5 * H), Some((H, 10 * H)));
+
+    // An hour of work, nine idle hours, an hour of work: fits as two hours.
+    let vp = Viewport::fit_folded(0, 11 * H, 100, Folds::new(&[(H, 10 * H)]));
+    assert_eq!((vp.col_of(H), vp.col_of(10 * H), vp.col_of(11 * H)), (50.0, 50.0, 100.0), "the idle stretch takes no width");
+    assert_eq!(vp.end_ns(100), 11 * H);
+    let mut zoomed = vp;
+    zoomed.zoom(0.5, 10 * H);
+    assert_eq!(zoomed.col_of(10 * H), 50.0, "zoom keeps its anchor across a fold");
+    let mut panned = vp;
+    panned.pan(50.0);
+    assert_eq!(panned.start_ns, H, "panning lands on the fold, where the waiting began");
+    let labels: Vec<String> = tick_times(&vp, 100.0, 0, 20.0).into_iter().map(|(_, l)| l).collect();
+    assert!(labels.contains(&"10h".to_owned()) || labels.contains(&"10h30m".to_owned()), "labels read real time after the fold: {labels:?}");
+}
+
+#[test]
+fn replay_jumps_across_idle_time() {
+    const H: Ns = 3_600_000 * MS;
+    let events = vec![
+        ev(1, 0, None, json!({"event_type": "session.started", "body": {"project_id": "p"}})),
+        start(2, 0, "root", None, "agent"),
+        start(3, 0, "a", Some("root"), "tool"),
+        end(4, H / 2, "a", "succeeded"),
+        start(5, 10 * H, "b", Some("root"), "tool"),
+        end(6, 10 * H + H / 2, "b", "succeeded"),
+        end(7, 10 * H + H / 2, "root", "succeeded"),
+    ];
+    let state = TraceState::from_events("s1".into(), &events);
+    let mut doc = TraceDoc::new(state.clone(), Mode::Static, 0);
+    assert_eq!(doc.folds.gaps(), [(H / 2, 10 * H)]);
+    let mut replay = TraceDoc::new(TraceState::from_events("s1".into(), &events[..2]), Mode::Replay { replay: Replay::new("s1".into(), events.clone()), clock: ReplayClock::new(H / 2 - MS) }, 0);
+    assert_eq!(replay.folds.gaps(), [(H / 2, 10 * H)], "replay folds the whole recording's idle time from the start");
+    let Mode::Replay { clock, .. } = &mut replay.mode else { unreachable!() };
+    clock.playing = true;
+    let store = trace_storage::Store::open_in_memory().unwrap();
+    replay.advance(&store, std::time::Duration::from_millis(10)).unwrap();
+    let Mode::Replay { clock, .. } = &replay.mode else { unreachable!() };
+    assert_eq!(clock.position, 10 * H, "playback skips nine idle hours instead of waiting through them");
+    doc.layout(100);
+    assert_eq!(doc.viewport.unwrap().folds, doc.folds);
 }

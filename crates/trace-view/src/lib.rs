@@ -6,7 +6,7 @@ mod doc;
 mod idle;
 mod names;
 
-pub use idle::{IDLE_GAP_MIN, MAX_GAPS, idle_gaps, skip_idle};
+pub use idle::{Folds, IDLE_GAP_MIN, MAX_GAPS, compact_duration, folds_for, idle_gaps};
 pub use names::{detail, harness_label, harness_name, kind_label, mcp_parts, pretty_model, title, top_model};
 pub use doc::{EXPAND_ALL_LIMIT, Mode, TraceDoc, export_span, matcher, resolve_session, wall_ns, write_private};
 use std::collections::HashSet;
@@ -100,37 +100,53 @@ fn visit(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// The visible time window. Times in and out are real; columns are measured in folded time, so idle
+/// stretches in `folds` take no width.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Viewport {
+    /// Real time at the left edge.
     pub start_ns: Ns,
+    /// Folded nanoseconds per cell.
     pub ns_per_cell: f64,
+    pub folds: Folds,
 }
 
 impl Viewport {
     const MIN_NS_PER_CELL: f64 = 1e-3;
 
     pub fn fit(start: Ns, end: Ns, width: u16) -> Self {
-        Self { start_ns: start, ns_per_cell: end.saturating_sub(start).max(1) as f64 / f64::from(width.max(1)) }
+        Self::fit_folded(start, end, width, Folds::default())
+    }
+
+    /// `start..end` across `width` cells, with `folds` taken out.
+    pub fn fit_folded(start: Ns, end: Ns, width: u16, folds: Folds) -> Self {
+        let span = folds.fold(end).saturating_sub(folds.fold(start));
+        Self { start_ns: start, ns_per_cell: span.max(1) as f64 / f64::from(width.max(1)), folds }
     }
 
     /// `factor` < 1 zooms in. `anchor_ns` stays at the same column.
     pub fn zoom(&mut self, factor: f64, anchor_ns: Ns) {
         let npc = (self.ns_per_cell * factor).max(Self::MIN_NS_PER_CELL);
-        let real = npc / self.ns_per_cell;
-        self.start_ns = anchor_ns - ((anchor_ns - self.start_ns) as f64 * real).round() as Ns;
+        let (a, s) = (self.folds.fold(anchor_ns), self.folds.fold(self.start_ns));
+        self.start_ns = self.folds.unfold(a - ((a - s) as f64 * npc / self.ns_per_cell).round() as Ns);
         self.ns_per_cell = npc;
     }
 
     pub fn pan(&mut self, cells: f64) {
-        self.start_ns += (cells * self.ns_per_cell).round() as Ns;
+        self.start_ns = self.folds.unfold(self.folds.fold(self.start_ns) + (cells * self.ns_per_cell).round() as Ns);
+    }
+
+    /// Moves the window so `t` sits at column `col`.
+    pub fn place(&mut self, t: Ns, col: f64) {
+        self.start_ns = self.folds.unfold(self.folds.fold(t).saturating_sub((col * self.ns_per_cell) as Ns));
     }
 
     pub fn end_ns(&self, width: u16) -> Ns {
-        self.start_ns.saturating_add((f64::from(width) * self.ns_per_cell).round() as Ns)
+        self.folds.unfold(self.folds.fold(self.start_ns).saturating_add((f64::from(width) * self.ns_per_cell).round() as Ns))
     }
 
     pub fn col_of(&self, t: Ns) -> f64 {
-        t.saturating_sub(self.start_ns) as f64 / self.ns_per_cell
+        self.folds.fold(t).saturating_sub(self.folds.fold(self.start_ns)) as f64 / self.ns_per_cell
     }
 }
 
@@ -162,9 +178,11 @@ pub fn ticks(vp: &Viewport, width: u16, origin_ns: Ns) -> Vec<(u16, String)> {
 pub fn tick_times(vp: &Viewport, width: f64, origin_ns: Ns, min_gap: f64) -> Vec<(Ns, String)> {
     let nice = (0..10).flat_map(|k| [1, 2, 5].map(|m| m * 10i64.pow(k))).chain(TICK_STEPS_S.map(|s| s * 1_000_000_000));
     let Some(step) = nice.into_iter().find(|&s| s as f64 / vp.ns_per_cell >= min_gap) else { return Vec::new() };
-    let mut k = vp.start_ns.saturating_sub(origin_ns).div_euclid(step);
+    // Ticks fall evenly in folded time; their labels read real time, so they jump across a fold.
+    let (f, fo) = (vp.folds, vp.folds.fold(origin_ns));
+    let mut k = f.fold(vp.start_ns).saturating_sub(fo).div_euclid(step);
     let mut times = Vec::new();
-    while let Some(t) = k.checked_mul(step).and_then(|o| origin_ns.checked_add(o)) {
+    while let Some(t) = k.checked_mul(step).and_then(|o| fo.checked_add(o)).map(|ft| f.unfold(ft)) {
         let col = vp.col_of(t).floor();
         if col >= width {
             break;

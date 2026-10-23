@@ -172,7 +172,7 @@ fn rows_show_model_detail_note_mark_and_idle_stretches() {
     let widget = WaterfallWidget { state: &s, rows: &rows, now: 1000 * MS, viewport: Viewport::fit(0, 1000 * MS, 50), origin_ns: 0, theme: &Theme::default(), tree_width: 30, focused: true, notes: Some(&notes), idle: &[(100 * MS, 900 * MS)] };
     widget.render(area, &mut buf, &mut WaterfallState::default());
     let l = lines(&buf);
-    assert!(l[0].contains(" 800ms idle "), "{l:?}");
+    assert!(l[0].contains("┊800ms"), "the fold reads its wait: {l:?}");
     assert!(l[1].starts_with("▾◆✓ Claude Code Opus 5.5"), "{l:?}");
     assert!(l[2].starts_with("   ●✓ LLM call ✎ Opus"), "{l:?}");
 }

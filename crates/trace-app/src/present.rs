@@ -4,7 +4,9 @@ use gpui_kit::assets::IconName;
 use gpui_kit::{Hsla, rgb};
 use trace_core::{Ns, SessionStatus, Span, SpanKind, SpanStatus, Totals, TraceState};
 use trace_storage::SessionSummary;
-pub use trace_view::{MAX_GAPS, detail, harness_label, harness_name, idle_gaps, kind_label, mcp_parts, pretty_model, skip_idle, title, top_model};
+pub use trace_view::{MAX_GAPS, compact_duration, detail, harness_label, harness_name, kind_label, mcp_parts, pretty_model, title, top_model};
+#[cfg(test)]
+use trace_view::idle_gaps;
 use trace_view::{Row, format_cost, format_duration, format_tokens};
 
 /// Which palette column a span paints with.
@@ -523,16 +525,6 @@ impl Squeeze {
     }
 }
 
-
-/// `47h`, `3d`, `35m`: an idle band's label in the few points it has.
-pub fn compact_duration(ns: Ns) -> String {
-    let m = ns / 60_000_000_000;
-    match m {
-        m if m >= 48 * 60 => format!("{}d", m / (24 * 60)),
-        m if m >= 60 => format!("{}h", m / 60),
-        m => format!("{m}m"),
-    }
-}
 
 pub fn idle_gap(last: Ns, now: Ns) -> String {
     format!("+{} idle", format_duration(now - last))
@@ -1410,10 +1402,6 @@ mod tests {
         }
         assert_eq!(Squeeze::new(span, 400., &[]).x(span.1 / 2), 200., "no idle stretches: linear");
         assert_eq!((sq.x(-H), sq.x(50 * H)), (0., 400.), "times past the ends pin to the strip's edges");
-        let len = H;
-        assert_eq!(skip_idle(&gaps, 0, len, true), Some(10 * H - len / 20), "forward lands just before the next burst");
-        assert_eq!(skip_idle(&gaps, 10 * H - len / 20, len, true), None, "nothing idle after the last burst");
-        assert_eq!(skip_idle(&gaps, 10 * H - len / 20, len, false), Some(H / 2 + len / 20 - len), "back puts the previous burst's end near the right edge");
         assert_eq!((compact_duration(9 * H + 30 * 60_000 * MS), compact_duration(72 * H), compact_duration(35 * 60_000 * MS)), ("9h".into(), "3d".into(), "35m".into()));
     }
 

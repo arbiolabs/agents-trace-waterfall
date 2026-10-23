@@ -1,4 +1,4 @@
-//! Idle stretches: where nothing ran in a long session, and how to jump across them.
+//! Idle stretches: where nothing ran in a long session, folded out of the timeline.
 
 use trace_core::{Ns, TraceState};
 
@@ -31,13 +31,72 @@ pub fn idle_gaps(state: &TraceState, (a, b): (Ns, Ns), session_end: Option<Ns>, 
     gaps
 }
 
-/// Where Next or Previous Activity moves a window of `len` that starts at `start`: just before the end of
-/// the next idle stretch, or so the previous one's start sits near the right edge.
-pub fn skip_idle(gaps: &[(Ns, Ns)], start: Ns, len: Ns, forward: bool) -> Option<Ns> {
-    let pad = len / 20;
-    if forward {
-        gaps.iter().find(|g| g.1 > start + pad).map(|g| g.1 - pad)
-    } else {
-        gaps.iter().rev().find(|g| g.1 <= start + pad && g.0 + pad - len < start).map(|g| g.0 + pad - len)
+
+/// Idle stretches taken out of the timeline: folded time is real time less every stretch before it, so
+/// the waterfall spends no width on waiting. Copy, so a `Viewport` can carry it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Folds {
+    gaps: [(Ns, Ns); MAX_GAPS],
+    n: usize,
+}
+
+impl Folds {
+    /// `gaps` in time order, as [`idle_gaps`] returns them; past [`MAX_GAPS`] the rest stay unfolded.
+    pub fn new(gaps: &[(Ns, Ns)]) -> Self {
+        let n = gaps.len().min(MAX_GAPS);
+        let mut arr = [(0, 0); MAX_GAPS];
+        arr[..n].copy_from_slice(&gaps[..n]);
+        Self { gaps: arr, n }
+    }
+
+    pub fn gaps(&self) -> &[(Ns, Ns)] {
+        &self.gaps[..self.n]
+    }
+
+    /// `t` with the idle time before it removed; a time inside a stretch folds onto its start.
+    pub fn fold(&self, t: Ns) -> Ns {
+        let mut cut: Ns = 0;
+        for &(a, b) in self.gaps() {
+            if t <= a {
+                break;
+            }
+            cut = cut.saturating_add(t.min(b) - a);
+        }
+        t.saturating_sub(cut)
+    }
+
+    /// The earliest real time that folds to `f`: a stretch's fold point unfolds to where the waiting began.
+    pub fn unfold(&self, f: Ns) -> Ns {
+        let mut t = f;
+        for &(a, b) in self.gaps() {
+            if t <= a {
+                break;
+            }
+            t = t.saturating_add(b - a);
+        }
+        t
+    }
+
+    /// The stretch that `t` falls strictly inside.
+    pub fn inside(&self, t: Ns) -> Option<(Ns, Ns)> {
+        self.gaps().iter().copied().find(|&(a, b)| a < t && t < b)
+    }
+}
+
+/// The idle stretches a session's timeline folds: between activity, never after the last of it, so a live
+/// session still shows time passing since its last event.
+pub fn folds_for(state: &TraceState, now: Ns) -> Folds {
+    let (Some(start), Some(last)) = (state.axis_start(), state.last_occurred_at_utc_ns) else { return Folds::default() };
+    Folds::new(&idle_gaps(state, (start, last), state.session.ended_at_utc_ns, now))
+}
+
+/// `47h`, `3d`, `35m`: an idle stretch's length in the few characters a fold mark has.
+pub fn compact_duration(ns: Ns) -> String {
+    let m = ns / 60_000_000_000;
+    match m {
+        m if m >= 48 * 60 => format!("{}d", m / (24 * 60)),
+        m if m >= 60 => format!("{}h", m / 60),
+        0 => crate::format_duration(ns),
+        m => format!("{m}m"),
     }
 }

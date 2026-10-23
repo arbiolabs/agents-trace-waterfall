@@ -1,4 +1,4 @@
-use crate::{Row, RowKind, Viewport, flatten, format_duration};
+use crate::{Folds, Row, RowKind, Viewport, flatten, folds_for, format_duration};
 use anyhow::Context;
 use std::collections::HashSet;
 use std::io::Write;
@@ -36,6 +36,8 @@ pub struct TraceDoc {
     /// Timeline width in the frontend's cell unit.
     pub timeline_width: u16,
     pub now: Ns,
+    /// Idle stretches folded out of the timeline: from the whole recording in replay, else from the state.
+    pub folds: Folds,
 }
 
 impl TraceDoc {
@@ -52,8 +54,13 @@ impl TraceDoc {
             viewport: None,
             timeline_width: 0,
             now: 0,
+            folds: Folds::default(),
         };
         d.refresh();
+        d.folds = match &d.mode {
+            Mode::Replay { replay, .. } => replay.end().map_or_else(Folds::default, |end| folds_for(&replay.state_at(end), end)),
+            _ => folds_for(&d.state, d.now),
+        };
         d
     }
 
@@ -135,6 +142,10 @@ impl TraceDoc {
             Mode::Replay { replay, clock } if clock.playing => {
                 let before = clock.position;
                 clock.tick(dt.as_nanos() as Ns, replay.end().unwrap_or(before));
+                // Playback never waits through idle time: it jumps to where activity resumes.
+                if let Some((_, resume)) = self.folds.inside(clock.position) {
+                    clock.position = resume;
+                }
                 if replay.index_at(before) != replay.index_at(clock.position) {
                     self.state = replay.state_at(clock.position);
                     self.refresh();
@@ -153,8 +164,9 @@ impl TraceDoc {
         if width > 0 {
             self.timeline_width = width;
             let mut vp = self.viewport.unwrap_or_else(|| self.fit(width));
+            vp.folds = self.folds;
             if let Mode::Live { following: true, .. } = self.mode {
-                vp.start_ns = self.now.saturating_sub((f64::from(width) * vp.ns_per_cell * 0.95) as Ns);
+                vp.place(self.now, f64::from(width) * 0.95);
             }
             self.viewport = Some(vp);
         }
@@ -167,7 +179,12 @@ impl TraceDoc {
             Mode::Replay { replay, .. } => (replay.start().unwrap_or(0), replay.end().unwrap_or(0)),
             _ => (self.state.axis_start().unwrap_or(self.now), self.now),
         };
-        Viewport::fit(start, end, width)
+        self.window(start, end, width)
+    }
+
+    /// A viewport showing `start..end` across `width` cells, idle stretches folded.
+    pub fn window(&self, start: Ns, end: Ns, width: u16) -> Viewport {
+        Viewport::fit_folded(start, end, width, self.folds)
     }
 
     pub fn apply_all(&mut self, events: impl IntoIterator<Item = CanonicalEvent>) {
@@ -177,6 +194,7 @@ impl TraceDoc {
         if matches!(self.mode, Mode::Live { .. }) && self.state.session.status != SessionStatus::Live {
             self.mode = Mode::Static;
         }
+        self.folds = folds_for(&self.state, self.now);
         self.refresh();
     }
 

@@ -67,7 +67,7 @@ fn hints(app: &App) -> String {
                     "Space play · [ ] step · < > speed · H/L seek · Enter inspect · r exit replay · ? help"
                 }
                 (_, Mode::Static) => {
-                    "j/k h/l · Enter inspect · +/- H/L · { } skip idle · E fold all · n note · r replay · ? help"
+                    "j/k h/l · Enter inspect · +/- H/L · / search · E fold all · n note · r replay · ? help"
                 }
             };
             format!("{} │ {keys}", v.doc.status())
@@ -250,8 +250,8 @@ fn draw_waterfall(v: &mut View, theme: &Theme, buf: &mut Buffer, area: Rect, tre
     let vp = v
         .doc
         .layout(area.width.saturating_sub(tree_width.saturating_add(1)));
-    let idle = v.idle_gaps();
     let d = &v.doc;
+    let idle = d.folds.gaps().to_vec();
     let mut wf = WaterfallState {
         offset: v.scroll,
         selected: d.selected_row,
@@ -524,7 +524,8 @@ Waterfall
   g/G          first/last span
   e            toggle expansion of all descendants (up to 5000 spans)
   E            collapse every branch / expand everything
-  { }          previous/next activity: jump across an idle stretch, keeping the zoom
+               idle stretches are folded out of the timeline; ┊ and their length mark each fold,
+               and replay jumps across them
   n            add or edit the selected span's note (empty removes it)
   Enter        open inspector        Tab   cycle focus tree / timeline / inspector
   Esc          clear search, close inspector, back to sessions

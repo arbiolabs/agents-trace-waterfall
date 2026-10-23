@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::StatefulWidget;
 use std::collections::BTreeMap;
 use trace_core::{Ns, SpanId, SpanKind, SpanStatus, TraceState};
-use trace_view::{Row, RowKind, Viewport, bar_span, detail, format_cost, format_duration, ticks, title};
+use trace_view::{Row, RowKind, Viewport, bar_span, compact_duration, detail, format_cost, format_duration, ticks, title};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Glyphs {
@@ -107,7 +107,7 @@ pub struct WaterfallWidget<'a> {
     pub focused: bool,
     /// The user's span notes; a noted row carries a mark after its title.
     pub notes: Option<&'a BTreeMap<SpanId, String>>,
-    /// Idle stretches, marked on the tick line where they fall in view.
+    /// Idle stretches the viewport folds out, marked where they fall in view.
     pub idle: &'a [(Ns, Ns)],
 }
 
@@ -135,23 +135,33 @@ impl StatefulWidget for WaterfallWidget<'_> {
         let now_style = th.fg(NOW);
         let sep = th.pick('│', '|');
 
-        let mut label_end = tl_x;
-        for (x, label) in ticks(&self.viewport, tl_w, self.origin_ns) {
-            let x = tl_x + x;
-            if x >= label_end {
-                label_end = buf.set_stringn(x, area.y, &label, usize::from(area.right() - x), Style::new().add_modifier(Modifier::DIM)).0 + 1;
+        // Folds first: a dotted line down the timeline and the wait on the tick line, `┊17h`. Folds closer
+        // than a label merge, their waits added; tick labels take only what the folds leave free.
+        let mut folds: Vec<(u16, Ns)> = Vec::new();
+        for &(a, b) in self.idle {
+            let col = self.viewport.col_of(a);
+            if !(0.0..f64::from(tl_w)).contains(&col) {
+                continue;
+            }
+            let x = tl_x + col as u16;
+            match folds.last_mut() {
+                Some((last, total)) if x < *last + 6 => *total += b - a,
+                _ => folds.push((x, b - a)),
             }
         }
         let dim = Style::new().add_modifier(Modifier::DIM);
-        for &(g0, g1) in self.idle {
-            let Some((sx, ex)) = bar_span(g0, g1, &self.viewport, tl_w).filter(|(sx, ex)| ex - sx >= 3) else { continue };
-            for x in sx..ex {
-                buf[(tl_x + x, area.y)].set_char(th.pick('░', '.')).set_style(dim);
-            }
-            let label = format!(" {} idle ", format_duration(g1 - g0));
-            let lw = label.chars().count() as u16;
-            if lw <= ex - sx {
-                buf.set_string(tl_x + sx + (ex - sx - lw) / 2, area.y, &label, dim);
+        let mut taken: Vec<(u16, u16)> = Vec::new();
+        for &(x, idle) in &folds {
+            let label = format!("{}{}", th.pick('┊', ':'), compact_duration(idle));
+            let end = buf.set_stringn(x, area.y, &label, usize::from(area.right() - x), th.fg(NOW).add_modifier(Modifier::DIM)).0;
+            taken.push((x, end));
+        }
+        let mut label_end = tl_x;
+        for (x, label) in ticks(&self.viewport, tl_w, self.origin_ns) {
+            let x = tl_x + x;
+            let end = x + label.chars().count() as u16;
+            if x >= label_end && taken.iter().all(|&(a, b)| end < a || x > b) {
+                label_end = buf.set_stringn(x, area.y, &label, usize::from(area.right() - x), dim).0 + 1;
             }
         }
 
@@ -227,6 +237,11 @@ impl StatefulWidget for WaterfallWidget<'_> {
                 for x in sx..ex {
                     let ch = if failed && x + 1 == ex { 'x' } else { fill };
                     buf[(tl_x + x, y)].set_char(ch).set_style(glyph_style);
+                }
+            }
+            for &(x, _) in &folds {
+                if buf[(x, y)].symbol() == " " {
+                    buf[(x, y)].set_char(th.pick('┊', ':')).set_style(dim);
                 }
             }
             self.highlight(buf, area, y, st.offset + i == st.selected);

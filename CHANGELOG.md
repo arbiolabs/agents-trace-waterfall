@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Idle time is folded out of the timeline in both frontends: an idle stretch takes no width and shows as
+  a break with its length (`17h`, `2d`), so a long session's work fills the view. Replay jumps across
+  idle time instead of playing through it.
+
+### Removed
+
+- The idle bands with their Skip button, and Go → Next / Previous Activity (`{` `}` in the TUI): folding
+  makes them unnecessary. The overview's idle bands still jump past an idle stretch when clicked.
+
 ## [1.1.0] - 2026-10-23
 
 Codex, pi and OpenCode join Claude Code, every harness's sub-agents nest inside the parent's trace, and

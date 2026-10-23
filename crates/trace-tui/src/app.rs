@@ -4,10 +4,10 @@ use ratatui::widgets::TableState;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
-use trace_core::{Ns, SessionId, SessionStatus, SpanId};
+use trace_core::{SessionId, SessionStatus, SpanId};
 use trace_render::Theme;
 use trace_storage::{SessionFilter, SessionSummary, Store};
-use trace_view::{Mode, TraceDoc, Viewport, export_span, idle_gaps, skip_idle};
+use trace_view::{Mode, TraceDoc, export_span};
 const LIVE_TICK: Duration = Duration::from_millis(66);
 const SESSIONS_REFRESH: Duration = Duration::from_secs(1);
 const STATUS_FILTERS: [Option<SessionStatus>; 5] = [
@@ -87,28 +87,6 @@ impl View {
         }
     }
 
-    /// Where nothing ran. Replay projects only the past, so it has none.
-    // ponytail: recomputed each frame; cache by span count if 10k-span sessions ever lag.
-    pub fn idle_gaps(&self) -> Vec<(Ns, Ns)> {
-        let d = &self.doc;
-        if matches!(d.mode, Mode::Replay { .. }) {
-            return Vec::new();
-        }
-        let end = d.state.session.ended_at_utc_ns;
-        idle_gaps(&d.state, (d.state.axis_start().unwrap_or(d.now), end.unwrap_or(d.now)), end, d.now)
-    }
-
-    /// Jumps the timeline across the nearest idle stretch, keeping the zoom.
-    fn skip_idle(&mut self, forward: bool) {
-        let gaps = self.idle_gaps();
-        let (Some(vp), w) = (self.doc.viewport, self.doc.timeline_width) else { return };
-        if let Some(start_ns) = skip_idle(&gaps, vp.start_ns, vp.end_ns(w) - vp.start_ns, forward) {
-            self.doc.viewport = Some(Viewport { start_ns, ..vp });
-            if let Mode::Live { following, .. } = &mut self.doc.mode {
-                *following = false;
-            }
-        }
-    }
 }
 
 pub struct App {
@@ -433,16 +411,12 @@ impl App {
     /// Keys that work in every waterfall focus.
     fn common_key(&mut self, code: KeyCode) {
         let Some(view) = &mut self.view else { return };
-        match code {
-            KeyCode::Char('n') => {
-                if let Some(id) = &view.doc.selected {
-                    self.prompt = Some(view.notes.get(id).cloned().unwrap_or_default());
-                    self.note_prompt = true;
-                }
-                return;
+        if code == KeyCode::Char('n') {
+            if let Some(id) = &view.doc.selected {
+                self.prompt = Some(view.notes.get(id).cloned().unwrap_or_default());
+                self.note_prompt = true;
             }
-            KeyCode::Char('{' | '}') => return view.skip_idle(code == KeyCode::Char('}')),
-            _ => {}
+            return;
         }
         let v = &mut view.doc;
         match (code, &mut v.mode) {
