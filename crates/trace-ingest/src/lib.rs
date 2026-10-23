@@ -1,7 +1,11 @@
 //! Collector daemon, Unix socket protocol server, normalization and adapters.
 
 mod claude_code;
+mod codex;
 mod collector;
+mod emit;
+mod opencode;
+mod pi;
 
 pub use collector::run_collector_until;
 
@@ -161,16 +165,25 @@ fn hello(socket_path: &Path) -> anyhow::Result<String> {
     ))
 }
 
-/// "canonical" (pass-through JSONL) and "claude-code".
+/// "canonical" (pass-through JSONL), "claude-code", "codex", "pi" and "opencode". OpenCode keeps sessions in
+/// SQLite, so its adapter reads the lines [`opencode::read_db`] makes from the database.
 pub fn adapter_by_name(name: &str) -> Option<Box<dyn TraceAdapter>> {
     match name {
         "canonical" => Some(Box::new(Canonical)),
         "claude-code" => Some(Box::new(claude_code::ClaudeCode::default())),
+        "codex" => Some(Box::new(codex::Codex::default())),
+        "pi" => Some(Box::new(pi::Pi::default())),
+        "opencode" => Some(Box::new(opencode::OpenCode::default())),
         _ => None,
     }
 }
 
-pub const ADAPTERS: &[&str] = &["canonical", "claude-code"];
+pub const ADAPTERS: &[&str] = &["canonical", "claude-code", "codex", "pi", "opencode"];
+
+/// Adapters whose source is a database, not a JSONL file.
+fn reads_database(adapter: &str) -> bool {
+    adapter == "opencode"
+}
 
 /// Import a JSONL file through the named adapter into the store, applying the same capture policy as the collector.
 pub fn import_file(store: &mut Store, path: &Path, adapter: &str, capture: &Capture) -> anyhow::Result<AppendOutcome> {
@@ -180,6 +193,11 @@ pub fn import_file(store: &mut Store, path: &Path, adapter: &str, capture: &Capt
             ADAPTERS.join(", ")
         )
     })?;
+    if reads_database(adapter) {
+        let (mut events, _) = opencode::read_db(path, i64::MIN)?;
+        capture.strip(&mut HashMap::new(), &mut events);
+        return store.append(&events);
+    }
     let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut out = AppendOutcome::default();
     let mut batch = Vec::new();

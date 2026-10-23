@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use trace_core::{Ns, SLOWEST_DEFAULT_KINDS, SPEEDS, SessionId, SessionStatus, Span, SpanId, SpanKind, SpanStatus};
 use trace_storage::{SessionFilter, SessionSummary, Store};
-use trace_view::{Mode, Row, RowKind, TraceDoc, Viewport, format_cost, format_duration, format_tokens, tick_times};
+use trace_view::{Mode, Row, RowKind, TraceDoc, Viewport, format_cost, format_duration, format_tokens, format_total_cost, tick_times};
 
 const SIDEBAR_W: f32 = 260.;
 const HEADER_H: f32 = 56.;
@@ -1506,7 +1506,7 @@ impl TraceApp {
             n => Some(format!("{n} turns")),
         };
         let how = join(vec![present::harness_label(&s.harness, &s.source_adapter), s.model.as_deref().map(present::pretty_model), turns.clone()]);
-        let meta = join(vec![when, dur, s.totals.cost_usd_micros().map(|c| format_cost(Some(c)))]);
+        let meta = join(vec![when, dur, s.totals.cost_usd_micros().map(|_| format_total_cost(&s.totals))]);
         let status = present::session_status(s.status, s.last_event_at_utc_ns, trace_view::wall_ns());
         let id = s.session_id.clone();
         let menu_id = s.session_id.clone();
@@ -2503,10 +2503,7 @@ impl TraceApp {
         let doc = self.doc.as_ref().expect("stats need a document");
         let t = doc.state.totals();
         let count = |k: SpanKind| doc.state.spans.values().filter(|s| s.kind == k).count();
-        let cost = match (t.cost_usd_micros(), t.cost_unknown_records > 0) {
-            (Some(c), true) => format!("≥ {}", format_cost(Some(c))),
-            (c, _) => format_cost(c),
-        };
+        let cost = format_total_cost(&t);
         let idle = idle(doc);
         let until_now = idle.map(|_| format!("{} until now", format_duration(doc.state.wall_clock(doc.now))));
         let cells = [

@@ -195,3 +195,12 @@ fn fold_all_hides_every_branch_and_keeps_the_selection_in_view() {
     doc.refresh();
     assert!(doc.all_folded(), "a branch arriving under a folded parent stays out of sight, so the next toggle expands");
 }
+
+#[test]
+fn total_cost_marks_estimates_and_lower_bounds() {
+    let t = |actual, estimate, unknown, billable| Totals { cost_actual_usd_micros: actual, cost_estimate_usd_micros: estimate, cost_unknown_records: unknown, billable_records: billable, ..Default::default() };
+    assert_eq!(format_total_cost(&t(1_200_000, 0, 0, 1)), "$1.20");
+    assert_eq!(format_total_cost(&t(1_000_000, 200_000, 0, 2)), "~$1.20", "part estimated from list prices");
+    assert_eq!(format_total_cost(&t(0, 1_200_000, 1, 2)), "≥ $1.20", "a call of unknown cost makes it a lower bound");
+    assert_eq!(format_total_cost(&t(0, 0, 1, 1)), "—");
+}

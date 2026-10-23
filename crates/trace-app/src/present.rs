@@ -918,7 +918,7 @@ pub fn popover_stats(state: &TraceState, s: &Span, rollup: &Totals, end: Option<
     let mut out = vec![
         ("Duration", format_duration(s.elapsed(end, now).ns)),
         ("Started", format!("+{}", format_duration(s.started_at_utc_ns - origin))),
-        ("Cost", format_cost(rollup.cost_usd_micros())),
+        ("Cost", trace_view::format_total_cost(rollup)),
     ];
     if rollup.billable_records > 0 && rollup.tokens_input + rollup.tokens_output > 0 {
         out.push(("Tokens in", format_tokens(rollup.tokens_input)));

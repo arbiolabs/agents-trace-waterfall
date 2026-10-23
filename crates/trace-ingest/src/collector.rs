@@ -317,20 +317,21 @@ fn tail_loop(
     let mut files = HashMap::new();
     while !stop.load(Ordering::Relaxed) {
         for (adapter, root) in roots {
+            if crate::reads_database(adapter) {
+                match tail_database(root, &mut offsets, tx) {
+                    Ok(false) => {}
+                    Ok(true) => save_offsets(offsets_path, &offsets),
+                    Err(e) => eprintln!("collector: reading {}: {e:#}", root.display()),
+                }
+                continue;
+            }
             for path in jsonl_files(root) {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
                 match tail_file(&path, adapter, &mut files, &mut offsets, tx) {
                     Ok(false) => {}
-                    Ok(true) => {
-                        if let Err(e) = write_private(
-                            offsets_path,
-                            &serde_json::to_vec(&offsets).expect("map of paths serializes"),
-                        ) {
-                            eprintln!("collector: saving {}: {e}", offsets_path.display());
-                        }
-                    }
+                    Ok(true) => save_offsets(offsets_path, &offsets),
                     Err(e) => {
                         eprintln!("collector: tailing {}: {e:#}", path.display());
                         files.remove(&path);
@@ -340,6 +341,39 @@ fn tail_loop(
         }
         std::thread::sleep(TAIL_POLL);
     }
+}
+
+fn save_offsets(path: &Path, offsets: &BTreeMap<PathBuf, u64>) {
+    if let Err(e) = write_private(path, &serde_json::to_vec(offsets).expect("map of paths serializes")) {
+        eprintln!("collector: saving {}: {e}", path.display());
+    }
+}
+
+/// Appends the events of every OpenCode session changed since the last poll. The offset is the newest
+/// change seen, in epoch milliseconds. True if it moved.
+fn tail_database(db: &Path, offsets: &mut BTreeMap<PathBuf, u64>, tx: &mpsc::Sender<Cmd>) -> anyhow::Result<bool> {
+    let since = offsets.get(db).map_or(i64::MIN, |&o| o as i64);
+    let (events, newest) = crate::opencode::read_db(db, since)?;
+    append_tailed(events, tx)?;
+    if newest == since {
+        return Ok(false);
+    }
+    offsets.insert(db.to_owned(), newest as u64);
+    Ok(true)
+}
+
+fn append_tailed(events: Vec<CanonicalEvent>, tx: &mpsc::Sender<Cmd>) -> anyhow::Result<()> {
+    for chunk in events.chunks(BATCH) {
+        let (reply, rx) = oneshot::channel();
+        tx.blocking_send(Cmd::Append {
+            events: chunk.to_vec(),
+            source: None,
+            reply,
+        })
+        .map_err(|_| anyhow!("writer stopped"))?;
+        rx.blocking_recv().context("writer stopped")??;
+    }
+    Ok(())
 }
 
 /// Feeds new complete lines of `path` through its adapter and appends the events. True if the offset moved.
@@ -399,16 +433,7 @@ fn tail_file(
             ),
         }
     }
-    for chunk in events.chunks(BATCH) {
-        let (reply, rx) = oneshot::channel();
-        tx.blocking_send(Cmd::Append {
-            events: chunk.to_vec(),
-            source: None,
-            reply,
-        })
-        .map_err(|_| anyhow!("writer stopped"))?;
-        rx.blocking_recv().context("writer stopped")??;
-    }
+    append_tailed(events, tx)?;
     t.consumed = pos;
     offsets.insert(path.to_owned(), pos);
     Ok(true)

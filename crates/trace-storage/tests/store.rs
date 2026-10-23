@@ -361,3 +361,27 @@ fn annotations_survive_rebuild_blank_clears_and_purge_drops() {
     store.purge(Some(101), None).unwrap();
     assert!(store.annotations(&s1).unwrap().is_empty());
 }
+
+#[test]
+fn unpriced_model_calls_get_estimates_and_old_stores_rebuild_them() {
+    let path = temp_db("estimates");
+    let unpriced = EventBody::UsageReported { usage: Usage { tokens_input: Some(1_000_000), tokens_output: Some(100_000), ..Default::default() }, is_final: true };
+    let events = vec![
+        ev("a", 1, "s1", None, 10, started("alpha", "claude-code")),
+        ev("a", 2, "s1", Some("llm"), 11, span(None, "call", SpanKind::Llm, Some("claude-opus-4-8"))),
+        ev("a", 3, "s1", Some("llm"), 20, unpriced),
+        ev("a", 4, "s1", Some("llm"), 21, ended(SpanStatus::Succeeded)),
+    ];
+    let estimate = |store: &Store| store.list_sessions(&SessionFilter::default()).unwrap()[0].totals.cost_estimate_usd_micros;
+    {
+        let mut store = Store::open(&path).unwrap();
+        store.append(&events).unwrap();
+        assert_eq!(estimate(&store), 7_500_000, "1M in × $5 + 100k out × $25 per MTok on Opus 4.8");
+    }
+    // A store whose projections predate estimates: zero the stored totals and forget the version.
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch("UPDATE sessions SET cost_estimate_usd_micros = 0; DELETE FROM meta;").unwrap();
+    }
+    assert_eq!(estimate(&Store::open(&path).unwrap()), 7_500_000, "reopening rebuilds the projections");
+}

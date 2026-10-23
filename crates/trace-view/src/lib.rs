@@ -10,7 +10,7 @@ pub use idle::{IDLE_GAP_MIN, MAX_GAPS, idle_gaps, skip_idle};
 pub use names::{detail, harness_label, harness_name, kind_label, mcp_parts, pretty_model, title, top_model};
 pub use doc::{EXPAND_ALL_LIMIT, Mode, TraceDoc, export_span, matcher, resolve_session, wall_ns, write_private};
 use std::collections::HashSet;
-use trace_core::{Ns, Span, SpanId, TraceState};
+use trace_core::{Ns, Span, SpanId, Totals, TraceState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowKind {
@@ -230,6 +230,17 @@ pub fn format_cost(micros: Option<u64>) -> String {
     let decimals = (1 - v.log10().floor() as i32) as usize;
     let s = format!("${v:.decimals$}");
     if s.trim_start_matches('$').parse::<f64>().is_ok_and(|r| r >= 0.01) { format!("${v:.2}") } else { s }
+}
+
+/// A total as it should read: `~$1.20` when part of it is estimated from list prices, `≥ $1.20` when some
+/// calls' cost is unknown so the sum is a lower bound, `—` when nothing is known.
+pub fn format_total_cost(t: &Totals) -> String {
+    let Some(c) = t.cost_usd_micros() else { return "—".into() };
+    match (t.cost_unknown_records > 0, t.cost_estimate_usd_micros > 0) {
+        (true, _) => format!("≥ {}", format_cost(Some(c))),
+        (false, true) => format!("~{}", format_cost(Some(c))),
+        _ => format_cost(Some(c)),
+    }
 }
 
 /// `999`, `12.3k`, `1.5M`.

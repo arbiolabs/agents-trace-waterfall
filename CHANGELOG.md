@@ -6,6 +6,37 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-23
+
+Codex, pi and OpenCode join Claude Code, every harness's sub-agents nest inside the parent's trace, and
+costs no harness reports are estimated from model list prices.
+
+### Added
+
+- Codex CLI adapter (`codex`): tails `~/.codex/sessions` rollouts. Turns, one span per model
+  response with cached-token split, tool calls, and the commands, file changes, MCP calls and web
+  searches inside them with Codex's own start and end times.
+- pi adapter (`pi`): tails `~/.pi/agent/sessions`. Model calls use pi's recorded request start and
+  duration and carry its cost estimate; tool calls end at their results.
+- OpenCode adapter (`opencode`): reads OpenCode 2.x's `opencode.db` read-only, for import and live
+  tailing, re-reading a session whenever it changes. Turns end with OpenCode's idle outcome.
+- Pi is a recognized harness name.
+- Sub-agents for every harness: Codex sub-agent threads, OpenCode child sessions and pi sub-agent
+  extension runs join the root session, nested under the tool call that started them.
+- OpenCode before 2.0: sessions in the `session`, `message` and `part` tables, one model call per step,
+  and 1.x's JSON-file `storage` folder (`--tail opencode=~/.local/share/opencode/storage`).
+- pi branches: a turn that continues from an earlier message is named `turn N (branch)`.
+- pi sub-agents that keep their own session: a session started from a parent during one of its tool
+  calls nests under that call, live. Forks and clones stay separate, without their copied history.
+- Cost estimates: a model call that reports tokens but no cost (Claude Code, Codex) is priced from the
+  model's API list price, cache reads and writes included, and marked as an estimate. Totals that
+  include estimates read `~$1.20`; existing stores recompute their session totals once on open.
+
+### Fixed
+
+- A Codex sub-agent closes when its own turn ends, even if the parent never reports it done.
+- The sidebar counts the main agent's turns only, not its sub-agents'.
+
 ## [1.0.0] - 2026-10-23
 
 The first release: a local-first trace waterfall for coding agents, as a native macOS app and a
@@ -49,5 +80,6 @@ terminal UI over the same recorded traces.
   time axis and previous / next activity (`{` / `}`).
 - Unicode and ASCII glyphs, colour and monochrome themes. Usable down to 60×18.
 
-[Unreleased]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/diego-arbio-dev/agents-trace-waterfall/releases/tag/v1.0.0

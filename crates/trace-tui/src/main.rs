@@ -39,9 +39,10 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = At::Start)]
         at: At,
     },
-    /// Import a JSONL file into the store.
+    /// Import a session into the store: a JSONL transcript, OpenCode's opencode.db, or its 1.x storage folder.
     Import {
         file: PathBuf,
+        /// canonical, claude-code, codex, pi or opencode.
         #[arg(long, default_value = "canonical")]
         adapter: String,
     },
@@ -70,7 +71,8 @@ enum Cmd {
 enum CollectorCmd {
     /// Run the ingestion daemon in the foreground until SIGINT/SIGTERM.
     Start {
-        /// `adapter=path`, repeatable. Added to the config's `[[tail]]` list.
+        /// `adapter=path`, repeatable, e.g. `codex=~/.codex/sessions`, `pi=~/.pi/agent/sessions` or
+        /// `opencode=~/.local/share/opencode/opencode.db`. Added to the config's `[[tail]]` list.
         #[arg(long, value_parser = parse_tail)]
         tail: Vec<(String, PathBuf)>,
     },

@@ -9,7 +9,7 @@ use ratatui::widgets::{
 };
 use trace_core::{CostProvenance, Ns, SLOWEST_DEFAULT_KINDS, SessionStatus, wire_name};
 use trace_render::{Glyphs, Theme, WaterfallState, WaterfallWidget};
-use trace_view::{Mode, TraceDoc, format_cost, format_duration, format_tokens, harness_label, pretty_model, title};
+use trace_view::{Mode, TraceDoc, format_cost, format_duration, format_tokens, format_total_cost, harness_label, pretty_model, title};
 
 const WIDE: u16 = 120;
 
@@ -159,7 +159,7 @@ fn sessions(app: &mut App, f: &mut Frame, area: Rect) {
                 format_tokens(s.totals.tokens_input),
                 format_tokens(s.totals.tokens_output)
             ),
-            format_cost(s.totals.cost_usd_micros()),
+            format_total_cost(&s.totals),
             s.totals.failed_spans.to_string(),
         ];
         TRow::new(

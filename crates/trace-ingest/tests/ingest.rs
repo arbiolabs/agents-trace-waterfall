@@ -340,8 +340,9 @@ fn claude_code_transcript_becomes_metadata_only_spans() {
         tokens_output: Some(10),
         cache_read: Some(100),
         cache_write: Some(50),
-        cost_usd_micros: None,
-        cost_provenance: CostProvenance::Unknown,
+        // Claude Code reports no cost, so Opus 4.1's list prices estimate it: 3×$15 + 10×$75 + 100×$1.50 + 50×$18.75 per MTok.
+        cost_usd_micros: Some(1883),
+        cost_provenance: CostProvenance::Estimate,
     };
     assert_eq!((m1.usage.as_ref(), m1.usage_final), (Some(&usage), true));
 
@@ -526,7 +527,10 @@ fn doctor_reports_live_collector_and_adapter_blind_spots() {
             (true, "socket"),
             (true, "collector"),
             (true, "adapter canonical"),
-            (true, "adapter claude-code")
+            (true, "adapter claude-code"),
+            (true, "adapter codex"),
+            (true, "adapter pi"),
+            (true, "adapter opencode")
         ]
     );
     assert_eq!(checks[3].detail, "answers hello with welcome (protocol 1)");
@@ -649,4 +653,368 @@ fn exported_journal_with_interruption_reimports() {
     let out = import_file(&mut fresh, &file, "canonical", &Default::default()).unwrap();
     assert_eq!((out.inserted, out.duplicates), (events.len(), 0));
     assert_eq!(fresh.load_session(&sid).unwrap().session.status, SessionStatus::Interrupted);
+}
+
+fn harness_fixture(rel: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(rel)
+}
+
+/// `2026-10-23T12:mm:ss.fffZ` in nanoseconds.
+fn at(min: i64, secs: f64) -> Ns {
+    1_792_756_800_000_000_000 + min * 60_000 * MS + (secs * 1000.).round() as i64 * MS
+}
+
+fn span_of<'a>(s: &'a TraceState, id: &str) -> &'a Span {
+    s.spans.get(&SpanId::from(id)).unwrap_or_else(|| panic!("no span {id}: {:?}", s.spans.keys().collect::<Vec<_>>()))
+}
+
+fn sorted_kinds(s: &TraceState) -> Vec<String> {
+    let mut k: Vec<_> = s.spans.values().map(|sp| format!("{:?}", sp.kind)).collect();
+    k.sort();
+    k
+}
+
+#[test]
+fn codex_rollout_becomes_turns_responses_and_nested_tools() {
+    let mut store = Store::open_in_memory().unwrap();
+    let path = harness_fixture("codex/rollout.jsonl");
+    let first = import_file(&mut store, &path, "codex", &Capture::default()).unwrap();
+    assert_eq!(import_file(&mut store, &path, "codex", &Capture::default()).unwrap(), AppendOutcome { inserted: 0, duplicates: first.inserted }, "re-reading yields identical events");
+    let s = store.load_session(&"01a168be-ebc0-7652-9efb-c75c48a4b669".into()).unwrap();
+    assert_eq!((s.session.project_id.as_str(), s.session.working_directory.as_str(), s.session.harness.as_str()), ("demo-proj", "/work/demo-proj", "codex"));
+    assert_eq!(sorted_kinds(&s), ["Agent", "Llm", "Llm", "Llm", "Tool", "Tool", "Tool", "Tool", "Tool", "Turn", "Turn"]);
+
+    let turn1 = "turn:01a168be-f574-7ff2-855f-b39283e2710b";
+    let llm1 = span_of(&s, "llm:resp_071fde928b486bfb016adb53b5917c81919b02c68b002cddc2");
+    assert_eq!((llm1.started_at_utc_ns, llm1.ended_at_utc_ns), (at(31, 47.598), Some(at(31, 50.990))), "a response starts with its turn");
+    assert_eq!((llm1.parent_span_id.as_ref().unwrap().0.as_str(), llm1.model.as_deref(), llm1.provider.as_deref()), (turn1, Some("gpt-6-luna"), Some("openai")));
+    let llm2 = span_of(&s, "llm:resp_071fde928b486bfb016adb53be6c00819185670a8974caade3");
+    assert_eq!(llm2.started_at_utc_ns, at(31, 58.199), "the next response starts at the tool output");
+    let exec = span_of(&s, "item:exec-1d0c3839-d0f8-440d-8d15-ff954ff615ab");
+    assert_eq!((exec.name.as_str(), exec.parent_span_id.as_ref().unwrap().0.as_str()), ("shell", "tool:call_f767f4e277004dea82d0180a0146700a"));
+    assert_eq!((exec.started_at_utc_ns, exec.ended_at_utc_ns), (at(31, 55.209), Some(at(31, 58.187))), "commands keep Codex's own start and end");
+    assert_eq!(span_of(&s, turn1).status, SpanStatus::Succeeded);
+
+    let llm3 = span_of(&s, "llm:resp-3");
+    let usage = llm3.usage.as_ref().unwrap();
+    assert_eq!((usage.tokens_input, usage.cache_read, usage.tokens_output), (Some(200), Some(800), Some(20)), "cached tokens split out of OpenAI's input count");
+    assert_eq!(span_of(&s, "item:mcp-1").name, "mcp__github__create_issue");
+    assert_eq!(span_of(&s, "item:mcp-1").parent_span_id.as_ref().unwrap().0, "tool:call-2");
+    assert_eq!(span_of(&s, "item:exec-2").status, SpanStatus::Failed);
+    assert_eq!(span_of(&s, "turn:turn-2").status, SpanStatus::Cancelled);
+}
+
+#[test]
+fn pi_session_becomes_turns_timed_calls_and_tools() {
+    let mut store = Store::open_in_memory().unwrap();
+    import_file(&mut store, &harness_fixture("pi/session.jsonl"), "pi", &Capture::default()).unwrap();
+    let s = store.load_session(&"pi-sess-1".into()).unwrap();
+    assert_eq!((s.session.project_id.as_str(), s.session.harness.as_str()), ("demo-proj", "pi"));
+    assert_eq!(sorted_kinds(&s), ["Agent", "Llm", "Llm", "Llm", "Llm", "Llm", "Llm", "Llm", "Subagent", "Tool", "Tool", "Tool", "Turn", "Turn", "Turn"]);
+
+    let a1 = span_of(&s, "llm:a1");
+    assert_eq!((a1.started_at_utc_ns, a1.ended_at_utc_ns), (at(0, 1.1), Some(at(0, 3.4))), "pi records the request start and its duration");
+    let u = a1.usage.as_ref().unwrap();
+    assert_eq!((u.tokens_input, u.tokens_output, u.cache_read, u.cache_write, u.cost_usd_micros, u.cost_provenance), (Some(10), Some(40), Some(900), Some(100), Some(4175), CostProvenance::Estimate));
+    let tool = span_of(&s, "tool:tc1");
+    assert_eq!((tool.name.as_str(), tool.started_at_utc_ns, tool.ended_at_utc_ns, tool.status), ("read", at(0, 3.4), Some(at(0, 4.0)), SpanStatus::Succeeded));
+    assert_eq!(tool.parent_span_id.as_ref().unwrap().0, "turn:u1");
+    let t1 = span_of(&s, "turn:u1");
+    assert_eq!((t1.ended_at_utc_ns, t1.status), (Some(at(0, 5.9)), SpanStatus::Succeeded), "the turn ends with the call that stops without a tool");
+    let a3 = span_of(&s, "llm:a3");
+    assert_eq!((a3.status, a3.error.as_deref()), (SpanStatus::Failed, Some("rate limited")));
+    assert_eq!(span_of(&s, "turn:u2").status, SpanStatus::Failed);
+    assert_eq!((span_of(&s, "turn:u2").name.as_str(), span_of(&s, "turn:u3").name.as_str()), ("turn 2", "turn 3 (branch)"), "going back to an earlier message starts a branch");
+
+    let sub = span_of(&s, "subagent:tc2:0");
+    assert_eq!((sub.name.as_str(), sub.kind, sub.parent_span_id.as_ref().unwrap().0.as_str()), ("scout", SpanKind::Subagent, "tool:tc2"));
+    assert_eq!((sub.started_at_utc_ns, sub.ended_at_utc_ns, sub.status), (at(0, 21.0), Some(at(0, 24.0)), SpanStatus::Succeeded), "from its first message to its last call's end");
+    let grep = span_of(&s, "tool:tc2:0:s1");
+    assert_eq!((grep.name.as_str(), grep.started_at_utc_ns, grep.ended_at_utc_ns), ("grep", at(0, 22.0), Some(at(0, 22.5))));
+    assert_eq!(grep.parent_span_id.as_ref().unwrap().0, "subagent:tc2:0");
+    let call = span_of(&s, "llm:tc2:0:3");
+    assert_eq!((call.model.as_deref(), call.usage.as_ref().unwrap().cost_usd_micros), (Some("claude-haiku-5-5"), Some(500)));
+}
+
+/// An OpenCode 2.x database with the two tables the adapter reads, holding the rows OpenCode wrote for a
+/// run that hit its free-usage limit.
+fn opencode_db(path: &Path) -> rusqlite::Connection {
+    let c = rusqlite::Connection::open(path).unwrap();
+    c.execute_batch(
+        "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL, version TEXT NOT NULL, parent_id TEXT, agent TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+         CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+         INSERT INTO session_v2 VALUES ('ses_fail', '/work/demo-proj', '2.1.3', NULL, NULL, 1792758724921, 1792758725769);
+         INSERT INTO session_message VALUES ('msg_u', 'ses_fail', 'user', 4, 1792758725142, 1792758725142, '{\"time\":{\"created\":1792758725142},\"text\":\"(text)\",\"files\":[]}');
+         INSERT INTO session_message VALUES ('msg_a', 'ses_fail', 'assistant', 5, 1792758725157, 1792758725769, '{\"time\":{\"created\":1792758725157,\"completed\":1792758725769},\"agent\":\"build\",\"model\":{\"id\":\"big-pickle\",\"providerID\":\"opencode\"},\"content\":[],\"finish\":\"error\",\"error\":{\"type\":\"provider.free-limit\",\"message\":\"Free usage limit reached.\",\"status\":429}}');
+         INSERT INTO session_message VALUES ('msg_i', 'ses_fail', 'idle', 7, 1792758725771, 1792758725771, '{\"time\":{\"created\":1792758725771},\"outcome\":\"failed\",\"error\":{\"type\":\"provider.free-limit\",\"message\":\"Free usage limit reached.\"}}');",
+    )
+    .unwrap();
+    c
+}
+
+/// A run that reads a file: the assistant step is still streaming when written, and completes later.
+fn opencode_run(c: &rusqlite::Connection, done: bool) {
+    let tool = if done {
+        r#"{"type":"tool","id":"call_1","name":"read","state":{"status":"completed","input":{},"content":[]},"time":{"created":1000,"ran":1200,"completed":1500}}"#
+    } else {
+        r#"{"type":"tool","id":"call_1","name":"read","state":{"status":"running","input":{},"metadata":{}},"time":{"created":1000,"ran":1200}}"#
+    };
+    let time = if done { r#"{"created":500,"streamed":1000,"completed":1600}"# } else { r#"{"created":500}"# };
+    let assistant = format!(r#"{{"time":{time},"agent":"build","model":{{"id":"claude-sonnet-5-5","providerID":"anthropic"}},"content":[{tool}],"cost":0.0042,"tokens":{{"input":12,"output":30,"reasoning":0,"cache":{{"read":2000,"write":100}}}}}}"#);
+    let base = 1_792_760_000_000i64;
+    // Offsets above are milliseconds after `base`.
+    let assistant = ["500", "1000", "1200", "1500", "1600"].iter().fold(assistant, |a, n| a.replace(&format!(":{n}"), &format!(":{}", base + n.parse::<i64>().unwrap())));
+    let updated = base + if done { 1700 } else { 1300 };
+    c.execute("INSERT OR REPLACE INTO session_v2 VALUES ('ses_ok', '/work/demo-proj', '2.1.3', NULL, 'build', ?1, ?2)", rusqlite::params![base, updated]).unwrap();
+    c.execute("INSERT OR REPLACE INTO session_message VALUES ('msg_u2', 'ses_ok', 'user', 1, ?1, ?1, '{}')", [base + 100]).unwrap();
+    c.execute("INSERT OR REPLACE INTO session_message VALUES ('msg_a2', 'ses_ok', 'assistant', 2, ?1, ?2, ?3)", rusqlite::params![base + 500, updated, assistant]).unwrap();
+    if done {
+        c.execute("INSERT OR REPLACE INTO session_message VALUES ('msg_i2', 'ses_ok', 'idle', 3, ?1, ?1, '{\"outcome\":\"succeeded\"}')", [base + 1700]).unwrap();
+    }
+}
+
+#[test]
+fn opencode_database_imports_failed_and_finished_runs() {
+    let env = env();
+    let db = env.dir.join("opencode.db");
+    let c = opencode_db(&db);
+    opencode_run(&c, true);
+    let mut store = Store::open_in_memory().unwrap();
+    let first = import_file(&mut store, &db, "opencode", &Capture::default()).unwrap();
+    assert_eq!(import_file(&mut store, &db, "opencode", &Capture::default()).unwrap().inserted, 0, "{first:?}");
+
+    let s = store.load_session(&"ses_fail".into()).unwrap();
+    assert_eq!((s.session.project_id.as_str(), s.session.harness.as_str()), ("demo-proj", "opencode"));
+    let llm = span_of(&s, "llm:msg_a");
+    assert_eq!((llm.status, llm.model.as_deref(), llm.error.as_deref()), (SpanStatus::Failed, Some("big-pickle"), Some("Free usage limit reached.")));
+    assert_eq!(span_of(&s, "turn:msg_u").status, SpanStatus::Failed, "the idle message's outcome ends the turn");
+
+    let s = store.load_session(&"ses_ok".into()).unwrap();
+    let base = 1_792_760_000_000 * MS;
+    let llm = span_of(&s, "llm:msg_a2");
+    assert_eq!((llm.started_at_utc_ns, llm.ended_at_utc_ns), (base + 500 * MS, Some(base + 1000 * MS)), "the call ends when its stream does");
+    let u = llm.usage.as_ref().unwrap();
+    assert_eq!((u.tokens_input, u.cache_read, u.cost_usd_micros, u.cost_provenance), (Some(12), Some(2000), Some(4200), CostProvenance::Estimate));
+    let tool = span_of(&s, "tool:call_1");
+    assert_eq!((tool.name.as_str(), tool.started_at_utc_ns, tool.ended_at_utc_ns), ("read", base + 1200 * MS, Some(base + 1500 * MS)));
+    assert_eq!(span_of(&s, "turn:msg_u2").status, SpanStatus::Succeeded);
+}
+
+#[test]
+fn collector_tails_an_opencode_database_as_messages_complete() {
+    let env = env();
+    let db = env.dir.join("opencode.db");
+    let c = opencode_db(&db);
+    opencode_run(&c, false);
+    let running = start(config(&env, &[("opencode", db.as_path())], YEAR));
+    let reader = Store::open(&env.db).unwrap();
+    let tool = |r: &Store| r.load_session(&"ses_ok".into()).ok().and_then(|s| s.spans.get(&SpanId::from("tool:call_1")).cloned());
+    wait_for("the running tool call", || tool(&reader).is_some());
+    assert_eq!(tool(&reader).unwrap().ended_at_utc_ns, None, "still running");
+    opencode_run(&c, true);
+    wait_for("the tool call to end", || tool(&reader).is_some_and(|t| t.ended_at_utc_ns.is_some()));
+    assert_eq!(reader.load_session(&"ses_fail".into()).unwrap().spans.len(), 3);
+    running.stop();
+}
+
+#[test]
+fn codex_sub_agent_nests_under_its_spawn_call_in_the_root_session() {
+    let mut store = Store::open_in_memory().unwrap();
+    // The child first: its spans wait for the parent's sub-agent span, then resolve.
+    for f in ["codex/subagent-child.jsonl", "codex/subagent-parent.jsonl"] {
+        import_file(&mut store, &harness_fixture(f), "codex", &Capture::default()).unwrap();
+    }
+    let sessions = store.list_sessions(&SessionFilter::default()).unwrap();
+    assert_eq!(sessions.iter().map(|s| s.session_id.0.as_str()).collect::<Vec<_>>(), ["01a168cc-d3fc-71f3-95ac-adf7636d82c0"], "the sub-agent joins the root session");
+    let s = store.load_session(&sessions[0].session_id).unwrap();
+    assert!(s.unresolved().is_empty());
+    let sub = span_of(&s, "subagent:01a168cc-df54-7272-97f3-5ad6babb84e8");
+    assert_eq!((sub.name.as_str(), sub.kind, sub.status), ("readme_sentence", SpanKind::Subagent, SpanStatus::Succeeded));
+    assert_eq!(sub.parent_span_id.as_ref().unwrap().0, "tool:call_53aa098bd4974b90969deff281c602d7");
+    assert_eq!(span_of(&s, "tool:call_53aa098bd4974b90969deff281c602d7").name, "spawn_agent");
+    let child_turn = span_of(&s, "turn:01a168cc-df7c-7443-9141-6a06eda97364");
+    assert_eq!(child_turn.parent_span_id.as_ref().unwrap().0, "subagent:01a168cc-df54-7272-97f3-5ad6babb84e8");
+    let turns = s.spans.values().filter(|sp| sp.kind == SpanKind::Turn).count();
+    assert_eq!(turns, 2, "the parent history copied into the child rollout is skipped");
+    assert_eq!(s.spans.values().filter(|sp| sp.kind == SpanKind::Llm).count(), 5);
+    assert_eq!(sessions[0].turn_count, 1, "the sidebar counts the main agent's turns, not the sub-agent's");
+}
+
+#[test]
+fn codex_sub_agent_closes_with_its_own_turn_when_the_parent_never_reports_it() {
+    let env = env();
+    let parent = std::fs::read_to_string(harness_fixture("codex/subagent-parent.jsonl")).unwrap();
+    let without: Vec<&str> = parent.lines().filter(|l| !l.contains(r#""kind":"completed""#)).collect();
+    let trimmed = env.dir.join("parent.jsonl");
+    std::fs::write(&trimmed, without.join("\n") + "\n").unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    import_file(&mut store, &trimmed, "codex", &Capture::default()).unwrap();
+    import_file(&mut store, &harness_fixture("codex/subagent-child.jsonl"), "codex", &Capture::default()).unwrap();
+    let s = store.load_session(&"01a168cc-d3fc-71f3-95ac-adf7636d82c0".into()).unwrap();
+    let sub = span_of(&s, "subagent:01a168cc-df54-7272-97f3-5ad6babb84e8");
+    assert_eq!((sub.ended_at_utc_ns, sub.status), (Some(at(47, 3.207)), SpanStatus::Succeeded));
+}
+
+#[test]
+fn opencode_sub_agent_session_nests_under_its_task_call() {
+    let env = env();
+    let db = env.dir.join("opencode.db");
+    let c = opencode_db(&db);
+    let b = 1_792_770_000_000i64;
+    let task = format!(r#"{{"time":{{"created":{},"streamed":{},"completed":{}}},"model":{{"id":"m","providerID":"p"}},"content":[{{"type":"tool","id":"call_task","name":"subagent","state":{{"status":"completed","input":{{}},"content":[],"metadata":{{"sessionID":"ses_child","status":"completed"}}}},"time":{{"created":{},"ran":{},"completed":{}}}}}]}}"#, b + 100, b + 200, b + 5000, b + 200, b + 300, b + 4900);
+    let child = format!(r#"{{"time":{{"created":{},"streamed":{},"completed":{}}},"model":{{"id":"m","providerID":"p"}},"content":[]}}"#, b + 1000, b + 3000, b + 3000);
+    c.execute_batch(&format!(
+        "INSERT INTO session_v2 VALUES ('ses_parent', '/work/demo-proj', '2.1.3', NULL, 'build', {b}, {u});
+         INSERT INTO session_v2 VALUES ('ses_child', '/work/demo-proj', '2.1.3', 'ses_parent', 'explore', {c0}, {u});
+         INSERT INTO session_message VALUES ('p_u', 'ses_parent', 'user', 1, {b}, {b}, '{{}}');
+         INSERT INTO session_message VALUES ('p_a', 'ses_parent', 'assistant', 2, {a}, {u}, '{task}');
+         INSERT INTO session_message VALUES ('c_u', 'ses_child', 'user', 1, {c0}, {c0}, '{{}}');
+         INSERT INTO session_message VALUES ('c_a', 'ses_child', 'assistant', 2, {c1}, {c2}, '{child}');
+         INSERT INTO session_message VALUES ('c_i', 'ses_child', 'idle', 3, {c3}, {c3}, '{{\"outcome\":\"succeeded\"}}');",
+        u = b + 6000, a = b + 100, c0 = b + 400, c1 = b + 1000, c2 = b + 3000, c3 = b + 3100,
+    ))
+    .unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    import_file(&mut store, &db, "opencode", &Capture::default()).unwrap();
+    assert!(store.load_session(&"ses_child".into()).unwrap().spans.is_empty(), "the child's events join its root session");
+    let s = store.load_session(&"ses_parent".into()).unwrap();
+    let sub = span_of(&s, "subagent:ses_child");
+    assert_eq!((sub.name.as_str(), sub.kind, sub.parent_span_id.as_ref().unwrap().0.as_str()), ("explore", SpanKind::Subagent, "tool:call_task"));
+    assert_eq!((sub.started_at_utc_ns, sub.ended_at_utc_ns, sub.status), ((b + 400) * MS, Some((b + 3100) * MS), SpanStatus::Succeeded));
+    assert_eq!(span_of(&s, "turn:c_u").parent_span_id.as_ref().unwrap().0, "subagent:ses_child");
+    assert_eq!(span_of(&s, "llm:c_a").parent_span_id.as_ref().unwrap().0, "turn:c_u");
+}
+
+#[test]
+fn opencode_before_2_reads_steps_tools_and_sub_agents() {
+    let env = env();
+    let db = env.dir.join("opencode.db");
+    let c = rusqlite::Connection::open(&db).unwrap();
+    let b = 1_792_780_000_000i64;
+    let part = |id: &str, msg: &str, sess: &str, at: i64, data: String| format!("INSERT INTO part VALUES ('{id}', '{msg}', '{sess}', {at}, {at}, '{data}');");
+    let tool = |call: &str, name: &str, status: &str, s: i64, e: i64, meta: &str| format!(r#"{{"type":"tool","callID":"{call}","tool":"{name}","state":{{"status":"{status}","input":{{}},"output":"","title":"","metadata":{{{meta}}},"time":{{"start":{s},"end":{e}}}}}}}"#);
+    let finish = |cost: f64| format!(r#"{{"type":"step-finish","reason":"stop","cost":{cost},"tokens":{{"input":5,"output":7,"reasoning":0,"cache":{{"read":100,"write":0}}}}}}"#);
+    let assistant = |done: i64, finish: &str| format!(r#"{{"role":"assistant","time":{{"created":{b},"completed":{done}}},"modelID":"claude-sonnet-5-5","providerID":"anthropic","agent":"build","cost":0,"tokens":{{"input":0,"output":0,"reasoning":0,"cache":{{"read":0,"write":0}}}},"finish":"{finish}"}}"#);
+    let mut sql = String::from(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, version TEXT NOT NULL, parent_id TEXT, agent TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+         CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);",
+    );
+    sql += &format!("INSERT INTO session VALUES ('ses_old', '/work/demo-proj', '1.4.0', NULL, NULL, {b}, {});", b + 9000);
+    sql += &format!("INSERT INTO session VALUES ('ses_old_child', '/work/demo-proj', '1.4.0', 'ses_old', 'general', {}, {});", b + 1500, b + 9000);
+    sql += &format!("INSERT INTO message VALUES ('msg_1u', 'ses_old', {b}, {b}, '{{\"role\":\"user\",\"time\":{{\"created\":{b}}}}}');");
+    sql += &format!("INSERT INTO message VALUES ('msg_1a', 'ses_old', {}, {}, '{}');", b + 100, b + 6000, assistant(b + 6000, "stop"));
+    sql += &part("prt_01", "msg_1a", "ses_old", b + 100, r#"{"type":"step-start"}"#.into());
+    sql += &part("prt_02", "msg_1a", "ses_old", b + 1000, tool("call_task", "task", "completed", b + 1000, b + 4000, r#""sessionId":"ses_old_child""#));
+    sql += &part("prt_03", "msg_1a", "ses_old", b + 1000, finish(0.002));
+    sql += &part("prt_04", "msg_1a", "ses_old", b + 4100, r#"{"type":"step-start"}"#.into());
+    sql += &part("prt_05", "msg_1a", "ses_old", b + 6000, finish(0.001));
+    sql += &format!("INSERT INTO message VALUES ('msg_2u', 'ses_old_child', {0}, {0}, '{{\"role\":\"user\",\"time\":{{\"created\":{0}}}}}');", b + 1500);
+    sql += &format!("INSERT INTO message VALUES ('msg_2a', 'ses_old_child', {}, {}, '{}');", b + 1600, b + 3900, assistant(b + 3900, "stop"));
+    c.execute_batch(&sql).unwrap();
+
+    let mut store = Store::open_in_memory().unwrap();
+    import_file(&mut store, &db, "opencode", &Capture::default()).unwrap();
+    let s = store.load_session(&"ses_old".into()).unwrap();
+    let step1 = span_of(&s, "llm:prt_01");
+    assert_eq!((step1.started_at_utc_ns, step1.ended_at_utc_ns), ((b + 100) * MS, Some((b + 1000) * MS)), "each step is a model call");
+    let u = step1.usage.as_ref().unwrap();
+    assert_eq!((u.tokens_input, u.cache_read, u.cost_usd_micros), (Some(5), Some(100), Some(2000)));
+    assert_eq!(span_of(&s, "llm:prt_04").ended_at_utc_ns, Some((b + 6000) * MS));
+    let task = span_of(&s, "tool:call_task");
+    assert_eq!((task.name.as_str(), task.started_at_utc_ns, task.ended_at_utc_ns), ("task", (b + 1000) * MS, Some((b + 4000) * MS)));
+    assert_eq!(span_of(&s, "turn:msg_1u").ended_at_utc_ns, Some((b + 6000) * MS), "the reply that finishes without a tool call ends the turn");
+    let sub = span_of(&s, "subagent:ses_old_child");
+    assert_eq!((sub.name.as_str(), sub.parent_span_id.as_ref().unwrap().0.as_str(), sub.ended_at_utc_ns), ("general", "tool:call_task", Some((b + 3900) * MS)));
+    assert_eq!(span_of(&s, "llm:msg_2a").parent_span_id.as_ref().unwrap().0, "turn:msg_2u");
+}
+
+/// A pi session file: the header, then entries at `(seconds after 12:00, json)`.
+fn pi_file(path: &Path, header: Value, entries: &[(f64, Value)]) {
+    let ms0 = 1_792_756_800_000i64;
+    let mut out = vec![header.to_string()];
+    for (i, (secs, msg)) in entries.iter().enumerate() {
+        let mut m = msg.clone();
+        let at = ms0 + (secs * 1000.).round() as i64;
+        m["timestamp"] = json!(at);
+        out.push(json!({"type": "message", "id": format!("{}-{i}", path.file_stem().unwrap().to_str().unwrap()), "parentId": null, "timestamp": format!("2026-10-23T12:00:{secs:06.3}Z"), "message": m}).to_string());
+    }
+    std::fs::write(path, out.join("\n") + "\n").unwrap();
+}
+
+#[test]
+fn pi_session_started_during_a_tool_call_is_its_sub_agent_and_a_fork_is_not() {
+    let env = env();
+    let (parent, child, fork) = (env.dir.join("parent.jsonl"), env.dir.join("child.jsonl"), env.dir.join("fork.jsonl"));
+    let user = json!({"role": "user", "content": []});
+    let call = |id: &str| json!({"role": "assistant", "content": [{"type": "toolCall", "id": id, "name": "delegate", "arguments": {}}], "model": "m", "provider": "p", "stopReason": "toolUse", "durationMs": 1000});
+    let reply = json!({"role": "assistant", "content": [], "model": "m", "provider": "p", "stopReason": "stop", "durationMs": 2000});
+    pi_file(&parent, json!({"type": "session", "version": 3, "id": "pi-parent", "timestamp": "2026-10-23T12:00:00.000Z", "cwd": "/work/demo-proj"}),
+        &[(0.5, user.clone()), (1.0, call("tc_d")), (9.0, json!({"role": "toolResult", "toolCallId": "tc_d", "toolName": "delegate", "content": [], "isError": false})), (9.5, reply.clone())]);
+    let header = |id: &str, at: &str| json!({"type": "session", "version": 3, "id": id, "timestamp": at, "cwd": "/work/demo-proj", "parentSession": parent.to_str().unwrap()});
+    // Both start with a copy of the parent's first prompt.
+    pi_file(&child, header("pi-child", "2026-10-23T12:00:03.000Z"), &[(0.5, user.clone()), (3.5, user.clone()), (4.0, reply.clone())]);
+    pi_file(&fork, header("pi-fork", "2026-10-23T12:00:20.000Z"), &[(0.5, user.clone()), (20.5, user.clone()), (21.0, reply.clone())]);
+
+    let mut store = Store::open_in_memory().unwrap();
+    for f in [&child, &parent, &fork] {
+        import_file(&mut store, f, "pi", &Capture::default()).unwrap();
+    }
+    let mut ids: Vec<_> = store.list_sessions(&SessionFilter::default()).unwrap().into_iter().map(|s| s.session_id.0).collect();
+    ids.sort();
+    assert_eq!(ids, ["pi-fork", "pi-parent"], "the sub-agent joins its parent's session; the fork keeps its own");
+
+    let s = store.load_session(&"pi-parent".into()).unwrap();
+    assert!(s.unresolved().is_empty());
+    let sub = span_of(&s, "subagent:pi-child");
+    assert_eq!((sub.kind, sub.parent_span_id.as_ref().unwrap().0.as_str()), (SpanKind::Subagent, "tool:tc_d"));
+    assert_eq!((sub.started_at_utc_ns, sub.ended_at_utc_ns), (at(0, 3.0), Some(at(0, 6.0))), "it ends with its last turn");
+    let child_turns: Vec<_> = s.spans.values().filter(|sp| sp.kind == SpanKind::Turn && sp.parent_span_id.as_ref().is_some_and(|p| p.0 == "subagent:pi-child")).collect();
+    assert_eq!(child_turns.len(), 1, "the copied parent history is skipped");
+
+    let f = store.load_session(&"pi-fork".into()).unwrap();
+    assert_eq!(f.spans.values().filter(|sp| sp.kind == SpanKind::Turn).count(), 1, "the fork skips its copied history too");
+}
+
+#[test]
+fn opencode_1_json_storage_reads_steps_tools_and_sub_agents() {
+    let env = env();
+    let dir = env.dir.join("storage");
+    let b = 1_792_790_000_000i64;
+    let put = |rel: &str, v: Value| {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, v.to_string()).unwrap();
+    };
+    put("session/proj/ses_a.json", json!({"id": "ses_a", "projectID": "proj", "directory": "/work/demo-proj", "title": "(text)", "version": "1.0.150", "time": {"created": b, "updated": b + 9000}}));
+    put("session/proj/ses_b.json", json!({"id": "ses_b", "projectID": "proj", "parentID": "ses_a", "directory": "/work/demo-proj", "title": "(text)", "version": "1.0.150", "time": {"created": b + 2000, "updated": b + 5000}}));
+    put("message/ses_a/msg_au.json", json!({"id": "msg_au", "sessionID": "ses_a", "role": "user", "time": {"created": b}}));
+    put("message/ses_a/msg_aa.json", json!({"id": "msg_aa", "sessionID": "ses_a", "role": "assistant", "time": {"created": b + 100, "completed": b + 8000}, "modelID": "claude-sonnet-5-5", "providerID": "anthropic", "cost": 0.004, "tokens": {"input": 9, "output": 30, "reasoning": 0, "cache": {"read": 500, "write": 0}}, "finish": "stop"}));
+    let step_finish = json!({"type": "step-finish", "reason": "stop", "cost": 0.002, "tokens": {"input": 4, "output": 10, "reasoning": 0, "cache": {"read": 250, "write": 0}}});
+    put("part/msg_aa/prt_01.json", json!({"id": "prt_01", "type": "step-start"}));
+    put("part/msg_aa/prt_02.json", json!({"id": "prt_02", "type": "text", "text": "(text)", "time": {"start": b + 300, "end": b + 1500}}));
+    put("part/msg_aa/prt_03.json", json!({"id": "prt_03", "type": "tool", "callID": "call_task", "tool": "task", "state": {"status": "completed", "input": {}, "output": "", "title": "", "metadata": {"sessionId": "ses_b"}, "time": {"start": b + 1600, "end": b + 6000}}}));
+    put("part/msg_aa/prt_04.json", { let mut f = step_finish.clone(); f["id"] = json!("prt_04"); f });
+    put("part/msg_aa/prt_05.json", json!({"id": "prt_05", "type": "step-start"}));
+    put("part/msg_aa/prt_06.json", json!({"id": "prt_06", "type": "text", "text": "(text)", "time": {"start": b + 6500, "end": b + 8000}}));
+    put("part/msg_aa/prt_07.json", { let mut f = step_finish.clone(); f["id"] = json!("prt_07"); f });
+    put("message/ses_b/msg_bu.json", json!({"id": "msg_bu", "sessionID": "ses_b", "role": "user", "time": {"created": b + 2000}}));
+    put("message/ses_b/msg_ba.json", json!({"id": "msg_ba", "sessionID": "ses_b", "role": "assistant", "time": {"created": b + 2100, "completed": b + 5000}, "modelID": "claude-haiku-5-5", "providerID": "anthropic", "cost": 0.0, "tokens": {"input": 1, "output": 2, "reasoning": 0, "cache": {"read": 0, "write": 0}}, "finish": "stop"}));
+
+    let mut store = Store::open_in_memory().unwrap();
+    import_file(&mut store, &dir, "opencode", &Capture::default()).unwrap();
+    let ids: Vec<_> = store.list_sessions(&SessionFilter::default()).unwrap().into_iter().map(|s| s.session_id.0).collect();
+    assert_eq!(ids, ["ses_a"]);
+    let s = store.load_session(&"ses_a".into()).unwrap();
+    let step1 = span_of(&s, "llm:prt_01");
+    assert_eq!((step1.started_at_utc_ns, step1.ended_at_utc_ns), ((b + 100) * MS, Some((b + 6000) * MS)), "a step runs from where the reply got to until its parts' latest end");
+    assert_eq!(step1.usage.as_ref().unwrap().cost_usd_micros, Some(2000));
+    let step2 = span_of(&s, "llm:prt_05");
+    assert_eq!((step2.started_at_utc_ns, step2.ended_at_utc_ns), ((b + 6000) * MS, Some((b + 8000) * MS)));
+    let task = span_of(&s, "tool:call_task");
+    assert_eq!((task.started_at_utc_ns, task.ended_at_utc_ns), ((b + 1600) * MS, Some((b + 6000) * MS)));
+    let sub = span_of(&s, "subagent:ses_b");
+    assert_eq!((sub.parent_span_id.as_ref().unwrap().0.as_str(), sub.ended_at_utc_ns), ("tool:call_task", Some((b + 5000) * MS)));
+    assert_eq!(span_of(&s, "llm:msg_ba").model.as_deref(), Some("claude-haiku-5-5"));
+    assert_eq!(span_of(&s, "turn:msg_au").ended_at_utc_ns, Some((b + 8000) * MS));
 }

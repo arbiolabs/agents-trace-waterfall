@@ -103,7 +103,13 @@ CREATE TABLE annotations (
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (session_id, span_id)
 );
+"#, r#"
+CREATE TABLE meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 "#];
+
+/// Bumped when projections compute differently, so stores rebuild them from the journal on open.
+/// 2: model-price cost estimates. 3: zero-token calls cost nothing.
+const PROJECTION_VERSION: i64 = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AppendOutcome {
@@ -175,6 +181,11 @@ impl Store {
         conn.pragma_update(None, "secure_delete", "ON")?;
         let mut store = Self { conn };
         store.migrate()?;
+        let built: Option<i64> = store.conn.query_row("SELECT value FROM meta WHERE key = 'projection_version'", [], |r| r.get(0)).optional()?;
+        if built != Some(PROJECTION_VERSION) {
+            store.rebuild_projections()?;
+            store.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('projection_version', ?1)", [PROJECTION_VERSION])?;
+        }
         Ok(store)
     }
 
@@ -253,7 +264,9 @@ impl Store {
 
     pub fn list_sessions(&self, filter: &SessionFilter) -> Result<Vec<SessionSummary>> {
         let mut sql = String::from(
-            "SELECT *, (SELECT COUNT(*) FROM spans p WHERE p.session_id = sessions.session_id AND p.kind = 'turn') FROM sessions WHERE 1 = 1",
+            // Turns of the main agent only; a sub-agent's turns sit under its own span.
+            "SELECT *, (SELECT COUNT(*) FROM spans p JOIN spans a ON a.session_id = p.session_id AND a.span_id = p.parent_span_id
+                        WHERE p.session_id = sessions.session_id AND p.kind = 'turn' AND a.kind = 'agent') FROM sessions WHERE 1 = 1",
         );
         let mut args: Vec<String> = Vec::new();
         let mut bind = |sql: &mut String, clause: &str, arg: String| {

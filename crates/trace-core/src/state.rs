@@ -258,9 +258,18 @@ impl TraceState {
     }
 }
 
+/// Final usage without a cost is priced from the span's model when the model's price is known.
+// ponytail: provisional (non-final) usage stays unpriced until the final report arrives.
 fn apply_usage(span: &mut Span, u: &Usage, is_final: bool) {
     if is_final {
-        span.usage = Some(u.clone());
+        let mut u = u.clone();
+        if u.cost_usd_micros.is_none()
+            && let Some(cost) = span.model.as_deref().and_then(|m| crate::estimate_cost(m, &u))
+        {
+            u.cost_usd_micros = Some(cost);
+            u.cost_provenance = CostProvenance::Estimate;
+        }
+        span.usage = Some(u);
         span.usage_final = true;
         return;
     }

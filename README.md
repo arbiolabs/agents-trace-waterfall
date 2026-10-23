@@ -23,9 +23,28 @@ trace-tui collector start &
 simulated-live --socket
 trace-tui live
 
-# Record Claude Code sessions as they happen (metadata only).
-trace-tui collector start --tail claude-code=$HOME/.claude/projects
+# Record your agents' sessions as they happen (metadata only).
+trace-tui collector start \
+  --tail claude-code=$HOME/.claude/projects \
+  --tail codex=$HOME/.codex/sessions \
+  --tail pi=$HOME/.pi/agent/sessions \
+  --tail opencode=$HOME/.local/share/opencode/opencode.db
 ```
+
+## Supported harnesses
+
+| Harness | Adapter | Reads | Notes |
+|---|---|---|---|
+| Claude Code | `claude-code` | `~/.claude/projects/**/*.jsonl` | Sub-agents nest under the tool call that launched them. |
+| Codex CLI | `codex` | `~/.codex/sessions/**/rollout-*.jsonl` | Commands, file changes, MCP calls and web searches keep Codex's own timings. Sub-agent threads join the root session under their `spawn_agent` call. |
+| pi | `pi` | `~/.pi/agent/sessions/**/*.jsonl` | Model calls carry pi's request timing and cost estimate. Branches are marked. Sub-agent sessions started during a tool call nest under it, live; runs of pi's sub-agent extension nest once the call returns. Forks and clones stay their own sessions. |
+| OpenCode | `opencode` | `~/.local/share/opencode/opencode.db`, or `~/.local/share/opencode/storage` for 1.x | Read-only; sessions are re-read as they change. Every SQLite version, and 1.x's JSON files. Sub-agent sessions nest under the task call that started them. |
+
+Every harness nests its sub-agents inside the parent's trace, so one session shows the whole run.
+
+Costs a harness doesn't report are estimated from the model's API list price (Claude and GPT-5 / GPT-4 models, cache reads and writes included) and shown as `~$1.20`. On a subscription plan this is what the same usage would cost through the API, not what you are billed. Unknown models stay `—`.
+
+Every adapter records metadata only: turns, model calls, tool names, timings, tokens and cost, never prompt, response or tool text. Any other harness can send events directly through `trace-adapter-sdk` or the socket protocol in [docs/protocol.md](docs/protocol.md). `trace-tui doctor` lists what each adapter cannot observe.
 
 ## Desktop app
 
@@ -48,7 +67,7 @@ Click a span for its details. Drag the overview strip to move through long sessi
 | `trace-tui live` | Sessions overview filtered to live runs. |
 | `trace-tui open <id>` | Open a session's waterfall. Accepts a unique id prefix. |
 | `trace-tui replay <id> --speed 2` | Replay a session on a virtual clock. |
-| `trace-tui import <file> [--adapter claude-code]` | Import JSONL. |
+| `trace-tui import <file> [--adapter claude-code\|codex\|pi\|opencode]` | Import a transcript, or an OpenCode database. |
 | `trace-tui export <id> [-o file]` | Write the normalized journal as JSONL. |
 | `trace-tui collector start [--tail adapter=path]` | Run the ingestion daemon. |
 | `trace-tui doctor` | Check storage, socket, collector, and adapters. |
@@ -76,6 +95,10 @@ projects = []
 [[tail]]
 adapter = "claude-code"
 path = "~/.claude/projects"
+
+[[tail]]
+adapter = "codex"
+path = "~/.codex/sessions"
 ```
 
 ## Layout
