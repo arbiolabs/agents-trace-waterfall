@@ -135,6 +135,9 @@ pub struct TraceApp {
     popover: Pop,
     /// Popover content height from the last frame, so the open and close animations can clip it.
     pop_h: Rc<Cell<f32>>,
+    pop_scroll: ScrollHandle,
+    /// `--popover-scroll-end`: hold the popover's body scrolled to its end.
+    pop_scroll_end: bool,
     hovered: Option<usize>,
     list: UniformListScrollHandle,
     focus: FocusHandle,
@@ -209,6 +212,8 @@ impl TraceApp {
             doc: None,
             popover: Pop::Closed,
             pop_h: Rc::new(Cell::new(0.)),
+            pop_scroll: ScrollHandle::new(),
+            pop_scroll_end: cli.popover_scroll_end,
             hovered: None,
             list: UniformListScrollHandle::new(),
             focus: cx.focus_handle(),
@@ -1444,13 +1449,14 @@ impl TraceApp {
         let mut errors: Vec<usize> = doc.state.spans.values().filter(|s| s.status == SpanStatus::Failed).map(|s| (g.ov_x(s.started_at_utc_ns).max(0.) as usize).min(cols - 1)).collect();
         errors.sort_unstable();
         errors.dedup();
-        marks.extend(errors.into_iter().map(|i| (i as f32, -3., LANES_H + 6., pal.error.mark)));
+        // A rug above the lanes, so even hundreds of failures never hide the density beneath.
+        marks.extend(errors.into_iter().map(|i| (i as f32, -7., 4., pal.error.mark)));
         let (a, b) = g.window();
         let (lx0, lx1) = present::lens_rect(g.ov_x(a), g.ov_x(b), g.tl_w);
         let thin = g.ov_x(b) - g.ov_x(a) < present::LENS_MIN;
         let this = cx.entity().downgrade();
         let strip = canvas(|_, _, _| {}, move |bounds, _, window, _| {
-            let top = bounds.origin.y + (bounds.size.height - px(LANES_H)) / 2.;
+            let top = bounds.origin.y + (bounds.size.height - px(LANES_H)) / 2. + px(3.);
             for (x, y, h, color) in &marks {
                 window.paint_quad(fill(Bounds::new(point(bounds.origin.x + px(*x), top + px(*y)), size(px(1.), px(*h))), *color));
             }
@@ -2065,6 +2071,12 @@ impl TraceApp {
         // GPUI has no element scale, so the card's bounds shrink toward the bar while the content holds
         // still underneath, clipped.
         let final_h = natural.min(place.max_h);
+        if self.pop_scroll_end {
+            self.pop_scroll.scroll_to_bottom();
+        }
+        // The body scrolls when it outgrows the room; a fade at the bottom says there is more until its end.
+        let max_scroll = self.pop_scroll.max_offset().y.to_f64() as f32;
+        let more_below = natural > final_h + 1. && -(self.pop_scroll.offset().y.to_f64() as f32) < max_scroll - 1.;
         let h = final_h * scale;
         let y = if place.above { place.y + final_h - h } else { place.y };
         let arrow_x = place.arrow_x - place.x - present::POP_ARROW;
@@ -2115,7 +2127,19 @@ impl TraceApp {
                 cx.notify();
             }))
             .on_click(|_, _, cx| cx.stop_propagation())
-            .child(div().id("pop-scroll").size_full().overflow_y_scroll().child(content));
+            .child(div().id("pop-scroll").size_full().overflow_y_scroll().track_scroll(&self.pop_scroll).on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify())).child(content))
+            .when(more_below, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(24.))
+                        .rounded_b(px(16.))
+                        .bg(linear_gradient(180., linear_color_stop(pal.pop.opacity(0.), 0.), linear_color_stop(pal.pop, 1.))),
+                )
+            });
         Some(
             deferred(
                 anchored()

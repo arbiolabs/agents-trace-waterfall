@@ -38,6 +38,9 @@ pub struct Cli {
     /// Fold and unfold the biggest subtree near the top for 300 frames, print frame timing, and quit.
     #[arg(long, hide = true)]
     pub bench_fold: bool,
+    /// With `--popover`, scroll the popover's body to its end, for screenshots.
+    #[arg(long, hide = true)]
+    pub popover_scroll_end: bool,
     /// Hold every transition at this progress, 0 to 1, for screenshots. With `--select`, folds the
     /// selected span; with `--popover`, holds the popover opening.
     #[arg(long, hide = true)]
