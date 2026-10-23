@@ -1,0 +1,61 @@
+[
+  {
+    "role": "user",
+    "ts": 1792781986097,
+    "content": [
+      {
+        "type": "text",
+        "text": "(text)"
+      },
+      {
+        "type": "text",
+        "text": "(text)"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "ts": 1792782069395,
+    "content": [
+      {
+        "type": "tool_result",
+        "tool_use_id": "call_oko9oks6",
+        "content": ""
+      },
+      {
+        "type": "text",
+        "text": "(text)"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "ts": 1792782214363,
+    "content": [
+      {
+        "type": "tool_result",
+        "tool_use_id": "call_gefd9zuq",
+        "content": "Exit code: 1"
+      },
+      {
+        "type": "text",
+        "text": "(text)"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "ts": 1792782615611,
+    "content": [
+      {
+        "type": "tool_result",
+        "tool_use_id": "call_008gip3a",
+        "content": ""
+      },
+      {
+        "type": "text",
+        "text": "(text)"
+      }
+    ]
+  }
+]

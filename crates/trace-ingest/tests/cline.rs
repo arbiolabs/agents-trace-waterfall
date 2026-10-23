@@ -159,6 +159,31 @@ fn a_child_task_read_alone_joins_its_root_under_the_spawning_call() {
     assert_eq!(sub.parent_span_id, Some(SpanId(format!("tool:roo-main:{}", ms(6.)))));
 }
 
+/// A live Roo CLI 0.1.17 run (qwen3:8b), text stripped by the fixture script: read a file, run a failing
+/// command, delegate a search to a `new_task` child, complete.
+#[test]
+fn a_live_roo_recording() {
+    let tasks = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/roo/tasks");
+    let mut store = Store::open_in_memory().unwrap();
+    import_file(&mut store, &tasks, "roo", &Capture::default()).unwrap();
+    let sessions = store.list_sessions(&SessionFilter::default()).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!((sessions[0].project_id.as_str(), sessions[0].turn_count), ("conf", 1));
+    let s = store.load_session(&sessions[0].session_id).unwrap();
+    let (main, child) = ("01a16a22-28b1-7499-9b23-94192e87e4f3", "01a16a26-d2b1-749e-a189-85725a978a66");
+    let mut tools: Vec<_> = s.spans.values().filter(|x| x.kind == SpanKind::Tool).map(|x| (x.started_at_utc_ns, x.name.as_str(), x.status)).collect();
+    tools.sort_by_key(|t| t.0);
+    let tools: Vec<_> = tools.into_iter().map(|(_, n, st)| (n, st)).collect();
+    assert_eq!(tools, [("readFile", SpanStatus::Succeeded), ("execute_command", SpanStatus::Failed), ("newTask", SpanStatus::Succeeded), ("searchFiles", SpanStatus::Succeeded)]);
+    let sub = &s.spans[&SpanId(format!("subagent:{child}"))];
+    assert_eq!((sub.parent_span_id.clone(), sub.status), (Some(SpanId(format!("tool:{main}:1792782291120"))), SpanStatus::Succeeded));
+    let calls = s.spans.values().filter(|x| x.kind == SpanKind::Llm).count();
+    assert_eq!(calls, 8, "four model calls each, the child's retried one included");
+    let first = &s.spans[&SpanId(format!("llm:{main}:1792781985985"))];
+    let u = first.usage.as_ref().unwrap();
+    assert_eq!((u.tokens_input, u.tokens_output, u.cost_usd_micros), (Some(9626), Some(425), Some(28_878)));
+}
+
 /// Prints the span tree of a real recording: `ROO_TASKS=<tasks folder> cargo test -p trace-ingest --test cline -- --ignored --nocapture`.
 #[test]
 #[ignore]
