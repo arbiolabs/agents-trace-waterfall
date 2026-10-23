@@ -345,3 +345,19 @@ fn list_sessions_filters_and_totals() {
     store.rebuild_projections().unwrap();
     assert_eq!(store.list_sessions(&SessionFilter::default()).unwrap(), all);
 }
+
+#[test]
+fn annotations_survive_rebuild_blank_clears_and_purge_drops() {
+    let mut store = Store::open_in_memory().unwrap();
+    store.append(&fixture("s1", "p", "a")).unwrap();
+    let (s1, tool) = (SessionId::from("s1"), SpanId::from("tool"));
+    store.set_annotation(&s1, &tool, "flaky: retry with sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123").unwrap();
+    store.rebuild_projections().unwrap();
+    let notes = store.annotations(&s1).unwrap();
+    assert!(notes[&tool].starts_with("flaky: retry with ") && !notes[&tool].contains("abcdefghijklmnop"), "{notes:?}");
+    store.set_annotation(&s1, &tool, "  ").unwrap();
+    assert!(store.annotations(&s1).unwrap().is_empty());
+    store.set_annotation(&s1, &tool, "keep").unwrap();
+    store.purge(Some(101), None).unwrap();
+    assert!(store.annotations(&s1).unwrap().is_empty());
+}

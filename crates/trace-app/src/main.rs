@@ -122,6 +122,7 @@ fn main() -> anyhow::Result<()> {
             KeyBinding::new("cmd-]", NextEvent, None),
             KeyBinding::new("cmd-[", PrevEvent, None),
             KeyBinding::new("enter", Inspect, Some(ROWS_CONTEXT)),
+            KeyBinding::new("n", AddNote, Some(ROWS_CONTEXT)),
             KeyBinding::new("cmd-c", CopySpanName, Some(ROWS_CONTEXT)),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());

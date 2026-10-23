@@ -3,7 +3,7 @@ use crate::present::{self, Change, Edge, Grab, Group, LabelAt, Shape, SidebarMod
 use crate::theme::{KindColors, Palette};
 use chrono::{Local, TimeZone};
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -12,7 +12,7 @@ use gpui_kit::component::{Icon, Sizable, Theme, ThemeMode};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -57,7 +57,7 @@ gpui_kit::actions!(
     trace_waterfall,
     [
         Quit, About, Import, ExportSession, ToggleSidebar, ZoomIn, ZoomOut, ZoomToFit, Follow, Replay, NextEvent, PrevEvent,
-        Inspect, ZoomToSpan, ToggleBranch, CopySpanName, CopySpanJson, ExportSpanJson, ShowInReplay
+        Inspect, AddNote, ZoomToSpan, ToggleBranch, CopySpanName, CopySpanJson, ExportSpanJson, ShowInReplay
     ]
 );
 
@@ -212,6 +212,11 @@ pub struct TraceApp {
     session_search: Entity<InputState>,
     span_search: Entity<InputState>,
     span_search_open: bool,
+    /// The open session's span notes, kept in step with the store.
+    notes: BTreeMap<SpanId, String>,
+    note: Entity<TextareaState>,
+    /// The span whose note the editor holds.
+    note_span: Option<SpanId>,
     forced_dark: Option<bool>,
     last_frame: Instant,
     last_poll: Instant,
@@ -257,7 +262,14 @@ impl TraceApp {
     ) -> Self {
         let session_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search sessions"));
         let span_search = cx.new(|cx| InputState::new(window, cx).placeholder("Filter spans"));
+        let note = cx.new(|cx| TextareaState::new(window, cx).placeholder("Add a note").auto_grow(2, 8));
         let subs = vec![
+            cx.subscribe(&note, |this: &mut Self, state, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    this.save_note(state.read(cx).value().to_string());
+                    cx.notify();
+                }
+            }),
             cx.subscribe(&session_search, |this: &mut Self, _, ev: &InputEvent, cx| {
                 if matches!(ev, InputEvent::Change) {
                     this.refresh_sessions(cx);
@@ -296,6 +308,9 @@ impl TraceApp {
             session_search,
             span_search,
             span_search_open: false,
+            notes: BTreeMap::new(),
+            note,
+            note_span: None,
             forced_dark,
             last_frame: Instant::now(),
             last_poll: Instant::now(),
@@ -451,6 +466,8 @@ impl TraceApp {
                 let now = Instant::now();
                 self.seen = doc.state.spans.keys().map(|k| (k.clone(), now)).collect();
                 self.reveal_until = now + REVEAL;
+                self.notes = self.store.annotations(doc.session_id()).unwrap_or_default();
+                self.note_span = None;
                 self.doc = Some(doc);
                 self.zoomed = false;
                 self.popover = Pop::Closed;
@@ -535,6 +552,43 @@ impl TraceApp {
     fn close_popover(&mut self) {
         if let Pop::Open(_) = self.popover {
             self.popover = Pop::Closing(Instant::now());
+        }
+    }
+
+    /// Opens the popover on the selected span with its note focused.
+    fn edit_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.doc.as_ref().is_none_or(|d| d.selected.is_none()) {
+            return;
+        }
+        if !matches!(self.popover, Pop::Open(_)) {
+            self.popover = Pop::Open(Instant::now());
+        }
+        self.note.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    /// Points the note editor at the popover's span, so it never shows another span's note.
+    fn sync_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let want = match self.popover {
+            Pop::Open(_) => self.doc.as_ref().and_then(|d| d.selected.clone()),
+            _ => self.note_span.clone(),
+        };
+        if want != self.note_span {
+            let text = want.as_ref().and_then(|id| self.notes.get(id)).cloned().unwrap_or_default();
+            self.note_span = want;
+            self.note.update(cx, |s, cx| s.set_value(text, window, cx));
+        }
+    }
+
+    // ponytail: one write per keystroke; debounce if typing ever lags on a slow disk.
+    fn save_note(&mut self, text: String) {
+        let (Some(doc), Some(span)) = (&self.doc, &self.note_span) else { return };
+        if let Err(e) = self.store.set_annotation(doc.session_id(), span, &text) {
+            self.error = Some(format!("{e:#}"));
+        } else if text.trim().is_empty() {
+            self.notes.remove(span);
+        } else {
+            self.notes.insert(span.clone(), text);
         }
     }
 
@@ -742,7 +796,9 @@ impl TraceApp {
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
-        let typing = self.span_search.read(cx).focus_handle(cx).is_focused(window) || self.session_search.read(cx).focus_handle(cx).is_focused(window);
+        let typing = [self.span_search.read(cx).focus_handle(cx), self.session_search.read(cx).focus_handle(cx), self.note.read(cx).focus_handle(cx)]
+            .iter()
+            .any(|f| f.is_focused(window));
         if typing {
             if ks.key == "escape" {
                 self.focus.focus(window, cx);
@@ -954,6 +1010,7 @@ impl TraceApp {
                 cx.notify();
             }
         }))
+        .on_action(cx.listener(|this, _: &AddNote, window, cx| this.edit_note(window, cx)))
         .on_action(cx.listener(|this, _: &ZoomToSpan, _, cx| {
             if let Some(s) = span(this) {
                 this.zoom_to_span(&s.span_id);
@@ -1032,6 +1089,7 @@ impl Render for TraceApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let built = Instant::now();
         self.bench_fold();
+        self.sync_note(window, cx);
         let vw = window.viewport_size().width.to_f64() as f32;
         let (sw, sliding) = self.sidebar_w(vw);
         if self.tick() || sliding || self.bench.is_some() {
@@ -1973,8 +2031,10 @@ impl TraceApp {
         let body = body.context_menu(move |menu, _, cx| {
             let Some(app) = app.upgrade() else { return menu };
             let (branch, collapsed) = app.read(cx).selected_branch();
+            let noted = app.read(cx).doc.as_ref().and_then(|d| d.selected.as_ref()).is_some_and(|id| app.read(cx).notes.contains_key(id));
             menu.action_context(focus.clone())
                 .menu("Inspect", Box::new(Inspect))
+                .menu(if noted { "Edit Note" } else { "Add Note" }, Box::new(AddNote))
                 .menu("Zoom to Fit", Box::new(ZoomToSpan))
                 .menu_with_disabled(if collapsed { "Expand Branch" } else { "Collapse Branch" }, Box::new(ToggleBranch), !branch)
                 .separator()
@@ -2393,7 +2453,16 @@ impl TraceApp {
                     })
                     .when_some(detail, |el, d| el.child(div().flex_shrink(8.).min_w(px(0.)).max_w(px(160.)).truncate().text_size(px(12.5)).text_color(pal.muted).child(d)))
                     .when(running, |el| el.child(Spinner::new().color(pal.accent).with_size(px(12.))))
-                    .when(s.status == SpanStatus::Failed, |el| el.child(Icon::new(IconName::TriangleAlert).size(px(13.)).text_color(pal.error.ink))),
+                    .when(s.status == SpanStatus::Failed, |el| el.child(Icon::new(IconName::TriangleAlert).size(px(13.)).text_color(pal.error.ink)))
+                    .when_some(self.notes.get(id).cloned(), |el, note| {
+                        el.child(
+                            div()
+                                .id(("note", key))
+                                .flex_shrink_0()
+                                .child(Icon::new(IconName::StickyNote).size(px(13.)).text_color(pal.muted))
+                                .tooltip(move |w, cx| Tooltip::new(note.clone()).build(w, cx)),
+                        )
+                    }),
             );
 
         let timeline = match hint {
@@ -2710,6 +2779,23 @@ impl TraceApp {
                         // A short last row keeps the column widths of the rows above.
                         div().flex().gap(px(10.)).children(row.iter().map(cell)).children((row.len()..3).map(|_| div().flex_1()))
                     })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(div().text_size(px(11.5)).font_weight(FontWeight::MEDIUM).text_color(pal.muted).child("Note"))
+                    .child(
+                        div()
+                            .px(px(8.))
+                            .py(px(6.))
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(pal.line)
+                            .text_size(px(12.5))
+                            .child(Textarea::new(&self.note).appearance(false).tab_index(TAB_POPOVER).aria_label("Note")),
+                    ),
             )
             .when_some(s.error.clone().or_else(|| (s.status == SpanStatus::Failed).then(|| "Failed without an error message".into())), |el, e| {
                 el.child(

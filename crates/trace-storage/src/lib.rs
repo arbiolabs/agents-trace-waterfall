@@ -94,6 +94,15 @@ CREATE TABLE payloads (
 );
 CREATE INDEX payloads_by_session ON payloads (session_id);
 CREATE INDEX payloads_by_stored ON payloads (stored_at);
+"#, r#"
+-- The user's notes on spans. Not journal events: a trace records what ran, notes are about it.
+CREATE TABLE annotations (
+    session_id TEXT NOT NULL,
+    span_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, span_id)
+);
 "#];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -340,7 +349,7 @@ impl Store {
                 stmt.query_map([cutoff], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
             };
             for id in &ids {
-                for table in ["events", "spans", "usage", "payloads", "sessions"] {
+                for table in ["events", "spans", "usage", "payloads", "annotations", "sessions"] {
                     tx.execute(&format!("DELETE FROM {table} WHERE session_id = ?1"), [id])?;
                 }
             }
@@ -366,6 +375,27 @@ impl Store {
 
     pub fn get_payload(&self, payload_ref: &str) -> Result<Option<Vec<u8>>> {
         Ok(self.conn.query_row("SELECT bytes FROM payloads WHERE payload_ref = ?1", [payload_ref], |r| r.get(0)).optional()?)
+    }
+
+    /// The session's span notes.
+    pub fn annotations(&self, session: &SessionId) -> Result<BTreeMap<SpanId, String>> {
+        let mut stmt = self.conn.prepare("SELECT span_id, text FROM annotations WHERE session_id = ?1")?;
+        let rows = stmt.query_map([&session.0], |r| Ok((SpanId(r.get(0)?), r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Replaces the span's note after redaction; blank text removes it.
+    pub fn set_annotation(&mut self, session: &SessionId, span: &SpanId, text: &str) -> Result<()> {
+        if text.trim().is_empty() {
+            self.conn.execute("DELETE FROM annotations WHERE session_id = ?1 AND span_id = ?2", params![session.0, span.0])?;
+            return Ok(());
+        }
+        let updated_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as i64;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO annotations (session_id, span_id, text, updated_at) VALUES (?1, ?2, ?3, ?4)",
+            params![session.0, span.0, redact::redact(text), updated_at],
+        )?;
+        Ok(())
     }
 
     /// Recomputes every projection from the journal.
