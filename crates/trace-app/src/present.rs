@@ -164,7 +164,7 @@ pub fn harness_brand(harness: &str, source_adapter: &str) -> Option<Brand> {
         "Junie" => Logo::Junie,
         "Devin" => Logo::Devin,
         "Qwen Code" => Logo::Qwen,
-        "Kimi Code" => Logo::Kimi,
+        "Kimi CLI" | "Kimi Code" => Logo::Kimi,
         "Grok CLI" => Logo::Grok,
         _ => return None,
     };

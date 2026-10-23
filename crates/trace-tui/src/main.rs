@@ -175,6 +175,9 @@ fn main() -> anyhow::Result<()> {
                 .map(|t| (t.adapter.clone(), t.path.clone()))
                 .collect();
             all.extend(tail);
+            if all.is_empty() {
+                all = trace_ingest::default_tails();
+            }
             trace_ingest::run_collector(trace_ingest::CollectorConfig {
                 socket_path: cfg.socket_path(),
                 db_path: db,

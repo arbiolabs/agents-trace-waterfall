@@ -40,11 +40,31 @@ pub(crate) enum Cmd {
     Reconcile,
 }
 
-/// [`crate::run_collector`] that also stops when `stop` fires or its sender is dropped.
+/// Runs the collector until `stop` fires or its sender is dropped. Leaves signals to the host process.
 pub fn run_collector_until(
     cfg: CollectorConfig,
     stop: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
+    run(cfg, async {
+        let _ = stop.await;
+    })
+}
+
+/// Runs the collector until SIGINT or SIGTERM: for the standalone daemon, which owns its process.
+pub(crate) fn run_until_signal(cfg: CollectorConfig) -> anyhow::Result<()> {
+    run(cfg, async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match (signal(SignalKind::interrupt()), signal(SignalKind::terminate())) {
+            (Ok(mut int), Ok(mut term)) => tokio::select! {
+                _ = int.recv() => {}
+                _ = term.recv() => {}
+            },
+            (Err(e), _) | (_, Err(e)) => eprintln!("collector: cannot watch signals: {e}"),
+        }
+    })
+}
+
+fn run(cfg: CollectorConfig, stop: impl std::future::Future<Output = ()>) -> anyhow::Result<()> {
     claim_socket(&cfg.socket_path)?;
     let store = Store::open(&cfg.db_path)?;
     let (tx, rx) = mpsc::channel(WRITE_QUEUE);
@@ -102,9 +122,9 @@ fn claim_socket(path: &Path) -> anyhow::Result<()> {
 async fn serve(
     cfg: &CollectorConfig,
     tx: mpsc::Sender<Cmd>,
-    mut stop: oneshot::Receiver<()>,
+    stop: impl std::future::Future<Output = ()>,
 ) -> anyhow::Result<()> {
-    use tokio::signal::unix::{SignalKind, signal};
+    tokio::pin!(stop);
     if let Some(addr) = cfg.otlp {
         // The receiver writes to the store unauthenticated, so it listens on this machine only.
         ensure!(addr.ip().is_loopback(), "otlp = {addr} is not a loopback address");
@@ -119,10 +139,6 @@ async fn serve(
         "collector: listening on {}, database {}",
         cfg.socket_path.display(),
         cfg.db_path.display()
-    );
-    let (mut int, mut term) = (
-        signal(SignalKind::interrupt())?,
-        signal(SignalKind::terminate())?,
     );
     let mut reconcile = tokio::time::interval_at(
         tokio::time::Instant::now() + RECONCILE_EVERY,
@@ -143,8 +159,6 @@ async fn serve(
                 }
                 Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
             },
-            _ = int.recv() => break,
-            _ = term.recv() => break,
             _ = &mut stop => break,
         }
     }

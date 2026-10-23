@@ -1500,7 +1500,12 @@ impl TraceApp {
             n => Some(format!("{n} turns")),
         };
         let how = join(vec![present::harness_label(&s.harness, &s.source_adapter), s.model.as_deref().map(present::pretty_model), turns.clone()]);
-        let meta = join(vec![when, dur, s.totals.cost_usd_micros().map(|_| format_total_cost(&s.totals))]);
+        let facts: Vec<(IconName, String)> = [(IconName::Calendar, when), (IconName::Timer, dur), (IconName::CircleDollarSign, s.totals.cost_usd_micros().map(|_| format_total_cost(&s.totals)))]
+            .into_iter()
+            .filter_map(|(icon, text)| Some((icon, text?)))
+            .collect();
+        let last = facts.len().saturating_sub(1);
+        let meta = facts.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(" · ");
         let status = present::session_status(s.status, s.last_event_at_utc_ns, trace_view::wall_ns());
         let id = s.session_id.clone();
         let menu_id = s.session_id.clone();
@@ -1536,7 +1541,12 @@ impl TraceApp {
                     .gap(px(1.))
                     .child(div().truncate().text_size(px(13.)).font_weight(FontWeight::MEDIUM).text_color(pal.ink).child(title))
                     .when(!how.is_empty(), |el| el.child(div().truncate().text_size(px(11.5)).text_color(pal.text).child(how)))
-                    .child(div().truncate().text_size(px(11.5)).text_color(pal.muted).font_features(tnum()).child(meta)),
+                    .child(
+                        div().flex().items_center().gap(px(8.)).min_w(px(0.)).text_size(px(11.5)).text_color(pal.muted).font_features(tnum()).children(facts.into_iter().enumerate().map(|(i, (icon, text))| {
+                            // Only the cost, last, gives way: the date and duration read whole.
+                            div().flex().when(i < last, |el| el.flex_none()).min_w(px(0.)).items_center().gap(px(4.)).child(Icon::new(icon).flex_none().size(px(11.)).text_color(pal.muted)).child(div().truncate().child(text))
+                        })),
+                    ),
             )
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, _| this.menu_target = Some(MenuTarget::Session(menu_id.clone()))))
             .on_click(cx.listener(move |this, _, _, cx| {

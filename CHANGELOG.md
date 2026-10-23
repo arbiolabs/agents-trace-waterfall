@@ -6,7 +6,23 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-23
+
+Twelve more harnesses and an OpenTelemetry receiver, live sessions that stay live without a separate
+collector, and replay that follows a session still being recorded.
+
 ### Added
+
+- Adapters for Gemini CLI, Qwen Code, Kilo Code, GitHub Copilot CLI, Cline (classic and 4.x), Roo Code,
+  Kimi Code, Kimi CLI, Crush, OpenClaw, Hermes Agent and Grok CLI, each checked against a real recording
+  where the harness could run against a local model. Sub-agents nest wherever the harness links them;
+  what a harness cannot record is listed by `doctor`.
+- An OpenTelemetry receiver (`otlp = "127.0.0.1:4318"`): OTLP/HTTP traces in JSON or protobuf, mapped by
+  the GenAI and OpenInference conventions. Goose and Qwen Code verified.
+- The desktop app runs the collector itself when none is running, and the collector watches every
+  harness's default location it finds when no sources are configured.
+- Session cards mark date, duration and cost with icons.
+- Gemini list prices for cost estimates.
 
 - Replaying a session that is still running follows the recording as it grows: playback waits at the
   live edge and plays on as the agent works. Both frontends mark it: a pulsing Recording pill, a LIVE
@@ -18,6 +34,9 @@ All notable changes to this project are documented here. The format follows
 - Codex rollouts compressed to `.jsonl.zst` are read, and archived sessions can be tailed.
 
 ### Fixed
+
+- OpenCode (before 2.0) and Kilo: a model call starts when its request was made and ends at its first
+  tool, not at the first token and after its tools ran.
 
 - OpenCode: a shell command that exits non-zero is a failed tool (OpenCode marks it completed with the
   exit code in its metadata). A fork no longer repeats its parent's copied history, and context
@@ -119,6 +138,7 @@ terminal UI over the same recorded traces.
   time axis and previous / next activity (`{` / `}`).
 - Unicode and ASCII glyphs, colour and monochrome themes. Usable down to 60×18.
 
-[Unreleased]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/diego-arbio-dev/agents-trace-waterfall/releases/tag/v1.0.0

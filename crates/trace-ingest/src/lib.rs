@@ -76,9 +76,45 @@ impl Capture {
     }
 }
 
+/// Where each harness keeps its sessions by default, for those present on this machine: what the collector
+/// tails when the config names nothing.
+pub fn default_tails() -> Vec<(String, PathBuf)> {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    [
+        ("claude-code", ".claude/projects"),
+        ("codex", ".codex/sessions"),
+        ("codex", ".codex/archived_sessions"),
+        ("pi", ".pi/agent/sessions"),
+        ("omp", ".omp/agent/sessions"),
+        ("opencode", ".local/share/opencode/opencode.db"),
+        ("kilo", ".local/share/kilo/kilo.db"),
+        ("gemini-cli", ".gemini/tmp"),
+        ("qwen-code", ".qwen/projects"),
+        ("copilot", ".copilot/session-state"),
+        ("cline", "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/tasks"),
+        ("cline", ".cline/data"),
+        ("roo", "Library/Application Support/Code/User/globalStorage/rooveterinaryinc.roo-cline/tasks"),
+        ("kimi", ".kimi"),
+        ("kimi-code", ".kimi-code"),
+        ("crush", ".local/share/crush/projects.json"),
+        ("openclaw", ".openclaw"),
+        ("hermes", ".hermes/state.db"),
+        ("grok", ".grok/sessions"),
+    ]
+    .into_iter()
+    .map(|(a, p)| (a.to_owned(), home.join(p)))
+    .filter(|(_, p)| p.exists())
+    .collect()
+}
+
 /// Runs until SIGINT/SIGTERM. Blocking; owns its own Tokio runtime.
 pub fn run_collector(cfg: CollectorConfig) -> anyhow::Result<()> {
-    let (_never, stop) = tokio::sync::oneshot::channel();
+    collector::run_until_signal(cfg)
+}
+
+/// Runs the collector inside another program until that program exits, leaving its signals alone.
+pub fn run_collector_in_process(cfg: CollectorConfig) -> anyhow::Result<()> {
+    let (_keep, stop) = tokio::sync::oneshot::channel();
     run_collector_until(cfg, stop)
 }
 

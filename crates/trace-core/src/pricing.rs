@@ -30,6 +30,11 @@ const fn openai(input: f64, cached: f64, output: f64) -> Price {
     Price { input, output, cache_read: cached, cache_write: 0. }
 }
 
+/// Google bills cached input at a tenth of the input rate, and storage by the hour, which a call never shows.
+const fn gemini(input: f64, output: f64) -> Price {
+    Price { input, output, cache_read: input * 0.1, cache_write: 0. }
+}
+
 /// Model family → price. Matched on the normalized model name, exactly or before a `-YYYYMMDD` snapshot date.
 const PRICES: &[(&str, Price)] = &[
     ("claude-fable-5-1", with_cache_read(claude(10., 50.), 0.25)),
@@ -61,11 +66,19 @@ const PRICES: &[(&str, Price)] = &[
     ("gpt-4.1-mini", openai(0.40, 0.10, 1.60)),
     ("gpt-4o", openai(2.50, 1.25, 10.)),
     ("gpt-4o-mini", openai(0.15, 0.075, 0.60)),
+    ("gemini-3-pro-preview", gemini(2., 12.)),
+    ("gemini-2.5-pro", gemini(1.25, 10.)),
+    ("gemini-2.5-flash", gemini(0.30, 2.50)),
+    ("gemini-2.5-flash-lite", gemini(0.10, 0.40)),
 ];
 
 /// Above this many prompt tokens (fresh, cached and cache-written input together), these models bill
 /// at a higher rate.
-const LONG_PROMPT: &[(&str, u64, Price)] = &[("claude-haiku-5-5", 100_000, claude(0.50, 2.50))];
+const LONG_PROMPT: &[(&str, u64, Price)] = &[
+    ("claude-haiku-5-5", 100_000, claude(0.50, 2.50)),
+    ("gemini-3-pro-preview", 200_000, gemini(4., 18.)),
+    ("gemini-2.5-pro", 200_000, gemini(2.50, 15.)),
+];
 
 /// `anthropic/claude-opus-4-1-20250805[1m]`, `us.anthropic.claude-sonnet-4-5` → `claude-…`; lowercase,
 /// provider and region prefixes and bracketed context tags dropped.

@@ -1000,7 +1000,7 @@ fn opencode_1_json_storage_reads_steps_tools_and_sub_agents() {
     assert_eq!(ids, ["ses_a"]);
     let s = store.load_session(&"ses_a".into()).unwrap();
     let step1 = span_of(&s, "llm:prt_01");
-    assert_eq!((step1.started_at_utc_ns, step1.ended_at_utc_ns), ((b + 100) * MS, Some((b + 6000) * MS)), "a step runs from where the reply got to until its parts' latest end");
+    assert_eq!((step1.started_at_utc_ns, step1.ended_at_utc_ns), ((b + 100) * MS, Some((b + 1600) * MS)), "a step runs from where the reply got to until its first tool starts");
     assert_eq!(step1.usage.as_ref().unwrap().cost_usd_micros, Some(2000));
     let step2 = span_of(&s, "llm:prt_05");
     assert_eq!((step2.started_at_utc_ns, step2.ended_at_utc_ns), ((b + 6000) * MS, Some((b + 8000) * MS)));

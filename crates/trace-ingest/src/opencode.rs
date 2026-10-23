@@ -174,24 +174,31 @@ impl TraceAdapter for OpenCode {
                 let parts = v["parts"].as_array().map(Vec::as_slice).unwrap_or_default();
                 let mut step: Option<SpanId> = None;
                 let mut steps = 0;
+                // Parts are stamped when written: a step's start part at its first token, its finish part
+                // after its tools ran. The request began with the message, and the answer ended at the first tool.
+                let mut first_tool: Option<i64> = None;
                 for p in parts {
                     let (pd, at) = (&p["data"], ms(&p["time_created"]).unwrap_or(ts));
                     match pd["type"].as_str() {
                         Some("step-start") => {
                             steps += 1;
                             let llm = span("llm", p["id"].as_str().unwrap_or(id));
-                            model_call(&mut e, &llm, &parent, at, model, provider);
+                            model_call(&mut e, &llm, &parent, if steps == 1 { ts.min(at) } else { at }, model, provider);
+                            first_tool = None;
                             step = Some(llm);
                         }
                         Some("step-finish") => {
                             if let Some(llm) = step.take() {
+                                let at = first_tool.map_or(at, |t| t.min(at));
                                 usage(&mut e, &llm, at, &pd["tokens"], &pd["cost"]);
                                 e.end(format!("end:{llm}"), &llm, at, SpanStatus::Succeeded, None);
                             }
                         }
                         Some("tool") => {
                             let t = &pd["state"]["time"];
-                            tool(&mut e, &parent, pd["callID"].as_str(), pd["tool"].as_str(), ms(&t["start"]).unwrap_or(at), ms(&t["end"]), &pd["state"]);
+                            let start = ms(&t["start"]).unwrap_or(at);
+                            first_tool.get_or_insert(start);
+                            tool(&mut e, &parent, pd["callID"].as_str(), pd["tool"].as_str(), start, ms(&t["end"]), &pd["state"]);
                         }
                         _ => {}
                     }

@@ -97,11 +97,31 @@ fn window_bounds() -> Bounds<Pixels> {
     parsed.unwrap_or_else(|| Bounds::new(point(px(120.), px(80.)), size(px(1440.), px(900.))))
 }
 
+/// Live sessions stay live without a separate `collector start`: when no collector answers on the socket,
+/// the app runs one until it quits, tailing the configured sources or else every harness found here.
+fn run_collector_unless_running(cfg: &trace_tui::config::Config, db: std::path::PathBuf) {
+    let socket = cfg.socket_path();
+    if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+        return;
+    }
+    let mut tail: Vec<_> = cfg.tail.iter().map(|t| (t.adapter.clone(), t.path.clone())).collect();
+    if tail.is_empty() {
+        tail = trace_ingest::default_tails();
+    }
+    let collector = trace_ingest::CollectorConfig { socket_path: socket, db_path: db, stale_after: std::time::Duration::from_secs(300), tail, capture: cfg.capture.clone(), otlp: cfg.otlp };
+    std::thread::spawn(move || {
+        if let Err(e) = trace_ingest::run_collector_in_process(collector) {
+            eprintln!("collector: {e:#}");
+        }
+    });
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cfg = trace_tui::config::Config::load()?;
     let db = cli.db.clone().unwrap_or_else(|| cfg.db_path());
     let store = trace_storage::Store::open(&db)?;
+    run_collector_unless_running(&cfg, db.clone());
     let forced_dark = cli.appearance.as_deref().map(|a| a == "dark");
     application().with_assets(Assets).run(move |cx| {
         gpui_kit::init(cx);
