@@ -256,3 +256,27 @@ fn replay_jumps_across_idle_time() {
     doc.layout(100);
     assert_eq!(doc.viewport.unwrap().folds, doc.folds);
 }
+
+#[test]
+fn player_reads_active_time_and_names_the_overall_length() {
+    assert_eq!((clock_time(65 * 1_000_000_000), clock_time(3_725 * 1_000_000_000)), ("1:05".into(), "1:02:05".into()));
+    let d = 86_400 * 1_000_000_000i64;
+    assert_eq!((spoken_span(14 * d), spoken_span(d), spoken_span(5 * 3_600_000_000_000), spoken_span(12 * 60_000_000_000), spoken_span(40_000_000_000)), ("14 days".into(), "24 hours".into(), "5 hours".into(), "12 minutes".into(), "40 seconds".into()));
+    assert_eq!(spoken_span(335 * 3_600_000_000_000 + 1_800_000_000_000), "14 days", "335h30m rounds to 14 days, not down to 13");
+
+    const H: Ns = 3_600_000 * MS;
+    let events = vec![
+        ev(1, 0, None, json!({"event_type": "session.started", "body": {"project_id": "p"}})),
+        start(2, 0, "root", None, "agent"),
+        start(3, 0, "a", Some("root"), "tool"),
+        end(4, H, "a", "succeeded"),
+        start(5, 10 * H, "b", Some("root"), "tool"),
+        end(6, 11 * H, "b", "succeeded"),
+        end(7, 11 * H, "root", "succeeded"),
+    ];
+    let mut doc = TraceDoc::new(TraceState::from_events("s1".into(), &events[..2]), Mode::Replay { replay: Replay::new("s1".into(), events.clone()), clock: ReplayClock::new(10 * H + H / 2) }, 0);
+    assert_eq!(doc.replay_times(), Some((H + H / 2, 2 * H, 11 * H)), "an hour and a half into two active hours, eleven hours overall");
+    doc.seek_active(0.75);
+    let Mode::Replay { clock, .. } = &doc.mode else { unreachable!() };
+    assert_eq!(clock.position, 10 * H + H / 2, "three quarters of the active time is past the idle stretch");
+}

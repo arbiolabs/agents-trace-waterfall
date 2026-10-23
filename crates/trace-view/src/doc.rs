@@ -1,4 +1,4 @@
-use crate::{Folds, Row, RowKind, Viewport, flatten, folds_for, format_duration};
+use crate::{Folds, Row, RowKind, Viewport, clock_time, flatten, folds_for, format_duration, spoken_span};
 use anyhow::Context;
 use std::collections::HashSet;
 use std::io::Write;
@@ -319,6 +319,23 @@ impl TraceDoc {
         self.refresh();
     }
 
+    /// Replay only: where the clock is in active time (idle folded out), the recording's active length, and
+    /// its wall-clock length.
+    pub fn replay_times(&self) -> Option<(Ns, Ns, Ns)> {
+        let Mode::Replay { replay, clock } = &self.mode else { return None };
+        let (start, end, f) = (replay.start()?, replay.end()?, self.folds);
+        Some((f.fold(clock.position) - f.fold(start), f.fold(end) - f.fold(start), end - start))
+    }
+
+    /// Replay only: seeks to `frac` of the recording's active time, so a scrubber never lands in idle time.
+    pub fn seek_active(&mut self, frac: f64) {
+        let f = self.folds;
+        self.seek(|r, _| {
+            let (start, end) = (f.fold(r.start()?), f.fold(r.end()?));
+            Some(f.unfold(start + ((end - start) as f64 * frac.clamp(0., 1.)) as Ns))
+        });
+    }
+
     /// Replay only: seeks by `steps` tenths of the visible timeline.
     pub fn seek_by(&mut self, steps: Ns) {
         let step = (self.timeline_width.max(10) as f64 * self.viewport.map_or(1e6, |vp| vp.ns_per_cell) / 10.0) as Ns;
@@ -357,13 +374,14 @@ impl TraceDoc {
                 format!("{state}{follow} lag {lag} queued {}", buffered.len())
             }
             Mode::Replay { replay, clock } => {
-                let start = replay.start().unwrap_or(0);
+                let (at, active, wall) = self.replay_times().unwrap_or_default();
                 format!(
-                    "REPLAY {} {}x {}/{} ev {}/{}",
+                    "REPLAY {} {}x {}/{} active, {} overall, ev {}/{}",
                     if clock.playing { "playing" } else { "paused" },
                     clock.speed(),
-                    format_duration(clock.position - start),
-                    format_duration(replay.end().unwrap_or(0) - start),
+                    clock_time(at),
+                    clock_time(active),
+                    spoken_span(wall),
                     replay.index_at(clock.position),
                     replay.events().len()
                 )

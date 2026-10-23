@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use trace_core::{Ns, SLOWEST_DEFAULT_KINDS, SPEEDS, SessionId, SessionStatus, Span, SpanId, SpanKind, SpanStatus};
 use trace_storage::{SessionFilter, SessionSummary, Store};
-use trace_view::{Mode, Row, RowKind, TraceDoc, Viewport, format_cost, format_duration, format_tokens, format_total_cost, tick_times};
+use trace_view::{Mode, Row, RowKind, TraceDoc, Viewport, clock_time, format_cost, format_duration, format_tokens, format_total_cost, spoken_span, tick_times};
 
 const SIDEBAR_W: f32 = 260.;
 const HEADER_H: f32 = 56.;
@@ -1782,18 +1782,18 @@ impl TraceApp {
 
     fn render_header(&self, pal: &Palette, inset: f32, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut right = div().flex().items_center().gap(px(8.));
-        let mut subtitle = String::new();
+        let (mut project, mut how) = (String::new(), String::new());
         let mut harness = None;
         if let Some(doc) = &self.doc {
             let s = &doc.state.session;
             harness = present::harness_brand(&s.harness, &s.source_adapter);
-            // From the trace itself, since a sidebar search may have filtered this session out of the list.
-            let model = present::top_model(&doc.state);
-            subtitle = [Some(s.project_id.clone()).filter(|p| !p.is_empty()), present::harness_label(&s.harness, &s.source_adapter), model]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" · ");
+            // From the trace itself, since a sidebar search may have filtered this session out of the list; early
+            // in a replay, before any model call, from the stored summary.
+            let model = present::top_model(&doc.state).or_else(|| {
+                self.sessions.iter().find(|x| x.session_id == s.session_id).and_then(|x| x.model.as_deref()).map(present::pretty_model)
+            });
+            project = s.project_id.clone();
+            how = [present::harness_label(&s.harness, &s.source_adapter), model].into_iter().flatten().collect::<Vec<_>>().join(" · ");
             if self.span_search_open || !doc.search.is_empty() {
                 right = right.child(
                     div()
@@ -1816,7 +1816,7 @@ impl TraceApp {
                     Some(last) => (Status::Idle, format!("Idle · {}", format_duration(doc.now - last)), false),
                     None => (Status::Live, "Live".to_owned(), true),
                 },
-                Mode::Replay { replay, clock } => (Status::Live, format!("Replay · {}", clock_time(clock.position - replay.start().unwrap_or(0))), false),
+                Mode::Replay { .. } => (Status::Live, format!("Replay · {}", clock_time(doc.replay_times().map_or(0, |t| t.0))), false),
                 Mode::Static => {
                     let st = present::session_status(s.status, None, 0);
                     (st, st.label().to_owned(), false)
@@ -1853,19 +1853,32 @@ impl TraceApp {
             .gap(px(10.))
             .pl(px(6. + inset))
             .pr(px(6.))
-            .child(Icon::new(IconName::Sparkle).size(px(16.)).text_color(pal.accent))
-            .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).text_color(pal.ink).child("Agents Trace Waterfall"))
+            // App name left, the open session centred like a window title, status and actions right. The
+            // two sides share the leftover width equally, so the session stays centred.
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.))
                     .flex()
                     .items_center()
-                    .gap(px(6.))
-                    .children(harness.map(|b| harness_tile(b, 16., pal)))
-                    .child(div().min_w(px(0.)).truncate().text_size(px(13.)).text_color(pal.muted).child(subtitle)),
+                    .gap(px(10.))
+                    // Staggered bars: a waterfall of spans.
+                    .child(Icon::new(IconName::ChartNoAxesGantt).size(px(17.)).text_color(pal.accent))
+                    .child(div().min_w(px(0.)).truncate().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).text_color(pal.ink).child("Agents Trace Waterfall")),
             )
-            .child(right)
+            .child(
+                div()
+                    .flex_shrink(1.)
+                    .min_w(px(0.))
+                    .max_w(relative(0.45))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .children(harness.map(|b| harness_tile(b, 16., pal)))
+                    .child(div().flex_shrink_0().text_size(px(13.5)).font_weight(FontWeight::MEDIUM).text_color(pal.ink).child(project))
+                    .when(!how.is_empty(), |el| el.child(div().min_w(px(0.)).truncate().text_size(px(13.)).text_color(pal.muted).child(how))),
+            )
+            .child(div().flex_1().min_w(px(0.)).flex().items_center().justify_end().child(right))
     }
 }
 
@@ -3082,8 +3095,10 @@ impl TraceApp {
     fn render_transport(&self, pal: &Palette, g: &Geo, cx: &mut Context<Self>) -> impl IntoElement {
         let doc = self.doc.as_ref().expect("transport needs a document");
         let Mode::Replay { replay, clock } = &doc.mode else { unreachable!("transport renders only in replay") };
-        let (start, end) = (replay.start().unwrap_or(0), replay.end().unwrap_or(0));
-        let frac = ((clock.position - start) as f64 / (end - start).max(1) as f64) as f32;
+        let _ = replay;
+        // Position and length in active time; idle time is folded out of playback.
+        let (at, active, wall) = doc.replay_times().unwrap_or_default();
+        let frac = (at as f64 / active.max(1) as f64) as f32;
         let speed_ix = clock.speed_index;
         let playing = clock.playing;
         let _ = g;
@@ -3106,7 +3121,7 @@ impl TraceApp {
             let b = scrub.get();
             let f = ((x - b.origin.x).to_f64() / b.size.width.to_f64().max(1.)).clamp(0., 1.);
             if let Some(doc) = &mut this.doc {
-                doc.seek(|r, _| Some(r.start().unwrap_or(0) + (f * (r.end().unwrap_or(0) - r.start().unwrap_or(0)) as f64) as Ns));
+                doc.seek_active(f);
             }
         };
         let seek_down = seek_to.clone();
@@ -3217,8 +3232,17 @@ impl TraceApp {
                         .text_size(px(12.))
                         .font_features(tnum())
                         .text_color(pal.text)
-                        .child(format!("{} / {}", clock_time(clock.position - start), clock_time(end - start))),
-                ),
+                        .child(format!("{} / {}", clock_time(at), clock_time(active))),
+                )
+                .when(wall > active, |el| {
+                    el.child(
+                        div()
+                            .ml(px(8.))
+                            .text_size(px(12.))
+                            .text_color(pal.muted)
+                            .child(format!("{} overall", spoken_span(wall))),
+                    )
+                }),
         )
     }
 
@@ -3396,11 +3420,6 @@ fn focus_window(doc: &TraceDoc, ns_per_px: f64, fit_w: f32) -> Option<(SpanId, V
     let end = t.effective_end(shown_end(doc), doc.now);
     let pad = (end - t.started_at_utc_ns) / 25;
     Some((t.span_id.clone(), doc.window(t.started_at_utc_ns - pad, end + pad, fit_w as u16)))
-}
-
-fn clock_time(ns: Ns) -> String {
-    let s = ns.max(0) / 1_000_000_000;
-    format!("{}:{:02}", s / 60, s % 60)
 }
 
 fn text_width(window: &mut Window, text: &str, size: f32) -> f32 {

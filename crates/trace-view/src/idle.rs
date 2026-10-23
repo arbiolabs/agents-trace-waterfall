@@ -2,13 +2,11 @@
 
 use trace_core::{Ns, TraceState};
 
-/// The overview's right-edge marker while a live session is idle: the gap from its last activity to now.
-/// Idle stretches at least this long, and at least a fiftieth of the session, squeeze in the overview and
-/// draw as bands on the timeline.
+/// Idle stretches at least this long fold out of the timeline and replay, and squeeze in the overview.
 pub const IDLE_GAP_MIN: Ns = 10 * 60 * 1_000_000_000;
 
-/// The most idle stretches the overview squeezes; the longest win.
-pub const MAX_GAPS: usize = 24;
+/// The most idle stretches folded; the longest win. A two-week session has a few dozen.
+pub const MAX_GAPS: usize = 64;
 
 /// Stretches of `(a, b)` where no leaf span ran, in time order. Leaves are the activity: the agent and turn
 /// spans around them can stay open across idle time.
@@ -16,7 +14,7 @@ pub fn idle_gaps(state: &TraceState, (a, b): (Ns, Ns), session_end: Option<Ns>, 
     let mut busy: Vec<(Ns, Ns)> =
         state.spans.values().filter(|s| state.children(&s.span_id).is_empty()).map(|s| (s.started_at_utc_ns, s.effective_end(session_end, now))).collect();
     busy.sort_unstable();
-    let min = IDLE_GAP_MIN.max((b - a) / 50);
+    let min = IDLE_GAP_MIN;
     let mut gaps = Vec::new();
     let mut reach = a;
     for (start, end) in busy.into_iter().chain([(b, b)]) {
@@ -34,10 +32,16 @@ pub fn idle_gaps(state: &TraceState, (a, b): (Ns, Ns), session_end: Option<Ns>, 
 
 /// Idle stretches taken out of the timeline: folded time is real time less every stretch before it, so
 /// the waterfall spends no width on waiting. Copy, so a `Viewport` can carry it.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Folds {
     gaps: [(Ns, Ns); MAX_GAPS],
     n: usize,
+}
+
+impl Default for Folds {
+    fn default() -> Self {
+        Self { gaps: [(0, 0); MAX_GAPS], n: 0 }
+    }
 }
 
 impl Folds {

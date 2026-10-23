@@ -11,6 +11,11 @@ All notable changes to this project are documented here. The format follows
 - Idle time is folded out of the timeline in both frontends: an idle stretch takes no width and shows as
   a break with its length (`17h`, `2d`), so a long session's work fills the view. Replay jumps across
   idle time instead of playing through it.
+- Every idle stretch of 10 minutes or more folds, however long the session (up to 64 of them).
+- The replay player counts active time (`1:12:05 / 6:22:04`) and its scrubber moves through active time
+  only; the session's wall-clock length reads separately, rounded (`14 days overall`).
+- Desktop header: the open session is centred, the project name in full ink with harness and model
+  muted beside it, and the app's mark is a waterfall of bars instead of a sparkle.
 
 ### Removed
 

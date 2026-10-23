@@ -261,6 +261,26 @@ pub fn format_total_cost(t: &Totals) -> String {
     }
 }
 
+/// `4:05`, `1:02:03`: a playback position.
+pub fn clock_time(ns: Ns) -> String {
+    let s = ns.max(0) / 1_000_000_000;
+    if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
+}
+
+/// `14 days`, `5 hours`, `12 minutes`, `40 seconds`: a length rounded to its largest unit, for a total
+/// that needs no precision.
+pub fn spoken_span(ns: Ns) -> String {
+    let s = ns.max(0) / 1_000_000_000;
+    let round = |unit: i64| (s + unit / 2) / unit;
+    let (n, unit) = match s {
+        s if s >= 2 * 86_400 => (round(86_400), "day"),
+        s if s >= 2 * 3600 => (round(3600), "hour"),
+        s if s >= 2 * 60 => (round(60), "minute"),
+        s => (s, "second"),
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
 /// `999`, `12.3k`, `1.5M`.
 pub fn format_tokens(n: u64) -> String {
     match n {
