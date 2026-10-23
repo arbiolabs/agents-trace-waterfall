@@ -65,9 +65,9 @@ Values come from the reference. Kinds map as follows: agent, turn, subagent, wai
 | tray | `#f0f0f0` | `#19191c` |
 | card | `#ffffff` | `#232326` |
 | strong / ink | `#171717` | `#ededed` |
-| text | `#6b6b6b` | `#a1a1a6` |
-| muted | `#8a8a8a` | `#7c7c82` |
-| faint | `#b8b8b8` | `#4a4a50` |
+| text | `#515154` | `#c7c7cc` |
+| muted | `#6e6e73` | `#a1a1a6` |
+| faint (decorative only) | `#b8b8b8` | `#4a4a50` |
 | line | `#ececec` | `#2e2e33` |
 | grid | `#f1f1f1` | `#2a2a2e` |
 | guide | `#e6e6e6` | `#34343a` |
@@ -77,13 +77,15 @@ Values come from the reference. Kinds map as follows: agent, turn, subagent, wai
 | wash | `#f7f7f7` | `#1d1d20` |
 | accent | `#2f6bff` | `#5b9aff` |
 | now | `rgba(47,107,255,.55)` | `rgba(91,154,255,.6)` |
-| agent bg / edge / ink / mark | `#eef0f3` `#d3d8e0` `#4b5363` `#9aa3b2` | `#33363d` `#4d535d` `#b8c0cc` `#7a8291` |
-| llm bg / edge / ink / mark | `#efecff` `#cbc2fb` `#5a45d4` `#8d7cf0` | `#332c5c` `#5a4cc0` `#b6a9ff` `#8d7cf0` |
+| agent bg / edge / ink / mark | `#eef0f3` `#d3d8e0` `#4b5363` `#9aa3b2` | `#3a3d44` `#50555f` `#b8c0cc` `#7a8291` |
+| llm bg / edge / ink / mark | `#efecff` `#cbc2fb` `#5a45d4` `#8d7cf0` | `rgba(141,124,240,.28)` `rgba(167,151,255,.65)` `#c9bfff` `#8d7cf0` |
 | tool bg / edge / ink / mark | `#e4f5f1` `#a9ddd1` `#0e7a67` `#3db39a` | `#1c3b35` `#2f7465` `#62d5bb` `#3db39a` |
 | error bg / edge / ink / mark | `#fde8e5` `#f1a397` `#c2331f` `#e5604c` | `#46221e` `#8c3c33` `#ff977d` `#e5604c` |
 | brand bg / fg (Live pill) | `#eaf1ff` `#2456d6` | `#16243f` `#8ab4ff` |
 | ok bg / fg (Done pill) | `#e6f6ec` `#1a7f45` | `#12301f` `#3dd68c` |
 | slow bg / fg | `#fff3e0` `#b85c00` | `#3a2410` `#ffa057` |
+
+Muted text meets 4.5:1 on the card in both appearances. Only grid, guide, and faint are lighter, and they never carry text. In dark mode the LLM fill is the lavender mark at 28% over the card with a lighter 1px edge, and agent bars sit one surface step above the card, so neither sinks into it.
 
 Wait spans use the agent palette with an amber mark (`#d99a2b`) so idle time reads as waiting, not work.
 

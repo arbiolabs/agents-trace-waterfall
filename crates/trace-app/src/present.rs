@@ -165,12 +165,41 @@ pub enum Edge {
 }
 
 /// For a span wholly outside the visible `window`, the edge it lies past and what the edge hint reads:
-/// `2.7s · 1h5m ago` (its length, then how long before the window it ended) or `3m later`.
-pub fn offscreen_hint(start: Ns, end: Ns, window: (Ns, Ns)) -> Option<(Edge, String)> {
+/// its length, then how far past the window it lies. While live, `2.7s · 1h5m ago` or `3m later`;
+/// a finished trace has no present to be ago from, so `2.7s · 1h5m before` or `3m after`.
+pub fn offscreen_hint(start: Ns, end: Ns, window: (Ns, Ns), live: bool) -> Option<(Edge, String)> {
+    let (before, after) = if live { ("ago", "later") } else { ("before", "after") };
     if end < window.0 {
-        Some((Edge::Left, format!("{} · {} ago", format_duration(end - start), format_duration(window.0 - end))))
+        Some((Edge::Left, format!("{} · {} {before}", format_duration(end - start), format_duration(window.0 - end))))
     } else if start > window.1 {
-        Some((Edge::Right, format!("{} later", format_duration(start - window.1))))
+        Some((Edge::Right, format!("{} {after}", format_duration(start - window.1))))
+    } else {
+        None
+    }
+}
+
+/// A live session with no event for this long reads as idle: its open spans stop at the last event.
+pub const IDLE_AFTER: Ns = 10 * 60 * 1_000_000_000;
+
+/// When a live session went quiet: its last event, if that is more than `IDLE_AFTER` before `now`.
+pub fn idle_since(state: &TraceState, live: bool, now: Ns) -> Option<Ns> {
+    let last = state.last_occurred_at_utc_ns?;
+    (live && state.session.ended_at_utc_ns.is_none() && now - last > IDLE_AFTER).then_some(last)
+}
+
+/// Where open spans stop drawing: the session's end, or the last event while idle. Feed it to
+/// `Span::effective_end` as the session end, so open spans neither grow forever nor outlive the evidence.
+pub fn shown_end(state: &TraceState, idle: Option<Ns>) -> Option<Ns> {
+    state.session.ended_at_utc_ns.or(idle)
+}
+
+/// The capsule pinned at the timeline edge while now is off-screen: `Now +6h49m`, the distance from
+/// the view's right edge to now, or `Now −3m` when the view lies past it.
+pub fn now_capsule(now: Ns, window: (Ns, Ns)) -> Option<(Edge, String)> {
+    if now > window.1 {
+        Some((Edge::Right, format!("Now +{}", format_duration(now - window.1))))
+    } else if now < window.0 {
+        Some((Edge::Left, format!("Now \u{2212}{}", format_duration(window.0 - now))))
     } else {
         None
     }
@@ -191,7 +220,8 @@ pub fn default_folds(state: &TraceState) -> Vec<trace_core::SpanId> {
     out
 }
 
-/// The overview's caption: `All · 16.2s` for the whole trace, else `7h18m – 7h31m of 8h12m`.
+/// The overview's caption: `All · 16.2s` for the whole trace, else `7h18m – 7h31m of 8h12m`. When both
+/// ends would read the same, it names the window's length and place instead: `4.4s at 2h4m of 2h4m`.
 pub fn overview_label(window: (Ns, Ns), whole: (Ns, Ns)) -> String {
     let total = whole.1 - whole.0;
     if window.0 <= whole.0 && window.1 >= whole.1 {
@@ -199,29 +229,42 @@ pub fn overview_label(window: (Ns, Ns), whole: (Ns, Ns)) -> String {
     }
     let a = (window.0 - whole.0).clamp(0, total);
     let b = (window.1 - whole.0).clamp(a, total);
-    format!("{} – {} of {}", format_duration(a), format_duration(b), format_duration(total))
+    let (fa, fb, ft) = (format_duration(a), format_duration(b), format_duration(total));
+    if fa == fb {
+        return format!("{} at {fa} of {ft}", format_duration(window.1 - window.0));
+    }
+    format!("{fa} – {fb} of {ft}")
 }
 
-/// Overview density: each span counts once in every column it touches, per lane, and a column's alpha
-/// is its count over the lane's busiest column, floored so a lone span stays visible.
-pub fn density(spans: impl IntoIterator<Item = (f32, f32, usize)>, cols: usize) -> Vec<[f32; 4]> {
+/// Overview lanes: wait, LLM, tool. Errors draw as ticks on top instead of a lane.
+pub const LANES: usize = 3;
+
+/// Overview density: per lane, each pixel column sums how much of it spans cover, so a column with
+/// three overlapping calls reads three times as busy as one with a single call. A column's alpha is the
+/// square root of its coverage over the lane's busiest column, floored so a lone instant stays visible.
+/// Spans are `(x0, x1, lane)` in columns.
+pub fn density(spans: impl IntoIterator<Item = (f32, f32, usize)>, cols: usize) -> Vec<[f32; LANES]> {
     const FLOOR: f32 = 0.18;
-    let mut counts = vec![[0u32; 4]; cols];
+    // An instant still occupies a sliver, so a burst of zero-length events adds up.
+    const MIN_W: f32 = 0.05;
     if cols == 0 {
         return Vec::new();
     }
+    let mut cover = vec![[0f32; LANES]; cols];
     for (x0, x1, lane) in spans {
-        let col = |x: f32| (x.floor().max(0.) as usize).min(cols - 1);
-        let (a, b) = (col(x0), col(x1));
-        counts[a..=b.max(a)].iter_mut().for_each(|c| c[lane] += 1);
+        let (x0, x1) = (x0.clamp(0., cols as f32 - MIN_W), x1.clamp(0., cols as f32));
+        let x1 = x1.max(x0 + MIN_W);
+        for (c, cell) in cover.iter_mut().enumerate().take(x1.ceil() as usize).skip(x0.floor() as usize) {
+            cell[lane] += x1.min(c as f32 + 1.) - x0.max(c as f32);
+        }
     }
-    let mut peak = [1u32; 4];
-    for c in &counts {
-        for k in 0..4 {
+    let mut peak = [f32::EPSILON; LANES];
+    for c in &cover {
+        for k in 0..LANES {
             peak[k] = peak[k].max(c[k]);
         }
     }
-    counts.iter().map(|c| std::array::from_fn(|k| if c[k] == 0 { 0. } else { (c[k] as f32 / peak[k] as f32).max(FLOOR) })).collect()
+    cover.iter().map(|c| std::array::from_fn(|k| if c[k] <= 0. { 0. } else { (c[k] / peak[k]).sqrt().max(FLOOR) })).collect()
 }
 
 /// The overview lens never draws narrower than this, so it stays grabbable.
@@ -406,12 +449,13 @@ pub fn descendants<'a>(state: &'a TraceState, id: &trace_core::SpanId, cap: usiz
 }
 
 /// The six cells of the popover's stats panel, in reading order. Cost and tokens cover the span's subtree (`rollup`).
-pub fn popover_stats(state: &TraceState, s: &Span, rollup: &Totals, now: Ns) -> [(&'static str, String); 6] {
+/// `end` is where open spans stop, from `shown_end`.
+pub fn popover_stats(state: &TraceState, s: &Span, rollup: &Totals, end: Option<Ns>, now: Ns) -> [(&'static str, String); 6] {
     let origin = state.axis_start().unwrap_or(s.started_at_utc_ns);
     let billed = rollup.billable_records > 0;
     let tokens = |n: u64| if billed { format_tokens(n) } else { "—".into() };
     [
-        ("Duration", format_duration(s.elapsed(state.session.ended_at_utc_ns, now).ns)),
+        ("Duration", format_duration(s.elapsed(end, now).ns)),
         ("Started", format!("+{}", format_duration(s.started_at_utc_ns - origin))),
         ("Cost", format_cost(rollup.cost_usd_micros())),
         ("Tokens in", tokens(rollup.tokens_input)),
@@ -589,11 +633,11 @@ mod tests {
     fn popover_stats_read_from_the_span_and_its_subtree() {
         let s = state();
         let sub = &s.spans[&"sub".into()];
-        let stats = popover_stats(&s, sub, &s.subtree_totals(&"sub".into()), 40_000 * MS).map(|(k, v)| format!("{k} {v}"));
+        let stats = popover_stats(&s, sub, &s.subtree_totals(&"sub".into()), None, 40_000 * MS).map(|(k, v)| format!("{k} {v}"));
         assert_eq!(stats, ["Duration 30s", "Started +8.1s", "Cost $0.05", "Tokens in 41.2k", "Tokens out 1.4k", "Spans 2"]);
-        let llm = popover_stats(&s, &s.spans[&"llm".into()], &s.subtree_totals(&"llm".into()), 40_000 * MS).map(|(_, v)| v);
+        let llm = popover_stats(&s, &s.spans[&"llm".into()], &s.subtree_totals(&"llm".into()), None, 40_000 * MS).map(|(_, v)| v);
         assert_eq!(llm, ["3s", "+9s", "$0.05", "41.2k", "1.4k", "0"]);
-        let bash = popover_stats(&s, &s.spans[&"Bash".into()], &s.subtree_totals(&"Bash".into()), 40_000 * MS).map(|(_, v)| v);
+        let bash = popover_stats(&s, &s.spans[&"Bash".into()], &s.subtree_totals(&"Bash".into()), None, 40_000 * MS).map(|(_, v)| v);
         assert_eq!(bash[2..5], ["—", "—", "—"], "nothing billed reads unknown, not zero");
     }
 
@@ -653,10 +697,42 @@ mod tests {
     #[test]
     fn offscreen_spans_name_their_edge_and_distance() {
         let w = (3_900_000 * MS, 4_000_000 * MS);
-        let left = offscreen_hint(0, 2_700 * MS, w);
-        assert_eq!(left, Some((Edge::Left, "2.7s · 1h4m ago".into())));
-        assert_eq!(offscreen_hint(4_180_000 * MS, 4_190_000 * MS, w), Some((Edge::Right, "3m later".into())));
-        assert_eq!(offscreen_hint(3_950_000 * MS, 4_190_000 * MS, w), None);
+        assert_eq!(offscreen_hint(0, 2_700 * MS, w, true), Some((Edge::Left, "2.7s · 1h4m ago".into())));
+        assert_eq!(offscreen_hint(4_180_000 * MS, 4_190_000 * MS, w, true), Some((Edge::Right, "3m later".into())));
+        assert_eq!(offscreen_hint(3_950_000 * MS, 4_190_000 * MS, w, true), None);
+        assert_eq!(offscreen_hint(0, 2_700 * MS, w, false), Some((Edge::Left, "2.7s · 1h4m before".into())), "a finished trace has no ago");
+        assert_eq!(offscreen_hint(4_180_000 * MS, 4_190_000 * MS, w, false), Some((Edge::Right, "3m after".into())));
+    }
+
+    #[test]
+    fn a_quiet_live_session_goes_idle_and_its_open_spans_stop_at_the_last_event() {
+        let mut events = vec![
+            ev(1, 0, None, json!({"event_type": "session.started", "body": {"project_id": "p"}})),
+            start(2, 0, "root", None, json!({"kind": "agent"})),
+            start(3, 5_000 * MS, "sub", Some("root"), json!({"kind": "subagent"})),
+        ];
+        let s = TraceState::from_events("s1".into(), &events);
+        let last = 5_000 * MS;
+        assert_eq!(idle_since(&s, true, last + IDLE_AFTER), None, "exactly at the threshold is still active");
+        let later = last + 6 * 3_600_000 * MS;
+        assert_eq!(idle_since(&s, true, later), Some(last));
+        assert_eq!(idle_since(&s, false, later), None, "replay and static traces are never idle");
+        let sub = &s.spans[&"sub".into()];
+        assert_eq!(sub.effective_end(shown_end(&s, idle_since(&s, true, later)), later), last);
+        assert_eq!(sub.effective_end(shown_end(&s, None), later), later, "an active session's open spans run to now");
+        events.push(ev(4, 6_000 * MS, None, json!({"event_type": "session.ended", "body": {"status": "completed"}})));
+        let ended = TraceState::from_events("s1".into(), &events);
+        assert_eq!(idle_since(&ended, true, later), None, "an ended session is done, not idle");
+    }
+
+    #[test]
+    fn now_capsule_reads_the_distance_past_the_view() {
+        let h = 3_600_000 * MS;
+        let m = 60_000 * MS;
+        let w = (7 * h, 7 * h + 31 * m);
+        assert_eq!(now_capsule(14 * h + 20 * m, w), Some((Edge::Right, "Now +6h49m".into())));
+        assert_eq!(now_capsule(7 * h + 10 * m, w), None);
+        assert_eq!(now_capsule(6 * h, w), Some((Edge::Left, "Now \u{2212}1h".into())));
     }
 
     #[test]
@@ -686,16 +762,21 @@ mod tests {
         let m = 60_000 * MS;
         assert_eq!(overview_label((0, 16_200 * MS), (0, 16_200 * MS)), "All · 16.2s");
         assert_eq!(overview_label((7 * h + 18 * m, 7 * h + 31 * m), (0, 8 * h + 12 * m)), "7h18m – 7h31m of 8h12m");
+        let whole = (0, 2 * h + 4 * m + 30_000 * MS);
+        assert_eq!(overview_label((2 * h + 4 * m, 2 * h + 4 * m + 4_400 * MS), whole), "4.4s at 2h4m of 2h4m", "identical ends name length and place");
     }
 
     #[test]
     fn density_scales_each_lane_by_its_busiest_column() {
-        let d = density([(0., 3.5, 1), (1., 1., 1), (1., 2., 1), (2., 2., 2)], 5);
-        let lane = |k: usize| d.iter().map(|c| c[k]).collect::<Vec<_>>();
-        assert_eq!(lane(1), [1. / 3., 1., 2. / 3., 1. / 3., 0.]);
+        // Lane 1: one span over columns 0..4, three more stacked on column 1.
+        let d = density([(0., 4., 1), (1., 2., 1), (1., 2., 1), (1., 2., 1), (2.5, 3., 2)], 5);
+        let lane = |k: usize| d.iter().map(|c| (c[k] * 100.).round() / 100.).collect::<Vec<_>>();
+        assert_eq!(lane(1), [0.5, 1., 0.5, 0.5, 0.]);
         assert_eq!(lane(2), [0., 0., 1., 0., 0.]);
-        let sparse = density((0..1).map(|_| (0., 0., 0)).chain((0..10).map(|_| (1., 1., 0))), 2);
-        assert_eq!(sparse.iter().map(|c| c[0]).collect::<Vec<_>>(), [0.18, 1.], "a lone span stays visible");
+        let sparse = density((0..1).map(|_| (0., 0., 0)).chain((0..10).map(|_| (1., 2., 0))), 2);
+        assert_eq!(sparse.iter().map(|c| c[0]).collect::<Vec<_>>(), [0.18, 1.], "a lone instant stays visible");
+        let burst = density((0..200).map(|i| (i as f32 / 100., i as f32 / 100., 0)), 2);
+        assert_eq!(burst.iter().map(|c| (c[0] * 100.).round() / 100.).collect::<Vec<_>>(), [1., 1.], "a burst of instants reads as busy");
     }
 
     #[test]
