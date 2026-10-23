@@ -1583,7 +1583,8 @@ mod tests {
         sessions[2].totals.cost_actual_usd_micros = 5_000;
         sessions[2].totals.billable_records = 1;
         let tree = group_sessions(&sessions, SidebarMode::Workspaces, now, 0);
-        let shape: Vec<(String, Vec<(String, Vec<String>)>)> = tree
+        type Shape = Vec<(String, Vec<(String, Vec<String>)>)>;
+        let shape: Shape = tree
             .iter()
             .map(|n| match n {
                 SidebarNode::Workspace(w) => (w.name.clone(), w.projects.iter().map(|p| (p.name.clone(), p.sessions.iter().map(|s| s.session_id.0.clone()).collect())).collect()),

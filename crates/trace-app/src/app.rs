@@ -1168,7 +1168,7 @@ impl TraceApp {
         let app = cx.entity().downgrade();
         let list = list.role(Role::List).aria_label("Sessions").context_menu(move |menu, _, cx| {
             let Some(target) = app.upgrade().and_then(|a| a.read(cx).menu_target.clone()) else { return menu };
-            let act = |label: &'static str, f: Box<dyn Fn(&mut TraceApp, &mut Window, &mut Context<TraceApp>)>| {
+            let act = |label: &'static str, f: Box<MenuAction>| {
                 let app = app.clone();
                 let f = Rc::new(f);
                 PopupMenuItem::new(label).on_click(move |_, window, cx| {
@@ -1308,7 +1308,7 @@ impl TraceApp {
                     .flex_1()
                     .min_w(px(0.))
                     .truncate()
-                    .text_size(px(if workspace { 12.5 } else { 12.5 }))
+                    .text_size(px(12.5))
                     .font_weight(if workspace { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
                     .text_color(if workspace { pal.ink } else { pal.text })
                     .child(f.name),
@@ -1414,6 +1414,8 @@ impl TraceApp {
             }))
     }
 }
+
+type MenuAction = dyn Fn(&mut TraceApp, &mut Window, &mut Context<TraceApp>);
 
 /// A workspace or project header's content, for `render_folder`.
 struct FolderRow {
