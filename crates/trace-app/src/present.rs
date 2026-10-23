@@ -2,7 +2,7 @@
 
 use gpui_kit::assets::IconName;
 use trace_core::{Ns, Span, SpanKind, SpanStatus, Totals, TraceState};
-use trace_view::{format_cost, format_duration, format_tokens};
+use trace_view::{Row, format_cost, format_duration, format_tokens};
 
 /// Which palette column a span paints with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +210,47 @@ pub fn popover_x(bar_x0: f32, bar_x1: f32, width: f32, pop_w: f32) -> f32 {
     }
 }
 
+/// Ease-out quint, within 0.01 of the design's cubic-bezier(0.22, 1, 0.36, 1).
+pub fn ease(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0., 1.)).powi(5)
+}
+
+/// What a fold does to one row while it animates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    Stay,
+    Enter,
+    Leave,
+}
+
+impl Change {
+    /// Height and opacity fraction at eased progress `p`.
+    pub fn scale(self, p: f32) -> f32 {
+        match self {
+            Change::Stay => 1.0,
+            Change::Enter => p,
+            Change::Leave => 1.0 - p,
+        }
+    }
+}
+
+/// Interleaves the rows before and after a fold. A fold only hides or shows rows, so the shorter
+/// list is a subsequence of the longer. Kept rows take their new state, so a parent shows its new chevron.
+pub fn fold_merge(old: &[Row], new: &[Row]) -> Vec<(Row, Change)> {
+    let entering = new.len() >= old.len();
+    let (long, short, extra) = if entering { (new, old, Change::Enter) } else { (old, new, Change::Leave) };
+    let mut j = 0;
+    long.iter()
+        .map(|r| match short.get(j).filter(|s| s.kind == r.kind) {
+            Some(s) => {
+                j += 1;
+                (if entering { r } else { s }.clone(), Change::Stay)
+            }
+            None => (r.clone(), extra),
+        })
+        .collect()
+}
+
 /// Every descendant of `id`, stopping at `cap`.
 pub fn descendants<'a>(state: &'a TraceState, id: &trace_core::SpanId, cap: usize) -> Vec<&'a Span> {
     let mut out: Vec<&'a Span> = Vec::new();
@@ -267,6 +308,32 @@ pub fn group(live: bool, started: Option<Ns>, today_start: Ns) -> Group {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ease_tracks_the_design_curve() {
+        // Points on cubic-bezier(0.22, 1, 0.36, 1) as (x, y).
+        for (x, y) in [(0.0, 0.0), (0.192, 0.657), (0.3425, 0.875), (1.0, 1.0)] {
+            assert!((ease(x) - y).abs() < 0.01, "ease({x}) = {} vs {y}", ease(x));
+        }
+        assert_eq!(ease(2.0), 1.0);
+    }
+
+    #[test]
+    fn fold_merge_marks_hidden_and_shown_rows() {
+        let row = |id: &str, collapsed: bool| Row { kind: trace_view::RowKind::Span(id.into()), depth: 0, has_children: false, collapsed, retry: false };
+        let open = [row("p", false), row("a", false), row("b", false), row("q", false)];
+        let shut = [row("p", true), row("q", false)];
+        let marks = |m: Vec<(Row, Change)>| m.into_iter().map(|(r, c)| (r.kind, r.collapsed, c)).collect::<Vec<_>>();
+        let id = |s: &str| trace_view::RowKind::Span(s.into());
+        assert_eq!(
+            marks(fold_merge(&open, &shut)),
+            [(id("p"), true, Change::Stay), (id("a"), false, Change::Leave), (id("b"), false, Change::Leave), (id("q"), false, Change::Stay)]
+        );
+        assert_eq!(
+            marks(fold_merge(&shut, &open)),
+            [(id("p"), false, Change::Stay), (id("a"), false, Change::Enter), (id("b"), false, Change::Enter), (id("q"), false, Change::Stay)]
+        );
+        assert_eq!([Change::Stay, Change::Enter, Change::Leave].map(|c| c.scale(0.25)), [1.0, 0.25, 0.75]);
+    }
     #[test]
     fn opaque_agent_ids_shorten_but_names_do_not() {
         assert_eq!(super::short_id("a000974c519f6187a".into()), "a000974");

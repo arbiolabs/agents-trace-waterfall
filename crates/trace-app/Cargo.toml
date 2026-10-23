@@ -20,5 +20,8 @@ gpui-kit = "0.8.0"
 gpui-pre-macos = { version = "0.3.9", features = ["runtime_shaders"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", features = ["NSAccessibility", "NSWorkspace"] }
+
 [dev-dependencies]
 serde_json.workspace = true

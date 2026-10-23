@@ -35,6 +35,13 @@ pub struct Cli {
     /// Scroll and pan every frame for 300 frames, print frame timing, and quit.
     #[arg(long, hide = true)]
     pub bench_scroll: bool,
+    /// Fold and unfold the biggest subtree near the top for 300 frames, print frame timing, and quit.
+    #[arg(long, hide = true)]
+    pub bench_fold: bool,
+    /// Hold every transition at this progress, 0 to 1, for screenshots. With `--select`, folds the
+    /// selected span; with `--popover`, holds the popover opening.
+    #[arg(long, hide = true)]
+    pub freeze_anim: Option<f32>,
 }
 
 fn parse_window(v: &str) -> Result<(f64, f64), String> {
@@ -60,6 +67,9 @@ fn main() -> anyhow::Result<()> {
     let forced_dark = cli.appearance.as_deref().map(|a| a == "dark");
     application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
         gpui_kit::init(cx);
+        cx.set_window_appearance(forced_dark.map(|d| if d { WindowAppearance::Dark } else { WindowAppearance::Light }));
+        #[cfg(target_os = "macos")]
+        cx.set_reduce_motion(objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_window_closed(|cx, _| cx.quit()).detach();

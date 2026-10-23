@@ -1,5 +1,5 @@
 use crate::Cli;
-use crate::present::{self, Group, LabelAt, Tone};
+use crate::present::{self, Change, Group, LabelAt, Tone, ease};
 use crate::theme::{KindColors, Palette, Pill};
 use chrono::{Local, TimeZone};
 use gpui_kit::assets::IconName;
@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use trace_core::{Ns, SLOWEST_DEFAULT_KINDS, SPEEDS, SessionId, SessionStatus, Span, SpanId, SpanKind, SpanStatus};
 use trace_storage::{SessionFilter, SessionSummary, Store};
-use trace_view::{Mode, RowKind, TraceDoc, Viewport, format_cost, format_duration, format_tokens, tick_times};
+use trace_view::{Mode, Row, RowKind, TraceDoc, Viewport, format_cost, format_duration, format_tokens, tick_times};
 
 const SIDEBAR_W: f32 = 260.;
 const HEADER_H: f32 = 56.;
@@ -38,6 +38,8 @@ const STRIP_H: f32 = 28.;
 const SIDEBAR_AUTO_BELOW: f32 = 1100.;
 const SIDEBAR_ANIM: Duration = Duration::from_millis(240);
 const FOLD_ANIM: Duration = Duration::from_millis(240);
+const POP_IN: Duration = Duration::from_millis(180);
+const POP_OUT: Duration = Duration::from_millis(160);
 /// Left edge of the sidebar toggle, just right of the traffic lights.
 const TOGGLE_X: f32 = 84.;
 const BENCH_FRAMES: usize = 300;
@@ -46,10 +48,6 @@ fn tnum() -> FontFeatures {
     FontFeatures(Arc::new(vec![("tnum".into(), 1)]))
 }
 
-/// The cubic-bezier(0.22, 1, 0.36, 1) curve from the design, close enough as an ease-out quint.
-fn ease(t: f32) -> f32 {
-    1.0 - (1.0 - t.clamp(0., 1.)).powi(5)
-}
 
 /// Pixel geometry of the trace card for one frame.
 #[derive(Clone, Copy)]
@@ -98,12 +96,29 @@ enum LensDrag {
     End,
 }
 
+/// A fold in flight: the toggled parent and every row before and after, marked by what the fold does to it.
+struct FoldAnim {
+    id: SpanId,
+    start: Instant,
+    rows: Vec<(Row, Change)>,
+}
+
+/// The detail popover's lifecycle; it stays mounted while it fades out.
+#[derive(Clone, Copy)]
+enum Pop {
+    Closed,
+    Open(Instant),
+    Closing(Instant),
+}
+
 /// `--bench-scroll`: frame intervals and render build times in milliseconds.
 struct Bench {
     last: Instant,
     intervals: Vec<f32>,
     builds: Vec<f32>,
     rows: Vec<f32>,
+    /// `--bench-fold`: toggle a fold every few frames instead of scrolling. Holds the parent once picked.
+    fold: Option<Option<SpanId>>,
 }
 
 pub struct TraceApp {
@@ -112,7 +127,9 @@ pub struct TraceApp {
     sessions: Vec<SessionSummary>,
     journal_seq: i64,
     doc: Option<TraceDoc>,
-    popover: bool,
+    popover: Pop,
+    /// Popover content height from the last frame, so the open and close animations can clip it.
+    pop_h: Rc<Cell<f32>>,
     hovered: Option<usize>,
     list: UniformListScrollHandle,
     focus: FocusHandle,
@@ -132,7 +149,10 @@ pub struct TraceApp {
     sidebar_pref: Option<bool>,
     /// Width animation: from, to, started.
     sidebar_anim: (f32, f32, Instant),
-    fold_anim: Option<(SpanId, Instant)>,
+    fold_anim: Option<FoldAnim>,
+    /// `--freeze-anim`: every transition holds at this progress.
+    freeze: Option<f32>,
+    reduce_motion: bool,
     lens_drag: Option<LensDrag>,
     /// `--viewport` seconds, applied on first layout.
     initial_window: Option<(f64, f64)>,
@@ -180,7 +200,8 @@ impl TraceApp {
             sessions: Vec::new(),
             journal_seq: 0,
             doc: None,
-            popover: false,
+            popover: Pop::Closed,
+            pop_h: Rc::new(Cell::new(0.)),
             hovered: None,
             list: UniformListScrollHandle::new(),
             focus: cx.focus_handle(),
@@ -198,9 +219,11 @@ impl TraceApp {
             sidebar_pref: None,
             sidebar_anim: (0., 0., Instant::now() - SIDEBAR_ANIM),
             fold_anim: None,
+            freeze: cli.freeze_anim,
+            reduce_motion: cx.reduce_motion(),
             lens_drag: None,
             initial_window: cli.viewport,
-            bench: cli.bench_scroll.then(|| Bench { last: Instant::now(), intervals: Vec::new(), builds: Vec::new(), rows: Vec::new() }),
+            bench: (cli.bench_scroll || cli.bench_fold).then(|| Bench { last: Instant::now(), intervals: Vec::new(), builds: Vec::new(), rows: Vec::new(), fold: cli.bench_fold.then_some(None) }),
             _subs: subs,
         };
         let w = this.sidebar_target(window.viewport_size().width.to_f64() as f32);
@@ -226,7 +249,11 @@ impl TraceApp {
                 this.list.scroll_to_item(i, ScrollStrategy::Center);
             }
         }
-        this.popover = cli.popover && this.doc.as_ref().is_some_and(|d| d.selected.is_some());
+        if cli.popover && this.doc.as_ref().is_some_and(|d| d.selected.is_some()) {
+            this.popover = Pop::Open(Instant::now());
+        } else if let (Some(_), Some(_), Some(id)) = (cli.freeze_anim, &cli.select, this.doc.as_ref().and_then(|d| d.selected.clone())) {
+            this.toggle_fold(&id);
+        }
         this.focus.focus(window, cx);
         cx.spawn(async move |this, cx| {
             loop {
@@ -276,8 +303,9 @@ impl TraceApp {
                 self.reveal_until = now + REVEAL;
                 self.doc = Some(doc);
                 self.zoomed = false;
-                self.popover = false;
+                self.popover = Pop::Closed;
                 self.hovered = None;
+                self.fold_anim = None;
                 self.error = None;
                 self.last_frame = now;
                 self.list.scroll_to_item(0, ScrollStrategy::Top);
@@ -320,8 +348,51 @@ impl TraceApp {
             Mode::Replay { clock, .. } => clock.playing,
             Mode::Static => false,
         };
-        let fold = self.fold_anim.as_ref().is_some_and(|(_, t)| t.elapsed() < FOLD_ANIM);
-        running || now < self.reveal_until || fold
+        if self.fold_anim.as_ref().is_some_and(|f| self.progress(f.start, FOLD_ANIM) >= 1.) {
+            self.fold_anim = None;
+        }
+        if let Pop::Closing(t) = self.popover
+            && self.progress(t, POP_OUT) >= 1.
+        {
+            self.popover = Pop::Closed;
+        }
+        let popping = match self.popover {
+            Pop::Open(t) => self.progress(t, POP_IN) < 1.,
+            Pop::Closing(_) => true,
+            Pop::Closed => false,
+        };
+        running || now < self.reveal_until || self.fold_anim.is_some() || popping
+    }
+
+    /// Linear progress of a transition that began at `start`, held by `--freeze-anim` and finished at once under Reduce Motion.
+    fn progress(&self, start: Instant, dur: Duration) -> f32 {
+        if self.reduce_motion {
+            return 1.;
+        }
+        self.freeze.unwrap_or_else(|| start.elapsed().as_secs_f32() / dur.as_secs_f32()).clamp(0., 1.)
+    }
+
+    /// How far the popover is shown, eased: 0 hidden, 1 fully open.
+    fn pop_shown(&self) -> f32 {
+        match self.popover {
+            Pop::Open(t) => ease(self.progress(t, POP_IN)),
+            Pop::Closing(t) => 1. - ease(self.progress(t, POP_OUT)),
+            Pop::Closed => 0.,
+        }
+    }
+
+    fn close_popover(&mut self) {
+        if let Pop::Open(_) = self.popover {
+            self.popover = Pop::Closing(Instant::now());
+        }
+    }
+
+    /// Animates the rows a fold hid or showed, given the rows from before it.
+    fn start_fold(&mut self, id: SpanId, old: Vec<Row>) {
+        let Some(doc) = &self.doc else { return };
+        if old.len() != doc.rows.len() {
+            self.fold_anim = Some(FoldAnim { id, start: Instant::now(), rows: present::fold_merge(&old, &doc.rows) });
+        }
     }
 
     fn sidebar_target(&mut self, vw: f32) -> f32 {
@@ -350,13 +421,13 @@ impl TraceApp {
     }
 
     fn toggle_fold(&mut self, id: &SpanId) {
-        if let Some(doc) = &mut self.doc {
-            if !doc.collapsed.remove(id) {
-                doc.collapsed.insert(id.clone());
-            }
-            doc.refresh();
-            self.fold_anim = Some((id.clone(), Instant::now()));
+        let Some(doc) = &mut self.doc else { return };
+        let old = doc.rows.clone();
+        if !doc.collapsed.remove(id) {
+            doc.collapsed.insert(id.clone());
         }
+        doc.refresh();
+        self.start_fold(id.clone(), old);
     }
 
     /// Shows `[a, b]` across the timeline, which stops following.
@@ -511,13 +582,13 @@ impl TraceApp {
         if ks.modifiers.platform || ks.modifiers.control {
             return;
         }
-        if key == "escape" && self.popover {
-            self.popover = false;
+        if key == "escape" && matches!(self.popover, Pop::Open(_)) {
+            self.close_popover();
             cx.notify();
             return;
         }
         let Some(doc) = &mut self.doc else { return };
-        let folds = doc.collapsed.len();
+        let before = matches!(key.as_str(), "h" | "left" | "l" | "right" | "e").then(|| (doc.rows.clone(), doc.selected.clone()));
         match key.as_str() {
             "j" | "down" => doc.move_by(1),
             "k" | "up" => doc.move_by(-1),
@@ -525,7 +596,7 @@ impl TraceApp {
             "l" | "right" => doc.right(),
             "g" | "home" => doc.select(0),
             "G" | "end" => doc.select(usize::MAX),
-            "enter" => self.popover = doc.selected.is_some(),
+            "enter" if doc.selected.is_some() => self.popover = Pop::Open(Instant::now()),
             "escape" if !doc.search.is_empty() => {
                 self.span_search.update(cx, |s, cx| s.set_value("", window, cx));
                 self.span_search_open = false;
@@ -555,10 +626,10 @@ impl TraceApp {
             "r" => self.toggle_replay(),
             _ => return,
         }
+        if let Some((old, Some(id))) = before {
+            self.start_fold(id, old);
+        }
         if let Some(doc) = &self.doc {
-            if doc.collapsed.len() != folds {
-                self.fold_anim = doc.selected.clone().map(|id| (id, Instant::now()));
-            }
             self.list.scroll_to_item(doc.selected_row, ScrollStrategy::Nearest);
         }
         cx.notify();
@@ -601,6 +672,7 @@ fn apply_theme(dark: bool, cx: &mut App) {
 impl Render for TraceApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let built = Instant::now();
+        self.bench_fold();
         let vw = window.viewport_size().width.to_f64() as f32;
         let (sw, sliding) = self.sidebar_w(vw);
         if self.tick() || sliding || self.bench.is_some() {
@@ -865,6 +937,26 @@ impl TraceApp {
             }))
     }
 
+    fn bench_fold(&mut self) {
+        // The biggest subtree near the top, folded and unfolded every 18 frames (about 300ms at 60fps).
+        // Runs before the frame builds, so the list never lays out rows its count no longer matches.
+        let Some(b) = &mut self.bench else { return };
+        let frame = b.intervals.len();
+        let (Some(target), Some(doc)) = (&mut b.fold, &self.doc) else { return };
+        let id = target.get_or_insert_with(|| {
+            let size = |i: usize| doc.rows[i + 1..].iter().take_while(|r| r.depth > doc.rows[i].depth).count();
+            let i = (0..doc.rows.len().min(30)).max_by_key(|&i| size(i)).unwrap_or(0);
+            match &doc.rows[i].kind {
+                RowKind::Span(id) => id.clone(),
+                RowKind::UnresolvedHeader => SpanId::default(),
+            }
+        });
+        if frame % 18 == 1 {
+            let id = id.clone();
+            self.toggle_fold(&id);
+        }
+    }
+
     fn bench_step(&mut self, built: Instant, cx: &mut Context<Self>) {
         let Some(b) = &mut self.bench else { return };
         let now = Instant::now();
@@ -881,11 +973,15 @@ impl TraceApp {
             let mut iv = b.intervals[10..].to_vec();
             let mut bd = b.builds[10..].to_vec();
             let mut rw = b.rows[10.min(b.rows.len())..].to_vec();
-            println!("bench-scroll: {} frames, rows {}", iv.len(), self.doc.as_ref().map_or(0, |d| d.rows.len()));
+            let name = if b.fold.is_some() { "bench-fold" } else { "bench-scroll" };
+            println!("{name}: {} frames, rows {}", iv.len(), self.doc.as_ref().map_or(0, |d| d.rows.len()));
             println!("frame interval {}", stats(&mut iv));
             println!("render build   {}", stats(&mut bd));
             println!("rows build     {}", stats(&mut rw));
             cx.quit();
+            return;
+        }
+        if b.fold.is_some() {
             return;
         }
         let rows = self.doc.as_ref().map_or(0, |d| d.rows.len()) as f32;
@@ -1037,6 +1133,7 @@ impl TraceApp {
 
     fn render_card(&mut self, pal: &Palette, vw: f32, card_left: f32, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let g = self.geo(vw, card_left).expect("render_card runs with a document");
+        let folding = self.render_fold(g, window, cx);
         let doc = self.doc.as_ref().expect("checked by caller");
         let ticks = tick_times(&g.vp, f64::from(g.tl_w), g.origin, 90.);
         let show_now = !matches!(doc.mode, Mode::Static);
@@ -1107,24 +1204,30 @@ impl TraceApp {
             .when(show_now && (0.0..=g.tl_w).contains(&now_x), |el| {
                 el.child(div().absolute().top_0().bottom_0().left(px(g.name_w + now_x.round())).w(px(1.)).bg(pal.now))
             })
-            .child(
-                uniform_list(
+            .child(match folding {
+                Some(stack) => stack.into_any_element(),
+                None => uniform_list(
                     "rows",
                     count,
                     cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
                         let t0 = Instant::now();
-                        let rows = range.map(|ix| this.render_row(ix, g, window, cx)).collect::<Vec<_>>();
+                        let rows = range
+                            .map(|ix| {
+                                let row = this.doc.as_ref().expect("rows need a document").rows[ix].clone();
+                                this.render_row(ix, &row, ix, g, window, cx)
+                            })
+                            .collect::<Vec<_>>();
                         if let Some(b) = &mut this.bench {
                             b.rows.push(t0.elapsed().as_secs_f32() * 1e3);
                         }
                         rows
                     }),
                 )
-                    .track_scroll(&self.list)
-                    .size_full()
-                    .pb(px(if matches!(doc.mode, Mode::Replay { .. }) { 72. } else { 8. })),
-            )
-            
+                .track_scroll(&self.list)
+                .size_full()
+                .pb(px(if matches!(doc.mode, Mode::Replay { .. }) { 72. } else { 8. }))
+                .into_any_element(),
+            })
             .child(gpui_kit::component::scroll::Scrollbar::vertical(&self.list));
         let stats = self.render_stats(pal);
         let overview = self.render_overview(pal, g, cx);
@@ -1153,6 +1256,38 @@ impl TraceApp {
                     .child(div().absolute().top(px(top - 10.)).bottom(px(0.)).left(px(x)).w(px(1.)).bg(pal.now).h(px(10.)))
             })
             .children(transport)
+    }
+
+    /// While a fold animates, the visible rows as a stack whose hidden or shown rows grow or shrink
+    /// with the fold. Only rows in view are built; the uniform list returns when the fold settles.
+    fn render_fold(&mut self, g: Geo, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
+        let f = self.fold_anim.as_ref()?;
+        let p = ease(self.progress(f.start, FOLD_ANIM));
+        let top = -self.list.0.borrow().base_handle.offset().y.to_f64() as f32;
+        let bottom = top + window.viewport_size().height.to_f64() as f32;
+        let mut visible = Vec::new();
+        let (mut y, mut next) = (0., 0usize);
+        for (k, (row, change)) in f.rows.iter().enumerate() {
+            if y >= bottom {
+                break;
+            }
+            let h = ROW_H * change.scale(p);
+            // A row on its way out answers clicks as the row above it, its parent.
+            let ix = if *change == Change::Leave { next.saturating_sub(1) } else { next };
+            if y + h > top && h >= 0.5 {
+                visible.push((ix, k, row.clone(), *change, y, h));
+            }
+            next += usize::from(*change != Change::Leave);
+            y += h;
+        }
+        let rows: Vec<_> = visible
+            .into_iter()
+            .map(|(ix, k, row, change, y, h)| {
+                let key = if change == Change::Leave { usize::MAX - k } else { ix };
+                div().absolute().left_0().right_0().top(px(y - top)).h(px(h)).overflow_hidden().opacity(change.scale(p)).child(self.render_row(ix, &row, key, g, window, cx))
+            })
+            .collect();
+        Some(div().size_full().relative().overflow_hidden().children(rows))
     }
 
     /// The whole session as a density strip, with the visible window as a lens: click jumps, drag moves,
@@ -1316,10 +1451,10 @@ impl TraceApp {
         }))
     }
 
-    fn render_row(&mut self, ix: usize, g: Geo, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// `ix` is the row's place in the document, for selection and hover; `key` names its elements.
+    fn render_row(&mut self, ix: usize, row: &Row, key: usize, g: Geo, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let pal = Palette::new(self.dark(window));
         let doc = self.doc.as_ref().expect("rows need a document");
-        let row = doc.rows[ix].clone();
         let RowKind::Span(id) = &row.kind else {
             return div()
                 .h(px(ROW_H))
@@ -1333,7 +1468,7 @@ impl TraceApp {
         };
         let s = &doc.state.spans[id];
         let selected = doc.selected.as_ref() == Some(id);
-        let hovered = self.hovered == Some(ix);
+        let hovered = key == ix && self.hovered == Some(ix);
         let live = !matches!(doc.mode, Mode::Static);
         let running = live && s.ended_at_utc_ns.is_none() && s.status == SpanStatus::Running;
         let tone = present::tone(s);
@@ -1358,7 +1493,7 @@ impl TraceApp {
         let chevron_id = id.clone();
         name = name.child(
             div()
-                .id(("chev", ix))
+                .id(("chev", key))
                 .size(px(14.))
                 .flex_shrink_0()
                 .flex()
@@ -1366,7 +1501,7 @@ impl TraceApp {
                 .justify_center()
                 .when(row.has_children, |el| {
                     let progress = match &self.fold_anim {
-                        Some((a, t)) if a == id => ease(t.elapsed().as_secs_f32() / FOLD_ANIM.as_secs_f32()),
+                        Some(f) if f.id == *id => ease(self.progress(f.start, FOLD_ANIM)),
                         _ => 1.,
                     };
                     let folded = if row.collapsed { progress } else { 1. - progress };
@@ -1421,10 +1556,10 @@ impl TraceApp {
                     .when(s.status == SpanStatus::Failed, |el| el.child(Icon::new(IconName::TriangleAlert).size(px(13.)).text_color(pal.error.ink))),
             );
 
-        let timeline = self.render_bar(ix, s, &g, kc, &pal, hovered, slowest, &hidden, window);
+        let timeline = self.render_bar(key, s, &g, kc, &pal, hovered, slowest, &hidden, window);
         let click_id = id.clone();
         let mut el = div()
-            .id(("row", ix))
+            .id(("row", key))
             .h(px(ROW_H))
             .w_full()
             .relative()
@@ -1455,12 +1590,12 @@ impl TraceApp {
                 if ev.click_count() >= 2 {
                     this.zoom_to_span(&click_id);
                 } else {
-                    this.popover = true;
+                    this.popover = Pop::Open(Instant::now());
                 }
                 this.focus.focus(window, cx);
                 cx.notify();
             }));
-        if selected && self.popover {
+        if selected && !matches!(self.popover, Pop::Closed) {
             let end = s.effective_end(doc.state.session.ended_at_utc_ns, g.now);
             let x = g.name_w + present::popover_x(g.x(s.started_at_utc_ns), g.x(end), g.tl_w + TL_PAD_R, POPOVER_W);
             el = el.child(
@@ -1607,26 +1742,20 @@ impl TraceApp {
                 })
         };
         let start = s.started_at_utc_ns;
-        div()
-            .id("popover")
-            .occlude()
+        let shown = self.pop_shown();
+        let scale = 0.96 + 0.04 * shown;
+        let inset = POPOVER_W * (1. - scale) / 2.;
+        let full_h = self.pop_h.get();
+        let measure = self.pop_h.clone();
+        let content = div()
+            .relative()
             .w(px(POPOVER_W))
+            .ml(px(-inset))
             .flex()
             .flex_col()
             .gap(px(14.))
             .p(px(16.))
-            .rounded(px(16.))
-            .bg(pal.pop)
-            .border_1()
-            .border_color(pal.line)
-            .shadow(vec![soft_shadow(pal, 0.12, 16., 40.), soft_shadow(pal, 0.06, 2., 6.)])
-            .cursor_default()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.popover = false;
-                cx.notify();
-            }))
-            .on_click(|_, _, cx| cx.stop_propagation())
-            .with_animation("pop", Animation::new(Duration::from_millis(180)).with_easing(ease), |el, t| el.opacity(t).mt(px(6. * (1. - t))))
+            .child(canvas(move |b, _, _| measure.set(b.size.height.to_f64() as f32), |_, _, _, _| {}).absolute().inset_0())
             .child(
                 div()
                     .flex()
@@ -1656,7 +1785,7 @@ impl TraceApp {
                             .child(Icon::new(IconName::X).size(px(14.)).text_color(pal.muted))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 cx.stop_propagation();
-                                this.popover = false;
+                                this.close_popover();
                                 cx.notify();
                             })),
                     ),
@@ -1701,7 +1830,31 @@ impl TraceApp {
                     format!("Files  {}", s.artifacts.len()),
                     s.artifacts.iter().take(4).map(|a| (a.path.clone(), a.change_summary.clone().unwrap_or_default())).collect(),
                 ))
-            })
+            });
+        // GPUI has no element scale, so the card's bounds shrink toward its top edge, by the row,
+        // while the content holds still underneath, clipped.
+        div().w(px(POPOVER_W)).child(
+            div()
+                .id("popover")
+                .occlude()
+                .ml(px(inset))
+                .w(px(POPOVER_W * scale))
+                .when(shown < 1. && full_h > 0., |el| el.h(px((full_h + 2.) * scale)))
+                .overflow_hidden()
+                .opacity(shown)
+                .rounded(px(16.))
+                .bg(pal.pop)
+                .border_1()
+                .border_color(pal.line)
+                .shadow(vec![soft_shadow(pal, 0.12, 16., 40.), soft_shadow(pal, 0.06, 2., 6.)])
+                .cursor_default()
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.close_popover();
+                    cx.notify();
+                }))
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(content),
+        )
     }
 
     fn render_transport(&self, pal: &Palette, g: &Geo, cx: &mut Context<Self>) -> impl IntoElement {

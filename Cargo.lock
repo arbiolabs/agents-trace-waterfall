@@ -7332,6 +7332,7 @@ dependencies = [
  "clap",
  "gpui-kit",
  "gpui-pre-macos",
+ "objc2-app-kit 0.3.2",
  "serde_json",
  "trace-core",
  "trace-ingest",
