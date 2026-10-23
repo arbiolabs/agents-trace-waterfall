@@ -478,15 +478,28 @@ pub fn shown_end(state: &TraceState, idle: Option<Ns>) -> Option<Ns> {
 }
 
 /// The capsule pinned at the timeline edge while now is off-screen: `Now +6h49m`, the distance from
-/// the view's right edge to now, or `Now −3m` when the view lies past it.
-pub fn now_capsule(now: Ns, window: (Ns, Ns)) -> Option<(Edge, String)> {
+/// the view's right edge to now, or `Now −3m` when the view lies past it. While idle the overview's
+/// idle marker already states the gap, so the capsule reads just `Now` rather than a second, nearly equal figure.
+pub fn now_capsule(now: Ns, window: (Ns, Ns), idle: bool) -> Option<(Edge, String)> {
     if now > window.1 {
-        Some((Edge::Right, format!("Now +{}", format_duration(now - window.1))))
+        Some((Edge::Right, if idle { "Now".into() } else { format!("Now +{}", format_duration(now - window.1)) }))
     } else if now < window.0 {
         Some((Edge::Left, format!("Now \u{2212}{}", format_duration(window.0 - now))))
     } else {
         None
     }
+}
+
+/// A session's duration, by one rule for the sidebar and the header: start to end once ended; start to now
+/// while live and active; start to the last event while idle or when the end was never recorded.
+pub fn session_duration(started: Option<Ns>, ended: Option<Ns>, last_event: Option<Ns>, live: bool, now: Ns) -> Option<Ns> {
+    let start = started?;
+    let end = match (ended, live && last_event.is_none_or(|t| now - t <= IDLE_AFTER)) {
+        (Some(e), _) => e,
+        (None, true) => now,
+        (None, false) => last_event?,
+    };
+    Some((end - start).max(0))
 }
 
 /// The overview's right-edge marker while a live session is idle: the gap from its last activity to now.
@@ -1434,9 +1447,16 @@ mod tests {
         let h = 3_600_000 * MS;
         let m = 60_000 * MS;
         let w = (7 * h, 7 * h + 31 * m);
-        assert_eq!(now_capsule(14 * h + 20 * m, w), Some((Edge::Right, "Now +6h49m".into())));
-        assert_eq!(now_capsule(7 * h + 10 * m, w), None);
-        assert_eq!(now_capsule(6 * h, w), Some((Edge::Left, "Now \u{2212}1h".into())));
+        assert_eq!(now_capsule(14 * h + 20 * m, w, false), Some((Edge::Right, "Now +6h49m".into())));
+        assert_eq!(now_capsule(14 * h + 20 * m, w, true), Some((Edge::Right, "Now".into())), "idle: the gap is told once, by the idle marker");
+        assert_eq!(now_capsule(7 * h + 10 * m, w, false), None);
+        const SEC: Ns = 1_000_000_000;
+        let s = Some(0);
+        assert_eq!(session_duration(s, None, Some(14 * SEC), true, 60 * SEC), Some(60 * SEC), "live and active: to now, as the header says");
+        assert_eq!(session_duration(s, None, Some(14 * SEC), true, 14 * SEC + IDLE_AFTER + 1), Some(14 * SEC), "idle: to the last event");
+        assert_eq!(session_duration(s, Some(30 * SEC), Some(31 * SEC), false, 99 * SEC), Some(30 * SEC), "ended: to the end");
+        assert_eq!(session_duration(None, None, Some(1), true, 9), None);
+        assert_eq!(now_capsule(6 * h, w, false), Some((Edge::Left, "Now \u{2212}1h".into())));
     }
 
     #[test]

@@ -1357,10 +1357,8 @@ impl TraceApp {
         let when = start.and_then(|t| Local.timestamp_opt(t / 1_000_000_000, 0).single()).map(|t| {
             if start.unwrap_or(0) >= today { t.format("%H:%M").to_string() } else { t.format("%b %-d").to_string() }
         });
-        let dur = match (s.started_at_utc_ns, s.ended_at_utc_ns.or(s.last_event_at_utc_ns)) {
-            (Some(a), Some(b)) => Some(format_duration(b - a)),
-            _ => None,
-        };
+        let dur = present::session_duration(s.started_at_utc_ns, s.ended_at_utc_ns, s.last_event_at_utc_ns, s.status == SessionStatus::Live, trace_view::wall_ns())
+            .map(format_duration);
         let join = |parts: Vec<Option<String>>| parts.into_iter().flatten().collect::<Vec<_>>().join(" · ");
         // We never store prompts, so what tells sessions apart is how they ran.
         let turns = match s.turn_count {
@@ -1936,7 +1934,7 @@ impl TraceApp {
                 .into_any_element(),
             })
             .child(gpui_kit::component::scroll::Scrollbar::vertical(&self.list))
-            .when_some(g.live.then(|| present::now_capsule(g.now, g.window())).flatten(), |el, (edge, text)| {
+            .when_some(g.live.then(|| present::now_capsule(g.now, g.window(), g.idle.is_some())).flatten(), |el, (edge, text)| {
                 let left = edge == Edge::Left;
                 let chevron = Icon::new(if left { IconName::ChevronLeft } else { IconName::ChevronRight }).size(px(14.)).text_color(pal.accent);
                 el.child(
