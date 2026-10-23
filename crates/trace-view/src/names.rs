@@ -36,14 +36,24 @@ pub fn detail(s: &Span, state: &TraceState) -> Option<String> {
             .filter(|t| !t.eq_ignore_ascii_case(&s.name))
             .or_else(|| nonempty(s.provider.as_deref())),
         SpanKind::Agent => top_model(state),
-        SpanKind::Subagent => s.model.as_deref().map(pretty_model).or_else(|| nonempty(s.agent_name.as_deref()).map(short_id)),
+        // The agent's type (`Explore`) says more than its model; a bare id says less.
+        SpanKind::Subagent => nonempty(s.agent_name.as_deref())
+            .filter(|n| !is_opaque_id(n))
+            // A plugin's agent, `pstack:poteto-agent`, reads by its own name.
+            .map(|n| capitalize(n.rsplit(':').next().unwrap_or(&n)))
+            .or_else(|| s.model.as_deref().map(pretty_model))
+            .or_else(|| nonempty(s.agent_name.as_deref()).map(short_id)),
         _ => None,
     }
 }
 
 /// Opaque hex ids (harness agent ids) shorten to 7 characters, like git hashes; names are capitalized.
 fn short_id(v: String) -> String {
-    if v.len() > 12 && v.chars().all(|c| c.is_ascii_hexdigit()) { v[..7].to_owned() } else { capitalize(&v) }
+    if is_opaque_id(&v) { v[..7].to_owned() } else { capitalize(&v) }
+}
+
+fn is_opaque_id(v: &str) -> bool {
+    v.len() > 12 && v.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// The row title. An LLM span named after its model reads `LLM call`, since the detail already names the model.

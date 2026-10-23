@@ -5,7 +5,8 @@ Agent traces often contain secrets and proprietary source code. agents-trace-wat
 ## What is collected by default
 
 - Session metadata: project, working directory, adapter, harness, host.
-- Span metadata: name, kind, status, start and end times, model, provider, tool name.
+- Span metadata: name, kind, status, start and end times, model, provider, tool name. A sub-agent is named by
+  the short description its harness gave it (Claude Code's Agent `description`, at most 80 characters).
 - Usage: token counts and cost, with provenance (actual, estimate, or unknown).
 - Artifact records: file path, hash, and change summary.
 - Span `error` messages and span and session attributes, as the adapter sends them. Secret redaction applies, but nothing else is removed. An error message can quote source code or a command line.

@@ -318,10 +318,24 @@ struct Tailed {
     emit_from: u64,
 }
 
+/// Bumped when an adapter derives different events from the same source (a new name, a fixed time).
+/// Read positions are kept per revision, so a new one re-reads every source once; the store replaces
+/// the events that changed and keeps those whose source is gone.
+const ADAPTER_REVISION: u32 = 2;
+
 fn offsets_path(db: &Path) -> PathBuf {
     let mut p = db.as_os_str().to_owned();
-    p.push(".tail-offsets.json");
-    p.into()
+    p.push(format!(".tail-offsets-r{ADAPTER_REVISION}.json"));
+    let p = PathBuf::from(p);
+    // Positions from earlier revisions are stale.
+    let (Some(dir), Some(name)) = (db.parent(), db.file_name()) else { return p };
+    let prefix = format!("{}.tail-offsets", name.to_string_lossy());
+    for old in fs::read_dir(if dir.as_os_str().is_empty() { Path::new(".") } else { dir }).into_iter().flatten().flatten() {
+        if old.file_name().to_string_lossy().starts_with(&prefix) && old.path().file_name() != p.file_name() {
+            let _ = fs::remove_file(old.path());
+        }
+    }
+    p
 }
 
 fn tail_loop(

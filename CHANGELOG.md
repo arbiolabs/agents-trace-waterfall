@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-10-24
+
+### Fixed
+
+- Claude Code sub-agents read as the task their Agent call named ("Gemini CLI adapter"), with their
+  agent type beside it, instead of `subagent` and an id.
+- Claude Code turns only number your prompts. A background task reporting back reads as
+  "Notification · <task>", a `!` command as "Shell command" (its output stays in that turn), and a
+  compaction summary as "Context compacted".
+- Sessions already recorded pick up adapter fixes: the collector re-reads its sources once after an
+  adapter changes, and the store replaces events that now read differently, keeping sessions whose
+  source is gone.
+
 ## [1.2.1] - 2026-10-24
 
 ### Changed
@@ -145,7 +158,8 @@ terminal UI over the same recorded traces.
   time axis and previous / next activity (`{` / `}`).
 - Unicode and ASCII glyphs, colour and monochrome themes. Usable down to 60×18.
 
-[Unreleased]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.2.2...HEAD
+[1.2.2]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.0.0...v1.1.0

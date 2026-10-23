@@ -193,7 +193,8 @@ fn streams_acks_and_restart_does_not_duplicate() {
         store.append(&events).unwrap(),
         AppendOutcome {
             inserted: 0,
-            duplicates: 70
+            duplicates: 70,
+            updated: 0,
         }
     );
 }
@@ -276,6 +277,7 @@ fn import_fixture(store: &mut Store) -> AppendOutcome {
     AppendOutcome {
         inserted: a.inserted + b.inserted,
         duplicates: a.duplicates + b.duplicates,
+        updated: a.updated + b.updated,
     }
 }
 
@@ -286,7 +288,8 @@ fn claude_code_transcript_becomes_metadata_only_spans() {
         import_fixture(&mut store),
         AppendOutcome {
             inserted: 35,
-            duplicates: 0
+            duplicates: 0,
+            updated: 0,
         }
     );
     let s = store.load_session(&"sess-1".into()).unwrap();
@@ -404,7 +407,8 @@ fn claude_code_transcript_becomes_metadata_only_spans() {
         import_fixture(&mut store),
         AppendOutcome {
             inserted: 0,
-            duplicates: 35
+            duplicates: 35,
+            updated: 0,
         }
     );
 }
@@ -462,7 +466,7 @@ fn tailing_resumes_after_restart_without_duplicates() {
     );
     assert_eq!(journal_len(&store), 35);
 
-    let offsets = env.dir.join("trace.db.tail-offsets.json");
+    let offsets = env.dir.join("trace.db.tail-offsets-r2.json");
     std::fs::remove_file(&offsets).unwrap();
     let c = start(config(&env, &tail, YEAR));
     wait_for("both files re-read", || {
@@ -672,7 +676,7 @@ fn codex_rollout_becomes_turns_responses_and_nested_tools() {
     let mut store = Store::open_in_memory().unwrap();
     let path = harness_fixture("codex/rollout.jsonl");
     let first = import_file(&mut store, &path, "codex", &Capture::default()).unwrap();
-    assert_eq!(import_file(&mut store, &path, "codex", &Capture::default()).unwrap(), AppendOutcome { inserted: 0, duplicates: first.inserted }, "re-reading yields identical events");
+    assert_eq!(import_file(&mut store, &path, "codex", &Capture::default()).unwrap(), AppendOutcome { inserted: 0, duplicates: first.inserted, updated: 0 }, "re-reading yields identical events");
     let s = store.load_session(&"01a168be-ebc0-7652-9efb-c75c48a4b669".into()).unwrap();
     assert_eq!((s.session.project_id.as_str(), s.session.working_directory.as_str(), s.session.harness.as_str()), ("demo-proj", "/work/demo-proj", "codex"));
     assert_eq!(sorted_kinds(&s), ["Agent", "Llm", "Llm", "Llm", "Tool", "Tool", "Tool", "Tool", "Tool", "Turn", "Turn"]);
@@ -1085,4 +1089,64 @@ fn opencode_fork_skips_copied_history_and_compaction_is_a_model_call() {
     assert_eq!(turns, ["turn:f3"], "the copied history is the parent's, not the fork's");
     let compaction = span_of(&s, "llm:f4");
     assert_eq!((compaction.started_at_utc_ns, compaction.ended_at_utc_ns, compaction.usage.as_ref().unwrap().cost_usd_micros), ((b + 6000) * MS, Some((b + 7000) * MS), Some(10_000)));
+}
+
+/// Sub-agents read as the task their Agent call named, and turns that no prompt started read as what
+/// started them: a background task reporting back, a `!` shell command, a compaction summary.
+#[test]
+fn claude_code_names_sub_agents_and_turns_by_what_started_them() {
+    let dir = std::env::temp_dir().join(format!("tw-cc-names-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.jsonl");
+    let at = |s: u32| format!("2026-10-22T10:00:{s:02}.000Z");
+    let base = json!({"sessionId": "s", "cwd": "/w/p", "isSidechain": false});
+    let rec = |extra: Value| {
+        let mut v = base.clone();
+        v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        v.to_string()
+    };
+    let lines = [
+        rec(json!({"type": "user", "uuid": "u1", "promptId": "p1", "timestamp": at(0), "origin": {"kind": "human"}, "message": {"role": "user", "content": "SECRET_PROMPT"}})),
+        rec(json!({"type": "assistant", "uuid": "a1", "timestamp": at(2), "message": {"id": "m1", "model": "claude-opus-5-5", "role": "assistant", "stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "t1", "name": "Agent", "input": {"description": "Gemini CLI adapter", "subagent_type": "general-purpose", "prompt": "SECRET_AGENT_PROMPT", "run_in_background": true}}]}})),
+        rec(json!({"type": "user", "uuid": "r1", "promptId": "p1", "timestamp": at(3), "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "SECRET_RESULT"}]}, "toolUseResult": {"agentId": "ag1", "status": "async_launched"}})),
+        rec(json!({"type": "assistant", "uuid": "a2", "timestamp": at(4), "message": {"id": "m2", "model": "claude-opus-5-5", "role": "assistant", "stop_reason": "end_turn", "content": []}})),
+        rec(json!({"type": "user", "uuid": "n1", "promptId": "p2", "timestamp": at(10), "origin": {"kind": "task-notification"}, "message": {"role": "user", "content": "<task-notification>\n<task-id>ag1</task-id>\n<result>SECRET_SUMMARY</result>"}})),
+        rec(json!({"type": "user", "uuid": "b1", "promptId": "p3", "timestamp": at(20), "message": {"role": "user", "content": "<bash-input>SECRET_COMMAND</bash-input>"}})),
+        rec(json!({"type": "user", "uuid": "b2", "promptId": "p4", "timestamp": at(21), "message": {"role": "user", "content": "<bash-stdout>SECRET_OUTPUT</bash-stdout>"}})),
+        rec(json!({"type": "user", "uuid": "c1", "promptId": "p5", "timestamp": at(30), "isCompactSummary": true, "message": {"role": "user", "content": "SECRET_SUMMARY"}})),
+        rec(json!({"type": "user", "uuid": "u2", "promptId": "p6", "timestamp": at(40), "origin": {"kind": "human"}, "message": {"role": "user", "content": "SECRET_PROMPT_2"}})),
+    ];
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    import_file(&mut store, &path, "claude-code", &Capture::default()).unwrap();
+    let s = store.load_session(&"s".into()).unwrap();
+    let sub = span_of(&s, "subagent:ag1");
+    assert_eq!((sub.name.as_str(), sub.agent_name.as_deref()), ("Gemini CLI adapter", Some("general-purpose")));
+    let mut turns: Vec<_> = s.spans.values().filter(|x| x.kind == SpanKind::Turn).map(|x| (x.started_at_utc_ns, x.name.as_str())).collect();
+    turns.sort();
+    let names: Vec<_> = turns.into_iter().map(|(_, n)| n).collect();
+    assert_eq!(names, ["turn 1", "Notification · Gemini CLI adapter", "Shell command", "Context compacted", "turn 2"]);
+    let json = serde_json::to_string(&s.spans).unwrap();
+    assert!(!json.contains("SECRET"), "text leaked: {json}");
+}
+
+/// A re-read after an adapter change replaces what changed and keeps when it was first observed.
+#[test]
+fn append_replaces_an_event_whose_content_changed() {
+    let mut store = Store::open_in_memory().unwrap();
+    let mut events = read_events("examples/sample-trace.jsonl");
+    store.append(&events).unwrap();
+    let target = events.iter_mut().find(|e| matches!(e.body, EventBody::SpanStarted { .. })).unwrap();
+    let id = target.span_id.clone().unwrap();
+    if let EventBody::SpanStarted { name, .. } = &mut target.body {
+        *name = "renamed".into();
+    }
+    for e in &mut events {
+        e.observed_at_utc_ns += 1_000;
+    }
+    let out = store.append(&events).unwrap();
+    assert_eq!((out.inserted, out.updated, out.duplicates), (0, 1, events.len() - 1));
+    let s = store.load_session(&events[0].session_id).unwrap();
+    assert_eq!(s.spans[&id].name, "renamed");
+    assert_eq!(store.append(&events).unwrap().updated, 0, "the replacement is now the stored event");
 }

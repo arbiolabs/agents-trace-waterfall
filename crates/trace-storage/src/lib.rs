@@ -115,6 +115,9 @@ const PROJECTION_VERSION: i64 = 3;
 pub struct AppendOutcome {
     pub inserted: usize,
     pub duplicates: usize,
+    /// Events already stored that an adapter now derives differently (a re-read after an adapter
+    /// change): replaced, keeping when they were first observed.
+    pub updated: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -200,7 +203,8 @@ impl Store {
         Ok(())
     }
 
-    /// One transaction. Idempotent on (source_id, event_id): duplicates are skipped and counted.
+    /// One transaction. Idempotent on (source_id, event_id): duplicates are skipped and counted, unless
+    /// what they say changed, when they replace the stored event.
     /// Redacts known secrets in string values before writing. Updates projections for touched sessions.
     pub fn append(&mut self, events: &[CanonicalEvent]) -> Result<AppendOutcome> {
         let tx = self.conn.transaction()?;
@@ -225,7 +229,21 @@ impl Store {
                 ],
             )?;
             if n == 0 {
-                out.duplicates += 1;
+                let stored: String = tx.query_row("SELECT json FROM events WHERE source_id = ?1 AND event_id = ?2", params![r.source_id.0, r.event_id.0], |row| row.get(0))?;
+                let mut was: CanonicalEvent = serde_json::from_str(&stored)?;
+                if (&was.body, &was.span_id, was.occurred_at_utc_ns, &was.session_id) == (&r.body, &r.span_id, r.occurred_at_utc_ns, &r.session_id) {
+                    out.duplicates += 1;
+                    continue;
+                }
+                let observed = was.observed_at_utc_ns;
+                was = r.clone();
+                was.observed_at_utc_ns = observed;
+                tx.execute(
+                    "UPDATE events SET session_id = ?3, span_id = ?4, event_type = ?5, occurred_at = ?6, json = ?7 WHERE source_id = ?1 AND event_id = ?2",
+                    params![was.source_id.0, was.event_id.0, was.session_id.0, was.span_id.as_ref().map(|s| &s.0), was.body.type_name(), was.occurred_at_utc_ns, serde_json::to_string(&was)?],
+                )?;
+                out.updated += 1;
+                sessions.insert(r.session_id);
                 continue;
             }
             out.inserted += 1;

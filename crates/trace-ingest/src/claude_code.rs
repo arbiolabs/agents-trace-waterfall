@@ -2,10 +2,12 @@
 //! `<session>/subagents/agent-<id>.jsonl`) to canonical events. Metadata only: no prompt,
 //! assistant, thinking or tool payload text is copied.
 //!
-//! Spans: `agent:<session>` root, `turn:<promptId>` per user prompt, `llm:<message id>` per API
+//! Spans: `agent:<session>` root, `turn:<promptId>` per user prompt (`turn N`; a background task's
+//! notification, a `!` shell command or a compaction summary also starts one, named for what it is), `llm:<message id>` per API
 //! response (one response spans several transcript lines, one per content block), `tool:<tool_use id>`
 //! ended by its tool_result, `subagent:<agentId>` started by the parent transcript when the Agent
-//! tool result names the agent. Event ids derive from transcript uuids and ids, and `source_seq`
+//! tool result names the agent, named by the short description its Agent call gave it, with its
+//! agent type. Event ids derive from transcript uuids and ids, and `source_seq`
 //! counts events from the top of the file, so re-reading a file yields identical events.
 
 use serde_json::{Value, json};
@@ -31,6 +33,41 @@ struct State {
     turns: u64,
     llm_message: Option<String>,
     tool_starts: HashMap<String, Ns>,
+    /// Agent tool calls by id: the description and agent type they launched a sub-agent with.
+    agent_calls: HashMap<String, (Option<String>, Option<String>)>,
+    /// Sub-agent descriptions by agent id, for naming the notifications they send back.
+    agent_names: HashMap<String, String>,
+}
+
+/// What started a turn, from a user record that is not a tool result: a typed prompt (None), or the
+/// name of the record that stands in for one. Only the record's kind is read, never its text.
+fn turn_origin(v: &Value, names: &HashMap<String, String>) -> Option<String> {
+    let content = &v["message"]["content"];
+    let text = content.as_str().or_else(|| content.as_array()?.iter().find_map(|b| b["text"].as_str())).unwrap_or_default().trim_start();
+    if v["origin"]["kind"] == "task-notification" || text.starts_with("<task-notification>") {
+        // The task id is an id, not content: it names which sub-agent reported back.
+        let id = text.split_once("<task-id>").and_then(|(_, r)| r.split_once("</task-id>")).map(|(id, _)| id.trim());
+        return Some(match id.and_then(|id| names.get(id)) {
+            Some(name) => format!("Notification · {name}"),
+            None => "Task notification".into(),
+        });
+    }
+    if v["isCompactSummary"] == true {
+        return Some("Context compacted".into());
+    }
+    if text.starts_with("<bash-input>") {
+        return Some("Shell command".into());
+    }
+    if text.starts_with("<command-name>") || text.starts_with("<local-command") {
+        return Some("Command".into());
+    }
+    None
+}
+
+/// A sub-agent's description as a span name: one line, at most 80 characters.
+fn short_label(s: &str) -> Option<String> {
+    let line = s.lines().next()?.trim();
+    (!line.is_empty()).then(|| line.chars().take(80).collect())
 }
 
 impl TraceAdapter for ClaudeCode {
@@ -138,35 +175,39 @@ impl TraceAdapter for ClaudeCode {
                     e.end(format!("end:{tool}"), &tool, ts, status, error);
                     if let Some(a) = v["toolUseResult"]["agentId"].as_str() {
                         let at = st.tool_starts.get(id).copied().unwrap_or(ts);
+                        let (description, kind) = st.agent_calls.get(id).cloned().unwrap_or_default();
+                        if let Some(d) = &description {
+                            st.agent_names.insert(a.to_owned(), d.clone());
+                        }
                         e.start(
                             &span("subagent", a),
                             at,
                             Some(&tool),
                             SpanKind::Subagent,
-                            "subagent",
-                            |s| s.agent_name = Some(a.to_owned()),
+                            description.as_deref().unwrap_or("subagent"),
+                            |s| s.agent_name = Some(kind.unwrap_or_else(|| a.to_owned())),
                         );
                     }
                 }
                 let key = v["promptId"].as_str().unwrap_or(uuid);
+                let text = v["message"]["content"].as_str().or_else(|| content.iter().find_map(|b| b["text"].as_str())).unwrap_or_default();
+                // A shell command's output arrives as its own record: it belongs to the command's turn.
+                let output = ["<bash-stdout>", "<bash-stderr>", "<local-command-stdout>"].iter().any(|t| text.trim_start().starts_with(t));
                 if results.is_empty()
                     && agent.is_none()
                     && v["isMeta"] != true
+                    && !output
                     && st.turn.as_deref() != Some(key)
                 {
                     if let Some(old) = st.turn.take().filter(|_| st.turn_open) {
                         let t = span("turn", &old);
                         e.end(format!("end:{t}"), &t, ts, SpanStatus::Succeeded, None);
                     }
-                    st.turns += 1;
-                    e.start(
-                        &span("turn", key),
-                        ts,
-                        Some(&root),
-                        SpanKind::Turn,
-                        &format!("turn {}", st.turns),
-                        |_| {},
-                    );
+                    let name = turn_origin(&v, &st.agent_names).unwrap_or_else(|| {
+                        st.turns += 1;
+                        format!("turn {}", st.turns)
+                    });
+                    e.start(&span("turn", key), ts, Some(&root), SpanKind::Turn, &name, |_| {});
                     st.turn = Some(key.to_owned());
                     st.turn_open = true;
                 }
@@ -222,6 +263,10 @@ impl TraceAdapter for ClaudeCode {
                         continue;
                     };
                     st.tool_starts.insert(id.to_owned(), ts);
+                    if matches!(name, "Agent" | "Task") {
+                        let input = &b["input"];
+                        st.agent_calls.insert(id.to_owned(), (input["description"].as_str().and_then(short_label), input["subagent_type"].as_str().map(str::to_owned)));
+                    }
                     e.start(
                         &span("tool", id),
                         ts,

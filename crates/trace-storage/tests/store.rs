@@ -110,11 +110,11 @@ fn duplicate_append_is_idempotent_across_reopen() {
     let events = fixture("s1", "alpha", "src");
     {
         let mut store = Store::open(&path).unwrap();
-        assert_eq!(store.append(&events).unwrap(), AppendOutcome { inserted: 12, duplicates: 0 });
-        assert_eq!(store.append(&events).unwrap(), AppendOutcome { inserted: 0, duplicates: 12 });
+        assert_eq!(store.append(&events).unwrap(), AppendOutcome { inserted: 12, duplicates: 0, updated: 0 });
+        assert_eq!(store.append(&events).unwrap(), AppendOutcome { inserted: 0, duplicates: 12, updated: 0 });
     }
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.append(&events[..3]).unwrap(), AppendOutcome { inserted: 0, duplicates: 3 });
+    assert_eq!(store.append(&events[..3]).unwrap(), AppendOutcome { inserted: 0, duplicates: 3, updated: 0 });
     assert_eq!(store.max_journal_seq().unwrap(), 12);
     assert_eq!(store.events_since(10, Some(&"s1".into())).unwrap().iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![11, 12]);
     assert_eq!(store.events_since(0, Some(&"other".into())).unwrap().len(), 0);
