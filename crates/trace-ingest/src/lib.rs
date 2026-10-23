@@ -1,11 +1,21 @@
 //! Collector daemon, Unix socket protocol server, normalization and adapters.
 
 mod claude_code;
+mod cline;
 mod codex;
 mod collector;
+mod copilot;
+mod crush;
 mod emit;
+mod gemini;
+mod grok;
+mod hermes;
+mod kilo;
+mod kimi;
+mod openclaw;
 mod opencode;
 mod pi;
+mod qwen;
 
 pub use collector::run_collector_until;
 
@@ -165,8 +175,8 @@ fn hello(socket_path: &Path) -> anyhow::Result<String> {
     ))
 }
 
-/// "canonical" (pass-through JSONL), "claude-code", "codex", "pi", "omp" (Oh My Pi, pi's format) and "opencode". OpenCode keeps sessions in
-/// SQLite, so its adapter reads the lines [`opencode::read_db`] makes from the database.
+/// Adapters by name. Some sources are not appended transcripts (OpenCode's SQLite, for one): those also
+/// have a [`snapshot_reader`], and their line adapter reads the lines that reader makes.
 pub fn adapter_by_name(name: &str) -> Option<Box<dyn TraceAdapter>> {
     match name {
         "canonical" => Some(Box::new(Canonical)),
@@ -175,15 +185,49 @@ pub fn adapter_by_name(name: &str) -> Option<Box<dyn TraceAdapter>> {
         "pi" => Some(Box::new(pi::Pi::default())),
         "omp" => Some(Box::new(pi::Pi::recorded_by("omp"))),
         "opencode" => Some(Box::new(opencode::OpenCode::default())),
+        "gemini-cli" => Some(gemini::adapter("gemini-cli")),
+        "qwen-code" => Some(qwen::adapter("qwen-code")),
+        "kilo" => Some(kilo::adapter("kilo")),
+        "openclaw" => Some(openclaw::adapter("openclaw")),
+        "copilot" => Some(copilot::adapter("copilot")),
+        "cline" => Some(cline::adapter("cline")),
+        "roo" => Some(cline::adapter("roo")),
+        "kimi" => Some(kimi::adapter("kimi")),
+        "crush" => Some(crush::adapter("crush")),
+        "hermes" => Some(hermes::adapter("hermes")),
+        "grok" => Some(grok::adapter("grok")),
         _ => None,
     }
 }
 
-pub const ADAPTERS: &[&str] = &["canonical", "claude-code", "codex", "pi", "omp", "opencode"];
+pub const ADAPTERS: &[&str] = &["canonical", "claude-code", "codex", "pi", "omp", "opencode", "gemini-cli", "qwen-code", "kilo", "openclaw", "copilot", "cline", "roo", "kimi", "crush", "hermes", "grok"];
 
-/// Adapters whose source is a database, not a JSONL file.
-fn reads_database(adapter: &str) -> bool {
-    adapter == "opencode"
+/// Reads a source that is not an appended transcript (a database, a JSON file rewritten in place): every
+/// session changed since the cursor, and the new cursor.
+pub(crate) type SnapshotRead = Box<dyn Fn(&Path, i64) -> anyhow::Result<(Vec<CanonicalEvent>, i64)>>;
+
+/// The snapshot reader of an adapter whose source is read whole, or None for a JSONL transcript.
+pub(crate) fn snapshot_reader(adapter: &str) -> Option<SnapshotRead> {
+    macro_rules! snapshot {
+        ($m:ident, $name:expr) => {
+            $m::SNAPSHOT.then(|| Box::new(move |p: &Path, since: i64| $m::read(p, since, $name)) as SnapshotRead)
+        };
+    }
+    match adapter {
+        "opencode" => Some(Box::new(opencode::read_db)),
+        "gemini-cli" => snapshot!(gemini, "gemini-cli"),
+        "qwen-code" => snapshot!(qwen, "qwen-code"),
+        "kilo" => snapshot!(kilo, "kilo"),
+        "openclaw" => snapshot!(openclaw, "openclaw"),
+        "copilot" => snapshot!(copilot, "copilot"),
+        "cline" => snapshot!(cline, "cline"),
+        "roo" => snapshot!(cline, "roo"),
+        "kimi" => snapshot!(kimi, "kimi"),
+        "crush" => snapshot!(crush, "crush"),
+        "hermes" => snapshot!(hermes, "hermes"),
+        "grok" => snapshot!(grok, "grok"),
+        _ => None,
+    }
 }
 
 /// Import a JSONL file through the named adapter into the store, applying the same capture policy as the collector.
@@ -194,8 +238,8 @@ pub fn import_file(store: &mut Store, path: &Path, adapter: &str, capture: &Capt
             ADAPTERS.join(", ")
         )
     })?;
-    if reads_database(adapter) {
-        let (mut events, _) = opencode::read_db(path, i64::MIN)?;
+    if let Some(read) = snapshot_reader(adapter) {
+        let (mut events, _) = read(path, i64::MIN)?;
         capture.strip(&mut HashMap::new(), &mut events);
         return store.append(&events);
     }

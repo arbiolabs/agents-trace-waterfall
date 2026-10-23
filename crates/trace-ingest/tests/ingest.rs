@@ -519,21 +519,12 @@ fn doctor_reports_live_collector_and_adapter_blind_spots() {
     let checks = trace_ingest::doctor(&env.sock, &env.db);
     c.stop();
     let summary: Vec<_> = checks.iter().map(|c| (c.ok, c.name.as_str())).collect();
-    assert_eq!(
-        summary,
-        [
-            (true, "storage"),
-            (true, "database permissions"),
-            (true, "socket"),
-            (true, "collector"),
-            (true, "adapter canonical"),
-            (true, "adapter claude-code"),
-            (true, "adapter codex"),
-            (true, "adapter pi"),
-            (true, "adapter omp"),
-            (true, "adapter opencode")
-        ]
-    );
+    let adapters: Vec<String> = trace_ingest::ADAPTERS.iter().map(|a| format!("adapter {a}")).collect();
+    let expected: Vec<_> = [(true, "storage"), (true, "database permissions"), (true, "socket"), (true, "collector")]
+        .into_iter()
+        .chain(adapters.iter().map(|a| (true, a.as_str())))
+        .collect();
+    assert_eq!(summary, expected);
     assert_eq!(checks[3].detail, "answers hello with welcome (protocol 1)");
     assert!(
         checks[5]

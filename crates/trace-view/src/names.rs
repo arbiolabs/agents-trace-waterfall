@@ -102,6 +102,12 @@ fn known_harness(h: &str) -> Option<&'static str> {
         "devin" => "Devin",
         "pi" => "Pi",
         "omp" | "ohmypi" => "Oh My Pi",
+        "qwen" | "qwencode" => "Qwen Code",
+        "kimi" | "kimicode" | "kimicli" => "Kimi Code",
+        "grok" | "grokcli" => "Grok CLI",
+        "openclaw" => "OpenClaw",
+        "crush" => "Crush",
+        "hermes" | "hermesagent" => "Hermes Agent",
         _ => return None,
     })
 }

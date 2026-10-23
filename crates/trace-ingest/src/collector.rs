@@ -317,8 +317,8 @@ fn tail_loop(
     let mut files = HashMap::new();
     while !stop.load(Ordering::Relaxed) {
         for (adapter, root) in roots {
-            if crate::reads_database(adapter) {
-                match tail_database(root, &mut offsets, tx) {
+            if let Some(read) = crate::snapshot_reader(adapter) {
+                match tail_snapshot(&read, root, &mut offsets, tx) {
                     Ok(false) => {}
                     Ok(true) => save_offsets(offsets_path, &offsets),
                     Err(e) => eprintln!("collector: reading {}: {e:#}", root.display()),
@@ -354,11 +354,11 @@ fn save_offsets(path: &Path, offsets: &BTreeMap<PathBuf, u64>) {
     }
 }
 
-/// Appends the events of every OpenCode session changed since the last poll. The offset is the newest
-/// change seen, in epoch milliseconds. True if it moved.
-fn tail_database(db: &Path, offsets: &mut BTreeMap<PathBuf, u64>, tx: &mpsc::Sender<Cmd>) -> anyhow::Result<bool> {
+/// Appends the events of every session a snapshot source changed since the last poll. The offset is the
+/// reader's cursor (for most, the newest change in epoch milliseconds). True if it moved.
+fn tail_snapshot(read: &crate::SnapshotRead, db: &Path, offsets: &mut BTreeMap<PathBuf, u64>, tx: &mpsc::Sender<Cmd>) -> anyhow::Result<bool> {
     let since = offsets.get(db).map_or(i64::MIN, |&o| o as i64);
-    let (events, newest) = crate::opencode::read_db(db, since)?;
+    let (events, newest) = read(db, since)?;
     append_tailed(events, tx)?;
     if newest == since {
         return Ok(false);
