@@ -310,6 +310,20 @@ impl TraceApp {
             this.toggle_fold(&id);
         }
         this.focus.focus(window, cx);
+        if let Some(n) = cli.tab {
+            cx.spawn_in(window, async move |_, cx| {
+                cx.background_executor().timer(Duration::from_millis(1500)).await;
+                for _ in 0..n {
+                    cx.update(|window, cx| {
+                        window.dispatch_keystroke(Keystroke::parse("tab").expect("a valid keystroke"), cx);
+                        window.refresh();
+                    })
+                    .ok();
+                    cx.background_executor().timer(Duration::from_millis(200)).await;
+                }
+            })
+            .detach();
+        }
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(WATCH).await;
@@ -1090,7 +1104,7 @@ impl TraceApp {
                         .border_1()
                         .border_color(pal.line)
                         .text_size(px(12.5))
-                        .child(Input::new(&self.session_search).appearance(false).small().prefix(Icon::new(IconName::Search).size(px(13.)).text_color(pal.muted))),
+                        .child(Input::new(&self.session_search).tab_index(TAB_SIDEBAR).appearance(false).small().prefix(Icon::new(IconName::Search).size(px(13.)).text_color(pal.muted))),
                 ),
             )
             .child(list)
@@ -1175,11 +1189,12 @@ impl TraceApp {
     }
 }
 
-/// Tab order groups: sidebar, header, the trace card, then the popover.
-const TAB_SIDEBAR: isize = 0;
-const TAB_HEADER: isize = 1;
-const TAB_CARD: isize = 2;
-const TAB_POPOVER: isize = 3;
+/// Tab order groups: sidebar, header, the trace card, then the popover. All positive, since index 0 sorts
+/// apart from them.
+const TAB_SIDEBAR: isize = 1;
+const TAB_HEADER: isize = 2;
+const TAB_CARD: isize = 3;
+const TAB_POPOVER: isize = 4;
 
 /// A keyboard-reachable control: a tab stop in group `order` that draws the focus ring, 2pt of accent at
 /// 50% set 2pt off its edge over `surface`, only when focus arrived from the keyboard.
@@ -1407,7 +1422,7 @@ impl TraceApp {
                         .border_1()
                         .border_color(if self.span_search.read(cx).focus_handle(cx).is_focused(window) { pal.accent.opacity(0.6) } else { pal.line })
                         .text_size(px(12.5))
-                        .child(Input::new(&self.span_search).appearance(false).small().cleanable(true).prefix(Icon::new(IconName::ListFilter).size(px(13.)).text_color(pal.muted))),
+                        .child(Input::new(&self.span_search).tab_index(TAB_HEADER).appearance(false).small().cleanable(true).prefix(Icon::new(IconName::ListFilter).size(px(13.)).text_color(pal.muted))),
                 );
             }
             let (status, label, pulse) = match &doc.mode {

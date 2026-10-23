@@ -45,6 +45,9 @@ pub struct Cli {
     /// selected span; with `--popover`, holds the popover opening.
     #[arg(long, hide = true)]
     pub freeze_anim: Option<f32>,
+    /// Press Tab this many times once the window has drawn, for focus ring screenshots.
+    #[arg(long, hide = true)]
+    pub tab: Option<usize>,
 }
 
 fn parse_window(v: &str) -> Result<(f64, f64), String> {
