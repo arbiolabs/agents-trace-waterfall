@@ -48,6 +48,18 @@ pub struct Cli {
     /// Press Tab this many times once the window has drawn, for focus ring screenshots.
     #[arg(long, hide = true)]
     pub tab: Option<usize>,
+    /// Right-click at `X,Y` in window points once the window has drawn, for context menu screenshots.
+    #[arg(long, hide = true, value_parser = parse_window)]
+    pub context_menu: Option<(f64, f64)>,
+    /// List sessions by recency or by workspace; overrides the remembered choice.
+    #[arg(long, hide = true, value_parser = ["recent", "workspaces"])]
+    pub sidebar_mode: Option<String>,
+    /// Collapse the sidebar workspace or project with this name; repeatable.
+    #[arg(long, hide = true)]
+    pub collapse: Vec<String>,
+    /// Type this into the session search field.
+    #[arg(long, hide = true)]
+    pub search: Option<String>,
 }
 
 fn parse_window(v: &str) -> Result<(f64, f64), String> {
@@ -150,7 +162,7 @@ fn main() -> anyhow::Result<()> {
             window_background: WindowBackgroundAppearance::Blurred,
             ..Default::default()
         };
-        let opened = open_window(options, cx, |window, cx| cx.new(|cx| app::TraceApp::new(store, cfg.capture.clone(), forced_dark, &cli, window, cx)));
+        let opened = open_window(options, cx, |window, cx| cx.new(|cx| app::TraceApp::new(store, cfg.capture.clone(), forced_dark, &cli, db.with_extension("sidebar.json"), window, cx)));
         match opened {
             // The kit's root paints the theme background over the whole window; clear it so the
             // sidebar's translucent tray shows the window's blur.

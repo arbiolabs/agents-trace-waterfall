@@ -1,5 +1,5 @@
 use crate::Cli;
-use crate::present::{self, Change, Edge, Grab, Group, LabelAt, Shape, Status, Tone, ease};
+use crate::present::{self, Change, Edge, Grab, Group, LabelAt, Shape, SidebarMode, SidebarNode, Status, Tone, ease};
 use crate::theme::{KindColors, Palette};
 use chrono::{Local, TimeZone};
 use gpui_kit::assets::IconName;
@@ -12,7 +12,7 @@ use gpui_kit::component::{Icon, Sizable, Theme, ThemeMode};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -132,6 +132,50 @@ struct FoldAnim {
     rows: Vec<(Row, Change)>,
 }
 
+/// What a right-click in the sidebar targets, for its context menu.
+#[derive(Clone)]
+enum MenuTarget {
+    Session(SessionId),
+    /// A workspace or project header: its state key and directory.
+    Folder { key: String, path: String },
+}
+
+/// The sidebar's remembered layout, saved next to the store so it survives a relaunch.
+struct SidebarState {
+    path: PathBuf,
+    mode: SidebarMode,
+    /// Keys of collapsed workspaces and projects; see `present::Workspace::key`.
+    collapsed: HashSet<String>,
+    /// The header last toggled and when, so its chevron can turn.
+    turned: Option<(String, Instant)>,
+}
+
+impl SidebarState {
+    fn load(path: PathBuf) -> Self {
+        let v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let mode = if v["mode"] == "workspaces" { SidebarMode::Workspaces } else { SidebarMode::Recent };
+        let collapsed = v["collapsed"].as_array().into_iter().flatten().filter_map(|k| k.as_str().map(str::to_owned)).collect();
+        Self { path, mode, collapsed, turned: None }
+    }
+
+    /// Best effort: a read-only directory only costs the layout on the next launch.
+    fn save(&self) {
+        let mut collapsed: Vec<&String> = self.collapsed.iter().collect();
+        collapsed.sort();
+        let mode = if self.mode == SidebarMode::Workspaces { "workspaces" } else { "recent" };
+        let body = serde_json::json!({ "mode": mode, "collapsed": collapsed });
+        trace_view::write_private(&self.path, body.to_string().as_bytes()).ok();
+    }
+
+    fn toggle(&mut self, key: &str) {
+        if !self.collapsed.remove(key) {
+            self.collapsed.insert(key.to_owned());
+        }
+        self.turned = Some((key.to_owned(), Instant::now()));
+        self.save();
+    }
+}
+
 /// The detail popover's lifecycle; it stays mounted while it fades out.
 #[derive(Clone, Copy)]
 enum Pop {
@@ -191,8 +235,9 @@ pub struct TraceApp {
     bench: Option<Bench>,
     /// When the empty state's command was last copied, for the brief check mark.
     copied_at: Option<Instant>,
-    /// The session a sidebar right-click targets, for its context menu.
-    menu_session: Option<SessionId>,
+    /// What the last sidebar right-click targeted, for its context menu.
+    menu_target: Option<MenuTarget>,
+    sidebar: SidebarState,
     /// macOS Increase Contrast.
     contrast: bool,
     /// macOS Reduce Transparency: the sidebar drops its translucency.
@@ -206,6 +251,7 @@ impl TraceApp {
         capture: trace_ingest::Capture,
         forced_dark: Option<bool>,
         cli: &Cli,
+        state_path: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -267,7 +313,8 @@ impl TraceApp {
             initial_window: cli.viewport,
             bench: (cli.bench_scroll || cli.bench_fold).then(|| Bench { last: Instant::now(), intervals: Vec::new(), builds: Vec::new(), rows: Vec::new(), fold: cli.bench_fold.then_some(None) }),
             copied_at: None,
-            menu_session: None,
+            menu_target: None,
+            sidebar: SidebarState::load(state_path),
             contrast: display_accessibility().0,
             solid_sidebar: display_accessibility().1,
             _subs: subs,
@@ -276,7 +323,17 @@ impl TraceApp {
         this.sidebar_anim.0 = w;
         this.sidebar_anim.1 = w;
         apply_theme(this.dark(window), cx);
+        if let Some(m) = &cli.sidebar_mode {
+            this.sidebar.mode = if m == "workspaces" { SidebarMode::Workspaces } else { SidebarMode::Recent };
+        }
+        if let Some(q) = &cli.search {
+            this.session_search.update(cx, |s, cx| s.set_value(q.clone(), window, cx));
+        }
         this.refresh_sessions(cx);
+        if !cli.collapse.is_empty() {
+            let keys = folder_keys(&this.sessions, |name| cli.collapse.iter().any(|c| c == name));
+            this.sidebar.collapsed.extend(keys);
+        }
         this.journal_seq = this.store.max_journal_seq().unwrap_or(0);
         let target = match &cli.open {
             Some(prefix) => trace_view::resolve_session(&this.store, prefix).map(Some),
@@ -310,6 +367,20 @@ impl TraceApp {
             this.toggle_fold(&id);
         }
         this.focus.focus(window, cx);
+        if let Some((x, y)) = cli.context_menu {
+            cx.spawn_in(window, async move |_, cx| {
+                cx.background_executor().timer(Duration::from_millis(1500)).await;
+                cx.update(|window, cx| {
+                    let position = point(px(x as f32), px(y as f32));
+                    let modifiers = Modifiers::default();
+                    window.dispatch_event(PlatformInput::MouseDown(MouseDownEvent { button: MouseButton::Right, position, modifiers, click_count: 1, first_mouse: false }), cx);
+                    window.dispatch_event(PlatformInput::MouseUp(MouseUpEvent { button: MouseButton::Right, position, modifiers, click_count: 1 }), cx);
+                    window.refresh();
+                })
+                .ok();
+            })
+            .detach();
+        }
         if let Some(n) = cli.tab {
             cx.spawn_in(window, async move |_, cx| {
                 cx.background_executor().timer(Duration::from_millis(1500)).await;
@@ -398,7 +469,8 @@ impl TraceApp {
         let now = Instant::now();
         let dt = now - self.last_frame;
         self.last_frame = now;
-        let Some(doc) = &mut self.doc else { return false };
+        let turning = self.sidebar.turned.as_ref().is_some_and(|(_, t)| self.progress(*t, FOLD_ANIM) < 1.);
+        let Some(doc) = &mut self.doc else { return turning };
         let res = match &doc.mode {
             Mode::Live { .. } if self.last_poll.elapsed() >= POLL => {
                 self.last_poll = now;
@@ -440,7 +512,7 @@ impl TraceApp {
             Pop::Closing(_) => true,
             Pop::Closed => false,
         };
-        running || now < self.reveal_until || self.fold_anim.is_some() || popping
+        running || turning || now < self.reveal_until || self.fold_anim.is_some() || popping
     }
 
     /// Linear progress of a transition that began at `start`, held by `--freeze-anim` and finished at once under Reduce Motion.
@@ -1044,47 +1116,90 @@ fn toast(pal: &Palette, msg: String, left: f32, cx: &mut Context<TraceApp>) -> i
 
 impl TraceApp {
     fn render_sidebar(&self, pal: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let today = Local::now().date_naive().and_hms_opt(0, 0, 0).and_then(|d| d.and_local_timezone(Local).earliest()).map_or(0, |d| d.timestamp_nanos_opt().unwrap_or(0));
+        let today = today_start();
+        let now = trace_view::wall_ns();
         let open_id = self.doc.as_ref().map(|d| d.session_id().clone());
-        let mut groups: Vec<(Group, Vec<&SessionSummary>)> = Vec::new();
-        for s in &self.sessions {
-            let g = present::group(s.status == SessionStatus::Live, s.started_at_utc_ns.or(s.last_event_at_utc_ns), today);
-            match groups.iter_mut().find(|(k, _)| *k == g) {
-                Some((_, v)) => v.push(s),
-                None => groups.push((g, vec![s])),
-            }
-        }
-        groups.sort_by_key(|(g, _)| *g);
+        let searching = !self.session_search_text(cx).is_empty();
         let mut list = div().id("sessions").flex_1().min_h(px(0.)).overflow_y_scroll().px(px(10.)).pb(px(10.));
-        for (g, items) in groups {
-            list = list.child(
-                div().pt(px(14.)).pb(px(6.)).px(px(10.)).text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(pal.muted).child(g.title()),
-            );
-            for s in items {
-                list = list.child(self.render_session_row(pal, s, g, open_id.as_ref() == Some(&s.session_id), today, cx));
+        for node in present::group_sessions(&self.sessions, self.sidebar.mode, now, today) {
+            match node {
+                SidebarNode::Section { group, sessions } => {
+                    list = list.child(div().pt(px(14.)).pb(px(6.)).px(px(10.)).text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(pal.muted).child(group.title()));
+                    for s in sessions {
+                        list = list.child(self.render_session_row(pal, s, group, open_id.as_ref() == Some(&s.session_id), today, false, cx));
+                    }
+                }
+                SidebarNode::Workspace(w) => {
+                    // A search shows every match, so it opens whatever it found inside.
+                    let open = searching || !self.sidebar.collapsed.contains(&w.key());
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    let tip = if w.path.is_empty() { "Sessions that reported no working directory".to_owned() } else { present::tilde(&w.path, &home) };
+                    let count = div().text_size(px(11.5)).text_color(pal.muted).font_features(tnum()).child(w.sessions().to_string());
+                    list = list.child(self.render_folder(pal, FolderRow { key: w.key(), path: w.path.clone(), name: w.name.clone(), spoken: w.spoken(), tip, depth: 0, open, live: w.live() > 0, trailing: count.into_any_element() }, cx));
+                    if !open {
+                        continue;
+                    }
+                    for p in &w.projects {
+                        let open = searching || !self.sidebar.collapsed.contains(&p.key());
+                        let trailing = div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .text_size(px(11.5))
+                            .text_color(pal.muted)
+                            .font_features(tnum())
+                            .children(p.cost().map(|c| format_cost(Some(c))))
+                            .child(div().h(px(16.)).min_w(px(16.)).px(px(5.)).flex().items_center().justify_center().rounded_full().bg(pal.hover.opacity(4.)).child(p.sessions.len().to_string()));
+                        let path = p.path.strip_prefix('#').map_or(p.path.clone(), |_| String::new());
+                        list = list.child(self.render_folder(pal, FolderRow { key: p.key(), tip: present::tilde(&path, &home), path, name: p.name.clone(), spoken: p.spoken(), depth: 1, open, live: p.live > 0, trailing: trailing.into_any_element() }, cx));
+                        if open {
+                            for s in &p.sessions {
+                                let g = present::group(s.status == SessionStatus::Live, s.started_at_utc_ns.or(s.last_event_at_utc_ns), today);
+                                list = list.child(self.render_session_row(pal, s, g, open_id.as_ref() == Some(&s.session_id), today, true, cx));
+                            }
+                        }
+                    }
+                }
             }
         }
-        if self.sessions.is_empty() && !self.session_search_text(cx).is_empty() {
+        if self.sessions.is_empty() && searching {
             list = list.child(div().px(px(10.)).pt(px(14.)).text_size(px(12.5)).text_color(pal.muted).child("No matching sessions"));
         }
         let app = cx.entity().downgrade();
         let list = list.role(Role::List).aria_label("Sessions").context_menu(move |menu, _, cx| {
-            let Some(id) = app.upgrade().and_then(|a| a.read(cx).menu_session.clone()) else { return menu };
-            let act = |label: &'static str, f: fn(&mut TraceApp, SessionId, &mut Window, &mut Context<TraceApp>)| {
-                let (app, id) = (app.clone(), id.clone());
+            let Some(target) = app.upgrade().and_then(|a| a.read(cx).menu_target.clone()) else { return menu };
+            let act = |label: &'static str, f: Box<dyn Fn(&mut TraceApp, &mut Window, &mut Context<TraceApp>)>| {
+                let app = app.clone();
+                let f = Rc::new(f);
                 PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                    let f = f.clone();
                     app.update(cx, |this, cx| {
-                        f(this, id.clone(), window, cx);
+                        f(this, window, cx);
                         cx.notify();
                     })
                     .ok();
                 })
             };
-            menu.item(act("Open", |this, id, _, _| this.open(id, false)))
-                .item(act("Replay", |this, id, _, _| this.open(id, true)))
-                .separator()
-                .item(act("Copy Session ID", |_, id, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(id.0.clone()))))
-                .item(act("Export JSONL…", |this, id, _, cx| this.export_session(id, cx)))
+            match target {
+                MenuTarget::Session(id) => {
+                    let (a, b, c, d) = (id.clone(), id.clone(), id.clone(), id);
+                    menu.item(act("Open", Box::new(move |this, _, _| this.open(a.clone(), false))))
+                        .item(act("Replay", Box::new(move |this, _, _| this.open(b.clone(), true))))
+                        .separator()
+                        .item(act("Copy Session ID", Box::new(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(c.0.clone())))))
+                        .item(act("Export JSONL…", Box::new(move |this, _, cx| this.export_session(d.clone(), cx))))
+                }
+                MenuTarget::Folder { key, path } => {
+                    let (reveal, copy) = (path.clone(), path.clone());
+                    let menu = menu.item(act("Collapse All Others", Box::new(move |this, _, _| this.collapse_others(&key))));
+                    if path.is_empty() {
+                        return menu;
+                    }
+                    menu.separator()
+                        .item(act("Reveal in Finder", Box::new(move |_, _, cx| cx.open_with_system(std::path::Path::new(&reveal)))))
+                        .item(act("Copy Path", Box::new(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone())))))
+                }
+            }
         });
         div()
             .w(px(SIDEBAR_W))
@@ -1107,6 +1222,7 @@ impl TraceApp {
                         .child(Input::new(&self.session_search).tab_index(TAB_SIDEBAR).appearance(false).small().prefix(Icon::new(IconName::Search).size(px(13.)).text_color(pal.muted))),
                 ),
             )
+            .child(div().px(px(14.)).pt(px(6.)).pb(px(2.)).child(self.render_mode_switch(pal, cx)))
             .child(list)
             .child(
                 div().px(px(14.)).pb(px(14.)).pt(px(6.)).child(
@@ -1131,7 +1247,107 @@ impl TraceApp {
             )
     }
 
-    fn render_session_row(&self, pal: &Palette, s: &SessionSummary, group: Group, selected: bool, today: Ns, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Recent | Workspaces, a compact segmented control under the search field.
+    fn render_mode_switch(&self, pal: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let track = if pal.dark { pal.chip } else { pal.hover.opacity(5.) };
+        div().id("mode-switch").role(Role::RadioGroup).aria_label("Group sessions").h(px(26.)).flex().p(px(2.)).rounded(px(8.)).bg(track).children([SidebarMode::Recent, SidebarMode::Workspaces].map(|m| {
+            let on = self.sidebar.mode == m;
+            focusable(div().id(m.label()), pal, track, TAB_SIDEBAR)
+                .role(Role::RadioButton)
+                .aria_label(m.label())
+                .aria_selected(on)
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(if on { pal.ink } else { pal.muted })
+                .cursor_pointer()
+                .when(on, |el| el.bg(if pal.dark { pal.pop } else { pal.card }).shadow(vec![soft_shadow(pal, 0.08, 1., 2.)]))
+                .when(!on, |el| el.hover(|s| s.text_color(pal.text)))
+                .child(m.label())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.sidebar.mode = m;
+                    this.sidebar.save();
+                    cx.notify();
+                }))
+        }))
+    }
+
+    /// A workspace or project header: chevron, folder or name, live mark, trailing counts. Click, Enter, or
+    /// Space toggles it; Left collapses and Right expands.
+    fn render_folder(&self, pal: &Palette, f: FolderRow, cx: &mut Context<Self>) -> impl IntoElement {
+        let turn = match &self.sidebar.turned {
+            Some((k, t)) if *k == f.key => ease(self.progress(*t, FOLD_ANIM)),
+            _ => 1.,
+        };
+        let folded = if f.open { 1. - turn } else { turn };
+        let workspace = f.depth == 0;
+        let (key, menu_key, menu_path) = (f.key.clone(), f.key.clone(), f.path.clone());
+        let (open, tip) = (f.open, f.tip);
+        focusable(div().id(SharedString::from(format!("folder-{}", f.key))), pal, pal.tray, TAB_SIDEBAR)
+            .role(Role::Button)
+            .aria_label(f.spoken)
+            .aria_expanded(f.open)
+            .h(px(if workspace { 30. } else { 28. }))
+            .mt(px(if workspace { 8. } else { 0. }))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .pl(px(4. + 12. * f32::from(f.depth)))
+            .pr(px(10.))
+            .rounded(px(7.))
+            .cursor_pointer()
+            .hover(|s| s.bg(pal.hover.opacity(3.)))
+            .child(Icon::new(IconName::ChevronDown).size(px(12.)).text_color(pal.muted).rotate(radians(-std::f32::consts::FRAC_PI_2 * folded)))
+            .when(workspace, |el| el.child(Icon::new(if f.open { IconName::FolderOpen } else { IconName::Folder }).size(px(14.)).text_color(pal.muted)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(px(if workspace { 12.5 } else { 12.5 }))
+                    .font_weight(if workspace { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                    .text_color(if workspace { pal.ink } else { pal.text })
+                    .child(f.name),
+            )
+            .when(f.live, |el| el.child(status_mark(pal, Status::Live, SharedString::from(format!("live-{key}")))))
+            .child(f.trailing)
+            .when(!tip.is_empty(), |el| el.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx)))
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, _| this.menu_target = Some(MenuTarget::Folder { key: menu_key.clone(), path: menu_path.clone() })))
+            .on_key_down(cx.listener({
+                let key = key.clone();
+                move |this, ev: &KeyDownEvent, _, cx| {
+                    let k = ev.keystroke.key.as_str();
+                    let toggle = matches!(k, "enter" | "space") || (k == "left" && open) || (k == "right" && !open);
+                    if toggle {
+                        this.sidebar.toggle(&key);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.sidebar.toggle(&key);
+                cx.notify();
+            }))
+    }
+
+    /// Collapses every other header at the same level as `key`, and opens `key`.
+    fn collapse_others(&mut self, key: &str) {
+        let level = &key[..2];
+        let all = folder_keys(&self.sessions, |_| true);
+        self.sidebar.collapsed.retain(|k| !k.starts_with(level));
+        self.sidebar.collapsed.extend(all.into_iter().filter(|k| k.starts_with(level) && k != key));
+        self.sidebar.save();
+    }
+
+    /// A session in the sidebar. `nested` rows sit inside a project, so they drop the project name and lead
+    /// with how the session ran.
+    #[allow(clippy::too_many_arguments)]
+    fn render_session_row(&self, pal: &Palette, s: &SessionSummary, group: Group, selected: bool, today: Ns, nested: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let name = if !s.project_id.is_empty() {
             s.project_id.clone()
         } else {
@@ -1152,17 +1368,25 @@ impl TraceApp {
             1 => Some("1 turn".to_owned()),
             n => Some(format!("{n} turns")),
         };
-        let how = join(vec![Some(s.harness.clone()).filter(|h| !h.is_empty()), s.model.as_deref().map(present::pretty_model), turns]);
+        let how = join(vec![Some(s.harness.clone()).filter(|h| !h.is_empty()), s.model.as_deref().map(present::pretty_model), turns.clone()]);
         let meta = join(vec![when, dur, s.totals.cost_usd_micros().map(|c| format_cost(Some(c)))]);
         let status = present::session_status(s.status, s.last_event_at_utc_ns, trace_view::wall_ns());
         let id = s.session_id.clone();
         let menu_id = s.session_id.clone();
         let spoken = [Some(name.clone()), Some(how.clone()).filter(|h| !h.is_empty()), Some(status.label().to_owned()), Some(meta.clone())].into_iter().flatten().collect::<Vec<_>>().join(", ");
         let ring = if selected { pal.card } else { pal.tray };
+        // Inside a project the name is the header above, and the tile already names a known harness.
+        let (title, how) = if nested && !how.is_empty() {
+            let harness = Some(s.harness.clone()).filter(|h| !h.is_empty() && present::harness_brand(h, &s.source_adapter).is_none());
+            (join(vec![harness, s.model.as_deref().map(present::pretty_model), turns.clone()]), String::new())
+        } else {
+            (name, how)
+        };
         focusable(div().id(SharedString::from(format!("session-{}", s.session_id))), pal, pal.tray, TAB_SIDEBAR)
             .flex()
             .gap(px(10.))
-            .px(px(10.))
+            .pl(px(if nested { 28. } else { 10. }))
+            .pr(px(10.))
             .py(px(7.))
             .rounded(px(9.))
             .cursor_pointer()
@@ -1179,16 +1403,49 @@ impl TraceApp {
                     .flex()
                     .flex_col()
                     .gap(px(1.))
-                    .child(div().truncate().text_size(px(13.)).font_weight(FontWeight::MEDIUM).text_color(pal.ink).child(name))
+                    .child(div().truncate().text_size(px(13.)).font_weight(FontWeight::MEDIUM).text_color(pal.ink).child(title))
                     .when(!how.is_empty(), |el| el.child(div().truncate().text_size(px(11.5)).text_color(pal.text).child(how)))
                     .child(div().truncate().text_size(px(11.5)).text_color(pal.muted).font_features(tnum()).child(meta)),
             )
-            .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, _| this.menu_session = Some(menu_id.clone())))
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, _| this.menu_target = Some(MenuTarget::Session(menu_id.clone()))))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open(id.clone(), false);
                 cx.notify();
             }))
     }
+}
+
+/// A workspace or project header's content, for `render_folder`.
+struct FolderRow {
+    key: String,
+    /// The directory, empty for the No workspace group.
+    path: String,
+    name: String,
+    spoken: String,
+    tip: String,
+    depth: u8,
+    open: bool,
+    live: bool,
+    trailing: AnyElement,
+}
+
+/// State keys of every workspace and project whose name passes `keep`.
+fn folder_keys(sessions: &[SessionSummary], keep: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for node in present::group_sessions(sessions, SidebarMode::Workspaces, trace_view::wall_ns(), 0) {
+        if let SidebarNode::Workspace(w) = node {
+            if keep(&w.name) {
+                out.push(w.key());
+            }
+            out.extend(w.projects.iter().filter(|p| keep(&p.name)).map(|p| p.key()));
+        }
+    }
+    out
+}
+
+/// Local midnight today, for the Today group.
+fn today_start() -> Ns {
+    Local::now().date_naive().and_hms_opt(0, 0, 0).and_then(|d| d.and_local_timezone(Local).earliest()).map_or(0, |d| d.timestamp_nanos_opt().unwrap_or(0))
 }
 
 /// Tab order groups: sidebar, header, the trace card, then the popover. All positive, since index 0 sorts
@@ -1406,7 +1663,12 @@ impl TraceApp {
         if let Some(doc) = &self.doc {
             let s = &doc.state.session;
             harness = present::harness_brand(&s.harness, &s.source_adapter);
-            let model = self.sessions.iter().find(|x| &x.session_id == doc.session_id()).and_then(|x| x.model.as_deref()).map(present::pretty_model);
+            // From the trace itself, since a sidebar search may have filtered this session out of the list.
+            let mut models: HashMap<&str, usize> = HashMap::new();
+            for m in doc.state.spans.values().filter(|x| x.kind == SpanKind::Llm).filter_map(|x| x.model.as_deref()) {
+                *models.entry(m).or_default() += 1;
+            }
+            let model = models.into_iter().max_by_key(|&(m, n)| (n, std::cmp::Reverse(m))).map(|(m, _)| present::pretty_model(m));
             subtitle = [Some(s.project_id.clone()).filter(|p| !p.is_empty()), Some(s.harness.clone()).filter(|h| !h.is_empty()), model]
                 .into_iter()
                 .flatten()
