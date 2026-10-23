@@ -12,6 +12,7 @@ mod grok;
 mod hermes;
 mod kilo;
 mod kimi;
+mod kimi_code;
 mod openclaw;
 mod opencode;
 mod pi;
@@ -193,6 +194,7 @@ pub fn adapter_by_name(name: &str) -> Option<Box<dyn TraceAdapter>> {
         "cline" => Some(cline::adapter("cline")),
         "roo" => Some(cline::adapter("roo")),
         "kimi" => Some(kimi::adapter("kimi")),
+        "kimi-code" => Some(kimi_code::adapter("kimi-code")),
         "crush" => Some(crush::adapter("crush")),
         "hermes" => Some(hermes::adapter("hermes")),
         "grok" => Some(grok::adapter("grok")),
@@ -200,7 +202,7 @@ pub fn adapter_by_name(name: &str) -> Option<Box<dyn TraceAdapter>> {
     }
 }
 
-pub const ADAPTERS: &[&str] = &["canonical", "claude-code", "codex", "pi", "omp", "opencode", "gemini-cli", "qwen-code", "kilo", "openclaw", "copilot", "cline", "roo", "kimi", "crush", "hermes", "grok"];
+pub const ADAPTERS: &[&str] = &["canonical", "claude-code", "codex", "pi", "omp", "opencode", "gemini-cli", "qwen-code", "kilo", "openclaw", "copilot", "cline", "roo", "kimi", "kimi-code", "crush", "hermes", "grok"];
 
 /// Reads a source that is not an appended transcript (a database, a JSON file rewritten in place): every
 /// session changed since the cursor, and the new cursor.
@@ -223,6 +225,7 @@ pub(crate) fn snapshot_reader(adapter: &str) -> Option<SnapshotRead> {
         "cline" => snapshot!(cline, "cline"),
         "roo" => snapshot!(cline, "roo"),
         "kimi" => snapshot!(kimi, "kimi"),
+        "kimi-code" => snapshot!(kimi_code, "kimi-code"),
         "crush" => snapshot!(crush, "crush"),
         "hermes" => snapshot!(hermes, "hermes"),
         "grok" => snapshot!(grok, "grok"),
