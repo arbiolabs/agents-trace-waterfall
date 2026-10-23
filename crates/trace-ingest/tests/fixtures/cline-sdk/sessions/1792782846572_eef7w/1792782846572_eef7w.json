@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "session_id": "1792782846572_eef7w",
+  "source": "cli",
+  "started_at": "2026-10-23T19:14:06.578Z",
+  "ended_at": "2026-10-23T19:16:48.221Z",
+  "exit_code": 0,
+  "status": "completed",
+  "interactive": false,
+  "provider": "ollama",
+  "model": "qwen3:8b",
+  "cwd": "/work/conf",
+  "workspace_root": "/work/conf",
+  "enable_tools": true,
+  "enable_spawn": true,
+  "enable_teams": true
+}

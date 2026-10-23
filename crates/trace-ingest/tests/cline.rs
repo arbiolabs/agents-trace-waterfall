@@ -1,8 +1,9 @@
 //! Cline and Roo Code record the conformance scenario in their task folders: `ui_messages.json`, the
 //! model-facing `api_conversation_history.json`, and Roo's `history_item.json` or Cline's
-//! `state/taskHistory.json` beside the tasks folder.
+//! `state/taskHistory.json` beside the tasks folder; Cline 4.x in its SDK session folder (manifest and one
+//! messages file per agent), which passes `support::conforms` whole.
 //!
-//! Neither can pass `support::conforms` whole, so [`conforms_but`] runs the same checks with one waived:
+//! The task folders cannot, so [`conforms_but`] runs the same checks with one waived:
 //! Roo records no model anywhere in a task folder, so its model calls cannot name one; Cline's
 //! `use_subagents` runs sub-agents in process and keeps only each one's totals, so a Cline sub-agent holds
 //! one aggregate model call and no tool calls.
@@ -121,6 +122,72 @@ fn cline(d: &Path) -> Vec<(PathBuf, &'static str)> {
     vec![(d.to_owned(), "cline")]
 }
 
+/// Cline 4.x's SDK session: the manifest and a messages file per agent, the sub-agent's beside its root's.
+fn cline_sdk(d: &Path) -> Vec<(PathBuf, &'static str)> {
+    let session = d.join("sessions/sdk");
+    let reply = |id: &str, secs: f64, calls: &[(&str, &str)]| {
+        let mut content = vec![json!({"type": "thinking", "thinking": SECRET}), json!({"type": "text", "text": SECRET})];
+        content.extend(calls.iter().map(|(id, name)| json!({"type": "tool_use", "id": id, "name": name, "input": {"path": SECRET}})));
+        json!({"id": id, "role": "assistant", "ts": ms(secs), "content": content,
+            "modelInfo": {"id": "claude-sonnet-4-5", "provider": "anthropic"}, "metrics": {"inputTokens": 100, "outputTokens": 20, "cacheReadTokens": 50, "cacheWriteTokens": 0, "cost": 0.001}})
+    };
+    let result = |id: &str, secs: f64, call: &str, ok: bool| {
+        json!({"id": id, "role": "user", "ts": ms(secs), "content": [{"type": "tool_result", "tool_use_id": call, "content": [{"query": SECRET, "result": SECRET, "success": ok, "error": if ok { Value::Null } else { json!(SECRET) }}]}]})
+    };
+    let prompt = |id: &str, secs: f64| json!({"id": id, "role": "user", "ts": ms(secs), "content": [{"type": "text", "text": SECRET}]});
+    let file = |id: &str, agent: &str, origin: Value, messages: Vec<Value>| json!({"version": 1, "updated_at": "2026-10-23T12:00:11.000Z", "agent": agent, "sessionId": id, "origin": origin, "messages": messages});
+    let main = vec![
+        prompt("u1", 0.),
+        reply("a1", 2., &[("c_read", "read_files")]),
+        result("r1", 3., "c_read", true),
+        reply("a2", 4., &[("c_bash", "run_commands")]),
+        result("r2", 5., "c_bash", false),
+        reply("a3", 6., &[("c_spawn", "spawn_agent")]),
+        json!({"id": "r3", "role": "user", "ts": ms(10.), "content": [{"type": "tool_result", "tool_use_id": "c_spawn", "content": json!({"text": SECRET}).to_string()}]}),
+        reply("a4", 11., &[]),
+    ];
+    let child = vec![prompt("su1", 6.), reply("sa1", 8., &[("c_grep", "search_codebase")]), result("sr1", 8.5, "c_grep", true), reply("sa2", 9.5, &[])];
+    write(&session.join("sdk.json"), &json!({"version": 1, "session_id": "sdk", "source": "cli", "status": "completed", "provider": "anthropic", "model": "claude-sonnet-4-5", "cwd": "/work/conf", "workspace_root": "/work/conf", "prompt": SECRET}));
+    write(&session.join("sdk.messages.json"), &file("sdk", "lead", json!({"source": "cli", "mode": "user", "sessionId": "sdk"}), main));
+    write(&session.join("agent_h.messages.json"), &file("sdk__agent_h", "subagent", json!({"source": "cli", "mode": "subagent", "sessionId": "sdk__agent_h", "parentThreadId": "sdk", "subagent": "agent_h"}), child));
+    vec![(d.join("sessions"), "cline")]
+}
+
+#[test]
+fn cline_sdk_conforms() {
+    conforms("cline", cline_sdk(&dir()));
+}
+
+/// A live Cline CLI 3.0.73 run (SDK sessions, qwen3:8b on Ollama), text stripped by the fixture script: one
+/// reply calls read, a failing command and `spawn_agent` at once; the sub-agent searches; a final answer.
+#[test]
+fn a_live_cline_sdk_recording() {
+    let sessions = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cline-sdk/sessions");
+    let mut store = Store::open_in_memory().unwrap();
+    import_file(&mut store, &sessions, "cline", &Capture::default()).unwrap();
+    let list = store.list_sessions(&SessionFilter::default()).unwrap();
+    assert_eq!(list.iter().map(|s| (s.session_id.0.as_str(), s.project_id.as_str(), s.turn_count)).collect::<Vec<_>>(), [("1792782846572_eef7w", "conf", 1)]);
+    let s = store.load_session(&list[0].session_id).unwrap();
+    let mut tools: Vec<_> = s.spans.values().filter(|x| x.kind == SpanKind::Tool).map(|x| (x.span_id.0.as_str(), x.status)).collect();
+    tools.sort_by_key(|t| t.0);
+    let (root, child) = ("1792782846572_eef7w", "1792782846572_eef7w__agent_19777a32-fa60-42e3-b32e-3e8105c5b789");
+    assert_eq!(
+        tools,
+        [
+            (format!("tool:{root}:call_5hcc2emp").as_str(), SpanStatus::Succeeded),
+            (format!("tool:{root}:call_ez31ti9p").as_str(), SpanStatus::Failed),
+            (format!("tool:{root}:call_kokb79vy").as_str(), SpanStatus::Succeeded),
+            (format!("tool:{child}:call_wuy9i6x4").as_str(), SpanStatus::Succeeded),
+        ]
+    );
+    let sub = &s.spans[&SpanId(format!("subagent:{child}"))];
+    assert_eq!((sub.parent_span_id.clone(), sub.status), (Some(SpanId(format!("tool:{root}:call_kokb79vy"))), SpanStatus::Succeeded));
+    let llm = &s.spans[&SpanId(format!("llm:{root}:msg_5hkpqTJb"))];
+    let u = llm.usage.as_ref().unwrap();
+    assert_eq!((llm.model.as_deref(), llm.provider.as_deref(), u.tokens_input, u.tokens_output), (Some("qwen3:8b"), Some("ollama"), Some(4238), Some(331)));
+    assert_eq!(s.spans.values().filter(|x| x.kind == SpanKind::Llm).count(), 4);
+}
+
 #[test]
 fn roo_conforms_but_names_no_model() {
     conforms_but("roo", roo(&dir()), Waive::Model);
@@ -133,14 +200,14 @@ fn cline_conforms_but_its_sub_agents_hold_only_totals() {
 
 #[test]
 fn no_text_is_copied() {
-    for (harness, files) in [("roo", roo(&dir())), ("cline", cline(&dir()))] {
+    for (harness, files, spans) in [("roo", roo(&dir()), 14), ("cline", cline(&dir()), 11), ("cline", cline_sdk(&dir()), 14)] {
         let mut store = Store::open_in_memory().unwrap();
         for (f, a) in &files {
             import_file(&mut store, f, a, &Capture::default()).unwrap();
         }
         let s = store.list_sessions(&SessionFilter::default()).unwrap();
         let session = store.load_session(&s[0].session_id).unwrap();
-        assert_eq!(session.spans.len(), if harness == "roo" { 14 } else { 11 }, "{harness}: every span read");
+        assert_eq!(session.spans.len(), spans, "{harness}: every span read");
         let dump = format!("{:?}", session.spans);
         assert!(!dump.contains(SECRET), "{harness}: a prompt, command or tool text leaked");
     }
