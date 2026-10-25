@@ -2,7 +2,7 @@
 //! text, so the composition is inferred from token usage: each LLM call's context is input + cache read +
 //! cache write, and the growth between consecutive calls is attributed to what happened in between.
 
-use crate::mcp_parts;
+use crate::{clock_time, format_tokens, mcp_parts};
 use trace_core::{Ns, Span, SpanId, SpanKind, TraceState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -236,4 +236,29 @@ fn worst(row: &[usize], areas: &[f64], side: f64) -> f64 {
     let (max, min) = row.iter().fold((0.0f64, f64::MAX), |(mx, mn), &k| (mx.max(areas[k]), mn.min(areas[k])));
     let (s2, side2) = (sum * sum, side * side);
     (side2 * max / s2).max(s2 / (side2 * min))
+}
+
+impl ContextMap {
+    /// `64.8k / 200k · 32%`, or `64.8k` when the window is unknown.
+    pub fn fill(&self) -> String {
+        match self.limit {
+            Some(l) => format!("{} / {} · {}%", format_tokens(self.used), format_tokens(l), (self.used * 100 + l / 2) / l),
+            None => format_tokens(self.used),
+        }
+    }
+
+    /// The window left over; zero when unknown.
+    pub fn free(&self) -> u64 {
+        self.limit.map_or(0, |l| l.saturating_sub(self.used))
+    }
+
+    /// `Compacted 2× · showing call at 41:07`, timed from the start of the trace.
+    pub fn caption(&self, state: &TraceState) -> String {
+        let compacted = match self.compactions {
+            0 => "Not compacted".to_owned(),
+            n => format!("Compacted {n}×"),
+        };
+        let at = state.spans.get(&self.at).map_or(0, |s| s.started_at_utc_ns - state.axis_start().unwrap_or(s.started_at_utc_ns));
+        format!("{compacted} · showing call at {}", clock_time(at))
+    }
 }

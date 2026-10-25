@@ -73,6 +73,8 @@ pub struct View {
     pub inspector: Option<Inspector>,
     /// The session's span notes, kept in step with the store.
     pub notes: BTreeMap<SpanId, String>,
+    /// The context map pane is open.
+    pub context: bool,
 }
 
 impl View {
@@ -84,6 +86,7 @@ impl View {
             focus: Focus::Tree,
             inspector: None,
             notes,
+            context: false,
         }
     }
 
@@ -142,17 +145,25 @@ impl App {
     }
 
     pub fn open(&mut self, id: SessionId) -> anyhow::Result<()> {
-        self.view = Some(View::new(TraceDoc::open(&self.store, id)?, &self.store));
-        self.screen = Screen::Waterfall;
+        let doc = TraceDoc::open(&self.store, id)?;
+        self.show(doc);
         Ok(())
     }
 
     pub fn open_replay(&mut self, id: SessionId, speed: f64, at_end: bool) -> anyhow::Result<()> {
         let doc = TraceDoc::open_replay(&self.store, id, speed, at_end)?;
-        self.view = Some(View::new(doc, &self.store));
-        self.screen = Screen::Waterfall;
+        self.show(doc);
         self.last_tick = Instant::now();
         Ok(())
+    }
+
+    /// Switching between live and replay of one session keeps the context pane as it was.
+    fn show(&mut self, doc: TraceDoc) {
+        let context = self.view.as_ref().is_some_and(|v| v.context && v.doc.session_id() == doc.session_id());
+        let mut view = View::new(doc, &self.store);
+        view.context = context;
+        self.view = Some(view);
+        self.screen = Screen::Waterfall;
     }
 
     /// How long the terminal loop may block before calling `tick`. None = wait for input.
@@ -415,6 +426,10 @@ impl App {
     /// Keys that work in every waterfall focus.
     fn common_key(&mut self, code: KeyCode) {
         let Some(view) = &mut self.view else { return };
+        if code == KeyCode::Char('c') {
+            view.context = !view.context;
+            return;
+        }
         if code == KeyCode::Char('n') {
             if let Some(id) = &view.doc.selected {
                 self.prompt = Some(view.notes.get(id).cloned().unwrap_or_default());

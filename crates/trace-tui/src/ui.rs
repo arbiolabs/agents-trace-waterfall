@@ -2,14 +2,14 @@ use crate::app::{App, Focus, Inspector, Screen, Tab, View};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span as TSpan};
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, Paragraph, Row as TRow, StatefulWidget, Table, Wrap,
 };
 use trace_core::{CostProvenance, Ns, SLOWEST_DEFAULT_KINDS, SessionStatus, wire_name};
-use trace_render::{Glyphs, Theme, WaterfallState, WaterfallWidget};
-use trace_view::{Mode, TraceDoc, format_cost, format_duration, format_tokens, format_total_cost, harness_label, pretty_model, title};
+use trace_render::{Glyphs, Palette, Theme, WaterfallState, WaterfallWidget};
+use trace_view::{Mode, PartKind, TraceDoc, context_map, format_cost, format_duration, format_tokens, format_total_cost, harness_label, pretty_model, title, treemap};
 
 const WIDE: u16 = 120;
 
@@ -19,6 +19,8 @@ impl App {
     }
 }
 const COMPACT: u16 = 80;
+/// From this width the context pane sits beside the waterfall, else below it.
+const CONTEXT_BESIDE: u16 = 160;
 
 pub fn render(app: &mut App, f: &mut Frame) {
     let [main, footer] =
@@ -61,13 +63,13 @@ fn hints(app: &App) -> String {
                 }
                 (Focus::Timeline, _) => "h/l pan · j/k move · +/- zoom · Tab inspector · ? help",
                 (_, Mode::Live { .. }) => {
-                    "j/k h/l · Enter inspect · Space pause · f follow · +/- H/L · / search · E fold all · n note · ? help"
+                    "j/k h/l · Enter inspect · Space pause · f follow · +/- H/L · / search · E fold all · n note · c context · ? help"
                 }
                 (_, Mode::Replay { .. }) => {
-                    "Space play · [ ] step · < > speed · H/L seek · Enter inspect · r exit replay · ? help"
+                    "Space play · [ ] step · < > speed · H/L seek · Enter inspect · c context · r exit replay · ? help"
                 }
                 (_, Mode::Static) => {
-                    "j/k h/l · Enter inspect · +/- H/L · / search · E fold all · n note · r replay · ? help"
+                    "j/k h/l · Enter inspect · +/- H/L · / search · E fold all · n note · c context · r replay · ? help"
                 }
             };
             format!("{} │ {keys}", v.doc.status())
@@ -201,6 +203,19 @@ fn waterfall(app: &mut App, f: &mut Frame, area: Rect) {
     v.doc.tick_clock();
     let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     f.render_widget(Paragraph::new(summary(&v.doc)), head);
+    let body = if v.context {
+        let (rest, pane) = if body.width >= CONTEXT_BESIDE {
+            let [a, b] = Layout::horizontal([Constraint::Min(0), Constraint::Length(48)]).areas(body);
+            (a, b)
+        } else {
+            let [a, b] = Layout::vertical([Constraint::Min(0), Constraint::Length((body.height / 2).clamp(8, 16))]).areas(body);
+            (a, b)
+        };
+        context_pane(&v.doc, &theme, f, pane);
+        rest
+    } else {
+        body
+    };
 
     let w = body.width;
     if w < COMPACT {
@@ -270,6 +285,77 @@ fn draw_waterfall(v: &mut View, theme: &Theme, buf: &mut Buffer, area: Rect, tre
     };
     widget.render(area, buf, &mut wf);
     v.scroll = wf.offset;
+}
+
+/// Narrower tiles go unlabelled: a clipped stub of a name reads as noise.
+const MIN_LABEL: usize = 4;
+
+fn part_color(k: PartKind) -> Color {
+    match k {
+        PartKind::Baseline => Color::Rgb(148, 163, 184),
+        PartKind::Prompts => Color::Rgb(96, 165, 250),
+        PartKind::Output => Color::Rgb(167, 139, 250),
+        PartKind::Tool => Color::Rgb(45, 212, 191),
+        PartKind::Other => Color::Rgb(161, 161, 170),
+        PartKind::Summary => Color::Rgb(251, 191, 36),
+    }
+}
+
+/// A treemap of the main agent's context: one tile per part, the window's free space shaded.
+fn context_pane(d: &TraceDoc, theme: &Theme, f: &mut Frame, area: Rect) {
+    let map = context_map(&d.state, d.context_at());
+    let title = map.as_ref().map_or(" Context ".into(), |m| {
+        let model = m.model.as_deref().map_or(String::new(), |m| format!("{} · ", pretty_model(m)));
+        format!(" Context · {model}{} ", m.fill())
+    });
+    let block = Block::bordered().title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let Some(m) = map else {
+        f.render_widget(Paragraph::new("No LLM call with token usage yet.").wrap(Wrap { trim: false }), inner);
+        return;
+    };
+    let [tiles, foot] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    f.render_widget(Paragraph::new(m.caption(&d.state)).style(Style::new().add_modifier(Modifier::DIM)), foot);
+    let mut weights: Vec<u64> = m.parts.iter().map(|p| p.tokens).collect();
+    weights.push(m.free());
+    // A cell is about twice as tall as it is wide; lay out in square units so tiles read square.
+    let rects = treemap(&weights, f32::from(tiles.width), f32::from(tiles.height) * 2.0);
+    let color = theme.palette == Palette::Color;
+    let buf = f.buffer_mut();
+    for (i, &(x, y, w, h)) in rects.iter().enumerate() {
+        let part = m.parts.get(i);
+        let (x0, x1) = (x.round() as u16, (x + w).round() as u16);
+        let (y0, y1) = ((y / 2.0).round() as u16, ((y + h) / 2.0).round() as u16);
+        // A one-cell gutter on the inner edges keeps neighbouring tiles of one color apart.
+        let x1 = if x1 < tiles.width && x1 > x0 + 1 { x1 - 1 } else { x1 };
+        let y1 = if y1 < tiles.height && y1 > y0 + 1 { y1 - 1 } else { y1 };
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        let (fill, symbol) = match part {
+            Some(p) if color => (Style::new().bg(part_color(p.kind)).fg(Color::Black), " "),
+            Some(_) => (Style::new().add_modifier(Modifier::REVERSED), " "),
+            None => (Style::new().add_modifier(Modifier::DIM), if theme.glyphs == Glyphs::Ascii { "." } else { "░" }),
+        };
+        for cy in y0..y1 {
+            for cx in x0..x1 {
+                buf[(tiles.x + cx, tiles.y + cy)].set_symbol(symbol).set_style(fill);
+            }
+        }
+        let width = usize::from(x1 - x0);
+        if width < MIN_LABEL {
+            continue;
+        }
+        let (label, tokens) = part.map_or(("Free", weights[i]), |p| (p.label.as_str(), p.tokens));
+        let tokens = format_tokens(tokens);
+        let text = if y1 - y0 >= 2 || label.chars().count() + 1 + tokens.len() > width { label.to_owned() } else { format!("{label} {tokens}") };
+        let style = if part.is_some() { fill.add_modifier(Modifier::BOLD) } else { Style::new() };
+        buf.set_stringn(tiles.x + x0, tiles.y + y0, &text, width, style);
+        if y1 - y0 >= 2 && tokens.len() <= width {
+            buf.set_stringn(tiles.x + x0, tiles.y + y0 + 1, &tokens, width, style.remove_modifier(Modifier::BOLD));
+        }
+    }
 }
 
 fn summary(v: &TraceDoc) -> Line<'static> {
@@ -527,6 +613,8 @@ Waterfall
                idle stretches are folded out of the timeline; ┊ and their length mark each fold,
                and replay jumps across them
   n            add or edit the selected span's note (empty removes it)
+  c            context map: what fills the main agent's context window at the selected span
+               (the root, or nothing, shows the view clock); sized from token usage, ░ is free space
   Enter        open inspector        Tab   cycle focus tree / timeline / inspector
   Esc          clear search, close inspector, back to sessions
   +/-          zoom in/out (anchored at selection, or now when following)

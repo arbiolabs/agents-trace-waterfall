@@ -72,6 +72,8 @@ fn tool_growth_splits_across_the_tools_that_ran() {
         [(PartKind::Baseline, BASE, 1000), (PartKind::Tool, "Bash", 300), (PartKind::Tool, "Read", 300), (PartKind::Output, "Responses", 50)]
     );
     assert_eq!((m.used, m.limit, m.at.0.as_str(), m.compactions, m.model.as_deref()), (1650, Some(200_000), "a2", 0, Some(OPUS)));
+    assert_eq!((m.fill(), m.free()), ("1.6k / 200k · 1%".into(), 198_350));
+    assert_eq!(m.caption(&session().state()), "Not compacted · showing call at 0:00");
 }
 
 #[test]
@@ -109,6 +111,7 @@ fn a_compaction_resets_to_baseline_and_summary() {
         [(PartKind::Baseline, BASE, 1000), (PartKind::Summary, "Compaction summary", 200), (PartKind::Other, "Other", 100)]
     );
     assert_eq!((m.used, m.compactions), (1300, 1));
+    assert!(m.caption(&session().state()).starts_with("Compacted 1× · "));
 }
 
 #[test]

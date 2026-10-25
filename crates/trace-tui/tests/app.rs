@@ -448,3 +448,21 @@ fn notes_save_from_the_prompt_and_fold_all_toggles() {
     press(&mut app, "E");
     assert!(!doc(&app).all_folded());
 }
+
+#[test]
+fn c_toggles_the_context_map_at_the_selection() {
+    let mut app = opened(&sample());
+    let has = |lines: &[String], s: &str| lines.iter().any(|l| l.contains(s));
+    assert!(!has(&screen(&mut app, 200, 40), " Context "));
+    press(&mut app, "c");
+    let lines = screen(&mut app, 200, 40);
+    assert!(has(&lines, "┌ Context · sim-model-1 · 6.7k ─"), "the root shows the clock: the last call");
+    assert!(has(&lines, "│Compacted 2× · showing call at 0:11 "));
+    press(&mut app, "j");
+    let lines = screen(&mut app, 200, 40);
+    assert!(has(&lines, "┌ Context · sim-model-1 · 8.5k ─"), "turn 1 shows its first call");
+    assert!(has(&lines, "│System, tools & memory "));
+    assert!(has(&lines, "│Not compacted · showing call at 0:00 "));
+    press(&mut app, "c");
+    assert!(!has(&screen(&mut app, 200, 40), " Context "));
+}
