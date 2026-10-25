@@ -321,7 +321,7 @@ struct Tailed {
 /// Bumped when an adapter derives different events from the same source (a new name, a fixed time).
 /// Read positions are kept per revision, so a new one re-reads every source once; the store replaces
 /// the events that changed and keeps those whose source is gone.
-const ADAPTER_REVISION: u32 = 2;
+const ADAPTER_REVISION: u32 = 3;
 
 fn offsets_path(db: &Path) -> PathBuf {
     let mut p = db.as_os_str().to_owned();

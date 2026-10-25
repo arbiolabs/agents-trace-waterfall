@@ -40,26 +40,26 @@ struct State {
 }
 
 /// What started a turn, from a user record that is not a tool result: a typed prompt (None), or the
-/// name of the record that stands in for one. Only the record's kind is read, never its text.
-fn turn_origin(v: &Value, names: &HashMap<String, String>) -> Option<String> {
+/// kind and name of the record that stands in for one. Only the record's kind is read, never its text.
+fn turn_origin(v: &Value, names: &HashMap<String, String>) -> Option<(&'static str, String)> {
     let content = &v["message"]["content"];
     let text = content.as_str().or_else(|| content.as_array()?.iter().find_map(|b| b["text"].as_str())).unwrap_or_default().trim_start();
     if v["origin"]["kind"] == "task-notification" || text.starts_with("<task-notification>") {
         // The task id is an id, not content: it names which sub-agent reported back.
         let id = text.split_once("<task-id>").and_then(|(_, r)| r.split_once("</task-id>")).map(|(id, _)| id.trim());
-        return Some(match id.and_then(|id| names.get(id)) {
+        return Some(("notification", match id.and_then(|id| names.get(id)) {
             Some(name) => format!("Notification · {name}"),
             None => "Task notification".into(),
-        });
+        }));
     }
     if v["isCompactSummary"] == true {
-        return Some("Context compacted".into());
+        return Some(("compaction", "Context compacted".into()));
     }
     if text.starts_with("<bash-input>") {
-        return Some("Shell command".into());
+        return Some(("shell", "Shell command".into()));
     }
     if text.starts_with("<command-name>") || text.starts_with("<local-command") {
-        return Some("Command".into());
+        return Some(("command", "Command".into()));
     }
     None
 }
@@ -203,11 +203,19 @@ impl TraceAdapter for ClaudeCode {
                         let t = span("turn", &old);
                         e.end(format!("end:{t}"), &t, ts, SpanStatus::Succeeded, None);
                     }
-                    let name = turn_origin(&v, &st.agent_names).unwrap_or_else(|| {
-                        st.turns += 1;
-                        format!("turn {}", st.turns)
+                    let origin = turn_origin(&v, &st.agent_names);
+                    let name = origin.as_ref().map_or_else(
+                        || {
+                            st.turns += 1;
+                            format!("turn {}", st.turns)
+                        },
+                        |(_, name)| name.clone(),
+                    );
+                    e.start(&span("turn", key), ts, Some(&root), SpanKind::Turn, &name, |s| {
+                        if let Some((kind, _)) = origin {
+                            s.attributes.insert("turn_origin".into(), json!(kind));
+                        }
                     });
-                    e.start(&span("turn", key), ts, Some(&root), SpanKind::Turn, &name, |_| {});
                     st.turn = Some(key.to_owned());
                     st.turn_open = true;
                 }

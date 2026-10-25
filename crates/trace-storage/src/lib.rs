@@ -105,11 +105,14 @@ CREATE TABLE annotations (
 );
 "#, r#"
 CREATE TABLE meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+"#, r#"
+-- What started a turn when no prompt did (`notification`, `shell`, ...): such turns are not counted.
+ALTER TABLE spans ADD COLUMN origin TEXT;
 "#];
 
 /// Bumped when projections compute differently, so stores rebuild them from the journal on open.
-/// 2: model-price cost estimates. 3: zero-token calls cost nothing.
-const PROJECTION_VERSION: i64 = 3;
+/// 2: model-price cost estimates. 3: zero-token calls cost nothing. 4: turn origins.
+const PROJECTION_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AppendOutcome {
@@ -282,9 +285,9 @@ impl Store {
 
     pub fn list_sessions(&self, filter: &SessionFilter) -> Result<Vec<SessionSummary>> {
         let mut sql = String::from(
-            // Turns of the main agent only; a sub-agent's turns sit under its own span.
+            // Prompted turns of the main agent only; a sub-agent's turns sit under its own span.
             "SELECT *, (SELECT COUNT(*) FROM spans p JOIN spans a ON a.session_id = p.session_id AND a.span_id = p.parent_span_id
-                        WHERE p.session_id = sessions.session_id AND p.kind = 'turn' AND a.kind = 'agent') FROM sessions WHERE 1 = 1",
+                        WHERE p.session_id = sessions.session_id AND p.kind = 'turn' AND p.origin IS NULL AND a.kind = 'agent') FROM sessions WHERE 1 = 1",
         );
         let mut args: Vec<String> = Vec::new();
         let mut bind = |sql: &mut String, clause: &str, arg: String| {
@@ -534,8 +537,8 @@ fn project(conn: &Connection, id: &SessionId) -> Result<()> {
     let mut model_counts: BTreeMap<&str, usize> = BTreeMap::new();
     for s in st.spans.values() {
         conn.execute(
-            "INSERT INTO spans (session_id, span_id, parent_span_id, name, kind, status, started_at, ended_at, model, tool_name)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO spans (session_id, span_id, parent_span_id, name, kind, status, started_at, ended_at, model, tool_name, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 id.0,
                 s.span_id.0,
@@ -547,6 +550,7 @@ fn project(conn: &Connection, id: &SessionId) -> Result<()> {
                 s.ended_at_utc_ns,
                 s.model,
                 s.tool_name,
+                s.attributes.get("turn_origin").and_then(|v| v.as_str()),
             ],
         )?;
         if let Some(u) = &s.usage {

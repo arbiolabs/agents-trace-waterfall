@@ -466,7 +466,7 @@ fn tailing_resumes_after_restart_without_duplicates() {
     );
     assert_eq!(journal_len(&store), 35);
 
-    let offsets = env.dir.join("trace.db.tail-offsets-r2.json");
+    let offsets = env.dir.join("trace.db.tail-offsets-r3.json");
     std::fs::remove_file(&offsets).unwrap();
     let c = start(config(&env, &tail, YEAR));
     wait_for("both files re-read", || {
@@ -1128,6 +1128,7 @@ fn claude_code_names_sub_agents_and_turns_by_what_started_them() {
     assert_eq!(names, ["turn 1", "Notification · Gemini CLI adapter", "Shell command", "Context compacted", "turn 2"]);
     let json = serde_json::to_string(&s.spans).unwrap();
     assert!(!json.contains("SECRET"), "text leaked: {json}");
+    assert_eq!(store.list_sessions(&SessionFilter::default()).unwrap()[0].turn_count, 2, "only prompts count as turns");
 }
 
 /// A re-read after an adapter change replaces what changed and keeps when it was first observed.
