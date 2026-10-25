@@ -1,4 +1,4 @@
-use crate::Cli;
+use crate::{Cli, context};
 use crate::present::{self, Change, Edge, Grab, Group, LabelAt, Shape, SidebarMode, SidebarNode, Status, Tone, ease};
 use crate::theme::{KindColors, Palette};
 use chrono::{Local, TimeZone};
@@ -59,11 +59,12 @@ gpui_kit::actions!(
     agents_trace_waterfall,
     [
         Quit, About, Import, ExportSession, ToggleSidebar, ZoomIn, ZoomOut, ZoomToFit, Follow, Replay, NextEvent, PrevEvent,
-        Inspect, AddNote, ZoomToSpan, ToggleBranch, CollapseAll, ExpandAll, CopySpanName, CopySpanJson, ExportSpanJson, ShowInReplay
+        Inspect, AddNote, ZoomToSpan, ToggleBranch, CollapseAll, ExpandAll, CopySpanName, CopySpanJson, ExportSpanJson, ShowInReplay,
+        ToggleContext
     ]
 );
 
-fn tnum() -> FontFeatures {
+pub(crate) fn tnum() -> FontFeatures {
     FontFeatures(Arc::new(vec![("tnum".into(), 1)]))
 }
 
@@ -247,6 +248,8 @@ pub struct TraceApp {
     contrast: bool,
     /// macOS Reduce Transparency: the sidebar drops its translucency.
     solid_sidebar: bool,
+    /// The context map panel is open beside the trace card.
+    context: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -328,6 +331,7 @@ impl TraceApp {
             initial_window: cli.viewport,
             bench: (cli.bench_scroll || cli.bench_fold).then(|| Bench { last: Instant::now(), intervals: Vec::new(), builds: Vec::new(), rows: Vec::new(), fold: cli.bench_fold.then_some(None) }),
             copied_at: None,
+            context: cli.context,
             menu_target: None,
             sidebar: SidebarState::load(state_path),
             contrast: display_accessibility().0,
@@ -891,6 +895,7 @@ impl TraceApp {
             }
             "/" => self.open_span_search(window, cx),
             "r" => self.toggle_replay(),
+            "c" => self.context = !self.context,
             _ => return,
         }
         if let Some((old, Some(id))) = before {
@@ -1071,6 +1076,10 @@ impl TraceApp {
                 this.save_as(format!("span-{s}.json"), json.into_bytes(), cx);
             }
         }))
+        .on_action(cx.listener(|this, _: &ToggleContext, _, cx| {
+            this.context = !this.context;
+            cx.notify();
+        }))
         .on_action(cx.listener(|this, _: &ShowInReplay, _, cx| {
             this.show_in_replay();
             cx.notify();
@@ -1165,7 +1174,7 @@ impl Render for TraceApp {
                     .pb(px(MAIN_PAD))
                     .child(self.render_header(&pal, (TOGGLE_X + 28. + 10. - card_left - 6.).max(0.), window, cx))
                     .child(match self.doc.is_some() {
-                        true => self.render_card(&pal, vw, card_left, window, cx).into_any_element(),
+                        true => self.render_trace(&pal, vw, card_left, window, cx).into_any_element(),
                         false => self.render_empty(&pal, cx).into_any_element(),
                     }),
             )
@@ -1623,7 +1632,7 @@ fn focus_ring(ring: Hsla, surface: Hsla, inset: bool) -> Vec<BoxShadow> {
     if inset { vec![spread(ring, 2.)] } else { vec![spread(ring, 4.), spread(surface, 2.)] }
 }
 
-fn soft_shadow(pal: &Palette, alpha: f32, y: f32, blur: f32) -> BoxShadow {
+pub(crate) fn soft_shadow(pal: &Palette, alpha: f32, y: f32, blur: f32) -> BoxShadow {
     BoxShadow {
         color: hsla(0., 0., 0., if pal.dark { alpha * 3. } else { alpha }),
         offset: point(px(0.), px(y)),
@@ -1869,6 +1878,16 @@ impl TraceApp {
                         })),
                 );
             }
+            let on = self.context;
+            right = right.child(
+                tool_button("context", IconName::LayoutDashboard, Some("Context"), on, pal)
+                    .aria_toggled(if on { Toggled::True } else { Toggled::False })
+                    .tooltip(|w, cx| Tooltip::new("What fills the agent's context window  C or ⌘K").build(w, cx))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.context = !this.context;
+                        cx.notify();
+                    })),
+            );
             let replaying = matches!(doc.mode, Mode::Replay { .. });
             let back_to_live = replaying && doc.recording_live;
             let (icon, label, tip) = match (replaying, back_to_live) {
@@ -2016,6 +2035,15 @@ impl TraceApp {
         let ov_w = if idle_at.is_some() { tl_w - IDLE_MARK_W } else { tl_w };
         let squeeze = present::Squeeze::new(overview, ov_w, doc.folds.gaps());
         Some(Geo { left: card_left + 1., name_w, tl_w, vp, now: doc.now, origin, overview, end: shown_end(doc), following, idle: idle_at, live, squeeze })
+    }
+
+    /// The trace card, with the context map beside it when open.
+    fn render_trace(&mut self, pal: &Palette, vw: f32, card_left: f32, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let beside = if self.context { context::PANEL_W + MAIN_PAD } else { 0. };
+        let h = window.viewport_size().height.to_f64() as f32 - HEADER_H - MAIN_PAD;
+        let panel = self.doc.as_ref().filter(|_| self.context).map(|doc| context::panel(pal, doc, h).into_any_element());
+        let card = self.render_card(pal, vw - beside, card_left, window, cx);
+        div().flex_1().min_h(px(0.)).flex().gap(px(MAIN_PAD)).child(card).children(panel)
     }
 
     fn render_card(&mut self, pal: &Palette, vw: f32, card_left: f32, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2235,6 +2263,7 @@ impl TraceApp {
         div()
             .flex_1()
             .min_h(px(0.))
+            .min_w(px(0.))
             .flex()
             .flex_col()
             .relative()

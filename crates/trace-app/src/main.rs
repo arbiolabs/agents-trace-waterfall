@@ -1,4 +1,5 @@
 mod app;
+mod context;
 mod present;
 mod theme;
 
@@ -24,6 +25,9 @@ pub struct Cli {
     /// Select the first span whose name contains this text.
     #[arg(long)]
     pub select: Option<String>,
+    /// Open with the context map beside the trace.
+    #[arg(long)]
+    pub context: bool,
     /// Open the detail popover on the selected span.
     #[arg(long)]
     pub popover: bool,
@@ -143,6 +147,7 @@ fn main() -> anyhow::Result<()> {
             KeyBinding::new("cmd-r", Replay, None),
             KeyBinding::new("cmd-]", NextEvent, None),
             KeyBinding::new("cmd-[", PrevEvent, None),
+            KeyBinding::new("cmd-k", ToggleContext, None),
             KeyBinding::new("enter", Inspect, Some(ROWS_CONTEXT)),
             KeyBinding::new("n", AddNote, Some(ROWS_CONTEXT)),
             KeyBinding::new("cmd-c", CopySpanName, Some(ROWS_CONTEXT)),
@@ -168,6 +173,7 @@ fn main() -> anyhow::Result<()> {
                 MenuItem::action("Expand All Spans", ExpandAll),
                 MenuItem::separator(),
                 MenuItem::action("Follow", Follow),
+                MenuItem::action("Context Map", ToggleContext),
             ]),
             Menu::new("Go").items([
                 MenuItem::action("Replay", Replay),
