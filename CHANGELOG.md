@@ -6,13 +6,21 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-25
+
 ### Added
 
 - A context map shows what fills the main agent's context window at the selected span: a treemap of the
   system prompt and tools, responses, each tool's results, prompts and any compaction summary, with the
   free space up to the model's window. Press `c` in the TUI, or `c`, ⌘K or the Context button in the
   desktop app. Prompts and tool output are never stored, so the parts are inferred from how each LLM
-  call's input grew; sub-agents keep their own context and are left out.
+  call's input grew; sub-agents keep their own context and are left out. While following a live
+  session or playing a replay, the map shows the newest call as it lands.
+
+### Fixed
+
+- The sessions list counts only your prompts as turns: notifications, `!` commands and compaction
+  summaries no longer add to a Claude Code session's turn count.
 
 ## [1.2.2] - 2026-10-24
 
@@ -166,7 +174,8 @@ terminal UI over the same recorded traces.
   time axis and previous / next activity (`{` / `}`).
 - Unicode and ASCII glyphs, colour and monochrome themes. Usable down to 60×18.
 
-[Unreleased]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.2.2...HEAD
+[Unreleased]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.2.2...v1.3.0
 [1.2.2]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/diego-arbio-dev/agents-trace-waterfall/compare/v1.1.0...v1.2.0
