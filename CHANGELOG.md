@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- A context map shows what fills the main agent's context window at the selected span: a treemap of the
+  system prompt and tools, responses, each tool's results, prompts and any compaction summary, with the
+  free space up to the model's window. Press `c` in the TUI, or `c`, ⌘K or the Context button in the
+  desktop app. Prompts and tool output are never stored, so the parts are inferred from how each LLM
+  call's input grew; sub-agents keep their own context and are left out.
+
 ## [1.2.2] - 2026-10-24
 
 ### Fixed

@@ -74,6 +74,8 @@ open "target/release/Agents Trace Waterfall.app"
 
 Click a span for its details. Drag the overview strip to move through long sessions. Drop a `.jsonl` file on the window to import it. The keyboard shortcuts match the TUI.
 
+The Context button (or `c`, as in the TUI) opens a context map beside the waterfall: a treemap of what fills the main agent's context window at the selected span, sized from token usage, with the free space up to the model's window and how often the session compacted.
+
 ## Commands
 
 | Command | Purpose |
