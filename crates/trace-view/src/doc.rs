@@ -128,10 +128,11 @@ impl TraceDoc {
         self.selected.as_ref().and_then(|id| self.state.spans.get(id))
     }
 
-    /// The moment a context map shows: the selected span's start, or the view clock when nothing below the
-    /// root is selected.
+    /// The moment a context map shows: the view clock while following a live session or playing a replay,
+    /// else the selected span's start, or the clock when nothing below the root is selected.
     pub fn context_at(&self) -> Ns {
-        match self.selected_span() {
+        let tracking = matches!(self.mode, Mode::Live { following: true, paused_at: None, .. } | Mode::Replay { clock: ReplayClock { playing: true, .. }, .. });
+        match self.selected_span().filter(|_| !tracking) {
             Some(s) if s.kind != SpanKind::Agent => s.started_at_utc_ns,
             _ => self.now,
         }

@@ -314,3 +314,17 @@ fn replay_of_a_live_session_grows_and_waits_at_the_live_edge() {
     tick(&mut doc, &store);
     assert!(!doc.recording_live);
 }
+
+#[test]
+fn context_follows_the_clock_while_live_and_the_selection_once_stopped() {
+    let mut doc = TraceDoc::new(sample(), Mode::Live { following: true, paused_at: None, buffered: Vec::new() }, 0);
+    doc.now = 1_000 * MS;
+    let i = doc.rows.iter().position(|r| matches!(&r.kind, RowKind::Span(id) if doc.state.spans[id].kind != SpanKind::Agent)).unwrap();
+    doc.select(i);
+    let selected = doc.selected_span().unwrap().started_at_utc_ns;
+    assert_ne!(selected, doc.now);
+    assert_eq!(doc.context_at(), doc.now, "following shows the newest context whatever is selected");
+    let Mode::Live { following, .. } = &mut doc.mode else { unreachable!() };
+    *following = false;
+    assert_eq!(doc.context_at(), selected, "stopped, the map shows the selected span's moment");
+}
