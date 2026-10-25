@@ -5,7 +5,7 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use trace_core::{CanonicalEvent, Ns, Replay, ReplayClock, SessionId, SessionStatus, Span, SpanId, TraceState, wire_name};
+use trace_core::{CanonicalEvent, Ns, Replay, ReplayClock, SessionId, SessionStatus, Span, SpanId, SpanKind, TraceState, wire_name};
 use trace_storage::{SessionFilter, Store};
 
 pub const EXPAND_ALL_LIMIT: usize = 5_000;
@@ -126,6 +126,15 @@ impl TraceDoc {
 
     pub fn selected_span(&self) -> Option<&Span> {
         self.selected.as_ref().and_then(|id| self.state.spans.get(id))
+    }
+
+    /// The moment a context map shows: the selected span's start, or the view clock when nothing below the
+    /// root is selected.
+    pub fn context_at(&self) -> Ns {
+        match self.selected_span() {
+            Some(s) if s.kind != SpanKind::Agent => s.started_at_utc_ns,
+            _ => self.now,
+        }
     }
 
     /// Rebuilds rows and the clock after any change to state, collapse set or search.

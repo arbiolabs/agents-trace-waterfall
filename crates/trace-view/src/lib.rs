@@ -2,10 +2,12 @@
 //! and `TraceDoc`, which owns live/pause/replay, collapse, selection and search. No UI toolkit types live here;
 //! a viewport "cell" is whatever unit the frontend draws in (terminal columns, pixels).
 
+mod context;
 mod doc;
 mod idle;
 mod names;
 
+pub use context::{ContextMap, Part, PartKind, context_map, treemap};
 pub use idle::{Folds, IDLE_GAP_MIN, MAX_GAPS, compact_duration, folds_for, idle_gaps};
 pub use names::{detail, harness_label, harness_name, kind_label, mcp_parts, pretty_model, title, top_model};
 pub use doc::{EXPAND_ALL_LIMIT, Mode, TraceDoc, export_span, matcher, resolve_session, wall_ns, write_private};
